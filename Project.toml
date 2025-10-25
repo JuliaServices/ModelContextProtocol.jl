@@ -1,5 +1,5 @@
-name = "Example"
-uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
+name = "ModelContextProtocol"
+uuid = "a630a0b0-4325-47f6-86f8-c7db38e4394e"
 version = "1.0.0"
 
 [compat]
