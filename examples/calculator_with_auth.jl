@@ -238,7 +238,6 @@ const REQUIRED_SCOPE = "calculator:use"
 const CLIENT_ID = "calculator-public-client"
 const AUTH_CODE_TTL = Dates.Second(300)
 const REGISTRATION_PATH = "/oidc/register"
-const OAUTH_LOG_SERVER = Ref{MCPServer}(nothing)
 
 const ISSUER_PRIVATE_KEY = """
 -----BEGIN PRIVATE KEY-----
@@ -340,15 +339,6 @@ function html_response(body::AbstractString; status::Integer=200)
     return HTTP.Response(status, HTTP.Headers(["Content-Type" => "text/html; charset=utf-8"]), body)
 end
 
-function oauth_log_and_respond(req::HTTP.Request, response::HTTP.Response; request_body::AbstractString="")
-    server = OAUTH_LOG_SERVER[]
-    if server !== nothing && server.config.verbose
-        MCP.log_server_http_request(server, req, request_body)
-        MCP.log_server_http_response(server, req, response)
-    end
-    return response
-end
-
 function render_login_page(params::Dict{String,String}; error_message::Union{String,Nothing}=nothing)
     hidden_inputs = IOBuffer()
     for (name, value) in params
@@ -429,7 +419,7 @@ function authorization_get_handler(req::HTTP.Request)
         end
         html_response(render_login_page(hidden_params))
     end
-    return oauth_log_and_respond(req, response)
+    return response
 end
 
 function authorization_post_handler(req::HTTP.Request)
@@ -475,7 +465,7 @@ function authorization_post_handler(req::HTTP.Request)
         ])
         HTTP.Response(302, headers, "")
     end
-    return oauth_log_and_respond(req, response; request_body=request_body)
+    return response
 end
 
 function verify_pkce(code::AuthorizationCode, verifier::AbstractString)
@@ -483,7 +473,7 @@ function verify_pkce(code::AuthorizationCode, verifier::AbstractString)
     if method == "plain"
         return String(verifier) == code.code_challenge
     elseif method == "s256"
-        challenge = OAuth.pkce_challenge(verifier; method=:S256)
+        challenge = OAuth.pkce_challenge(verifier)
         return challenge == code.code_challenge
     else
         return false
@@ -501,7 +491,7 @@ end
 
 function dynamic_client_registration_handler()
     function handler(req::HTTP.Request)
-        HTTP.method(req) == "POST" || return oauth_log_and_respond(req, HTTP.Response(405, HTTP.Headers(["Allow" => "POST"]), ""))
+        HTTP.method(req) == "POST" || return HTTP.Response(405, HTTP.Headers(["Allow" => "POST"]), "")
         body_bytes = req.body isa Vector{UInt8} ? req.body : Vector{UInt8}(codeunits(String(req.body)))
         request_body = String(body_bytes)
         registration = Dict{String,Any}()
@@ -511,7 +501,7 @@ function dynamic_client_registration_handler()
                 data isa AbstractDict || error("registration payload must be an object")
                 Dict{String,Any}(String(k) => v for (k, v) in data)
             catch err
-                return oauth_log_and_respond(req, json_error(400, "invalid_client_metadata", sprint(showerror, err)); request_body=request_body)
+                return json_error(400, "invalid_client_metadata", sprint(showerror, err))
             end
         end
         redirect_values = String[]
@@ -526,7 +516,7 @@ function dynamic_client_registration_handler()
                 push!(redirect_values, String(redirects))
             end
         end
-        issued_at = Dates.datetime2unix(Dates.now(UTC))
+        issued_at = round(Int, Dates.datetime2unix(Dates.now(UTC)))
         body = Dict{String,Any}(
             "client_id" => CLIENT_ID,
             "client_id_issued_at" => issued_at,
@@ -543,35 +533,34 @@ function dynamic_client_registration_handler()
             "Cache-Control" => "no-store",
             "Pragma" => "no-cache",
         ])
-        response = HTTP.Response(201, headers, JSON.json(body))
-        return oauth_log_and_respond(req, response; request_body=request_body)
+        return HTTP.Response(201, headers, JSON.json(body))
     end
     return handler
 end
 
 function token_handler(req::HTTP.Request, issuer::JWTAccessTokenIssuer)
     method = HTTP.method(req)
-    method == "POST" || return oauth_log_and_respond(req, HTTP.Response(405, HTTP.Headers(["Allow" => "POST"]), ""))
+    method == "POST" || return HTTP.Response(405, HTTP.Headers(["Allow" => "POST"]), "")
     body_bytes = req.body isa Vector{UInt8} ? req.body : Vector{UInt8}(codeunits(String(req.body)))
     params = parse_form_params(body_bytes)
     request_body = String(body_bytes)
     grant_type = get(params, "grant_type", nothing)
-    grant_type === nothing && return oauth_log_and_respond(req, json_error(400, "invalid_request", "grant_type is required"); request_body=request_body)
-    HTTP.ascii_lc_isequal(grant_type, "authorization_code") || return oauth_log_and_respond(req, json_error(400, "unsupported_grant_type", "Only authorization_code is supported"); request_body=request_body)
+    grant_type === nothing && return json_error(400, "invalid_request", "grant_type is required")
+    HTTP.ascii_lc_isequal(grant_type, "authorization_code") || return json_error(400, "unsupported_grant_type", "Only authorization_code is supported")
     client_id = get(params, "client_id", nothing)
-    client_id === nothing && return oauth_log_and_respond(req, json_error(400, "invalid_request", "client_id is required"); request_body=request_body)
-    HTTP.ascii_lc_isequal(client_id, CLIENT_ID) || return oauth_log_and_respond(req, json_error(400, "unauthorized_client", "Unknown client_id"); request_body=request_body)
+    client_id === nothing && return json_error(400, "invalid_request", "client_id is required")
+    HTTP.ascii_lc_isequal(client_id, CLIENT_ID) || return json_error(400, "unauthorized_client", "Unknown client_id")
     code_value = get(params, "code", nothing)
-    code_value === nothing && return oauth_log_and_respond(req, json_error(400, "invalid_request", "code is required"); request_body=request_body)
+    code_value === nothing && return json_error(400, "invalid_request", "code is required")
     redirect_uri = get(params, "redirect_uri", nothing)
-    redirect_uri === nothing && return oauth_log_and_respond(req, json_error(400, "invalid_request", "redirect_uri is required"); request_body=request_body)
+    redirect_uri === nothing && return json_error(400, "invalid_request", "redirect_uri is required")
     verifier = get(params, "code_verifier", nothing)
-    verifier === nothing && return oauth_log_and_respond(req, json_error(400, "invalid_request", "code_verifier is required"); request_body=request_body)
+    verifier === nothing && return json_error(400, "invalid_request", "code_verifier is required")
     code = consume_authorization_code(code_value)
-    code === nothing && return oauth_log_and_respond(req, json_error(400, "invalid_grant", "Authorization code is invalid or expired"); request_body=request_body)
-    client_id == code.client_id || return oauth_log_and_respond(req, json_error(400, "invalid_grant", "client_id mismatch"); request_body=request_body)
-    redirect_uri == code.redirect_uri || return oauth_log_and_respond(req, json_error(400, "invalid_grant", "redirect_uri mismatch"); request_body=request_body)
-    verify_pkce(code, verifier) || return oauth_log_and_respond(req, json_error(400, "invalid_grant", "PKCE verification failed"); request_body=request_body)
+    code === nothing && return json_error(400, "invalid_grant", "Authorization code is invalid or expired")
+    client_id == code.client_id || return json_error(400, "invalid_grant", "client_id mismatch")
+    redirect_uri == code.redirect_uri || return json_error(400, "invalid_grant", "redirect_uri mismatch")
+    verify_pkce(code, verifier) || return json_error(400, "invalid_grant", "PKCE verification failed")
 
     issued = issue_access_token(
         issuer;
@@ -591,8 +580,7 @@ function token_handler(req::HTTP.Request, issuer::JWTAccessTokenIssuer)
         "Cache-Control" => "no-store",
         "Pragma" => "no-cache",
     ])
-    response = HTTP.Response(200, headers, JSON.json(body))
-    return oauth_log_and_respond(req, response; request_body=request_body)
+    return HTTP.Response(200, headers, JSON.json(body))
 end
 
 function add_routes!(
@@ -643,7 +631,6 @@ function start_server()
         verbose=true,
     )
     server = MCPServer(config)
-    OAUTH_LOG_SERVER[] = server
     register_calculator_tools!(server)
     register_calculation_prompt!(server)
 
@@ -655,9 +642,9 @@ function start_server()
         error("Invalid MCP_PORT value $(port_str): $(err)")
     end
 
-    http_server = serve_mcp_http(server; host=host, port=port, verbose=false)
-    base = MCP.base_url(http_server)
-    transport_url = string("https://f8c4912df2d1.ngrok-free.app", server.transport_path)
+    http_server = serve_mcp_http(server; host=host, port=port, verbose=true)
+    base = "https://f8c4912df2d1.ngrok-free.app" # MCP.base_url(http_server)
+    transport_url = string(base, server.transport_path)
     issuer_url = base
     authorization_endpoint = string(base, "/oauth/authorize")
     token_endpoint = string(base, "/oauth/token")
@@ -713,7 +700,6 @@ function start_server()
         println("\nInterrupt received, shutting down...")
     finally
         stop_mcp_server(http_server)
-        OAUTH_LOG_SERVER[] = nothing
         println("Server stopped.")
     end
 end

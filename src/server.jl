@@ -55,33 +55,6 @@ end
 
 server_body_text(body) = body === nothing ? "" : body isa AbstractString ? String(body) : String(body)
 
-function log_server_http_request(server::MCPServer, req::HTTP.Request, body)
-    server.config.verbose || return
-    header_pairs = headers_to_pairs(req.headers)
-    printable_request = HTTP.Request(
-        request_method_string(req),
-        request_target_string(req),
-        header_pairs,
-        server_body_text(body),
-    )
-    println("MCP server HTTP request:")
-    println(printable_request)
-end
-
-function log_server_http_response(server::MCPServer, req::HTTP.Request, response::HTTP.Response; body_override=nothing)
-    server.config.verbose || return
-    body_value = body_override === nothing ? server_body_text(response.body) : server_body_text(body_override)
-    header_pairs = headers_to_pairs(response.headers)
-    printable_response = HTTP.Response(response.status, header_pairs, body_value)
-    println("MCP server HTTP response:")
-    println(printable_response)
-end
-
-respond(server::MCPServer, req::HTTP.Request, response::HTTP.Response; body_override=nothing) = begin
-    log_server_http_response(server, req, response; body_override=body_override)
-    return response
-end
-
 function normalize_log_level(level)
     level === nothing && return DEFAULT_LOG_LEVEL
     lowered = lowercase(String(level))
@@ -806,11 +779,10 @@ function server_manifest(server::MCPServer)
 end
 
 function manifest_response(server::MCPServer, req::HTTP.Request)
-    log_server_http_request(server, req, "")
     data = server_manifest(server)
     body = JSON.json(data)
     response = HTTP.Response(200, response_headers(server), body)
-    return respond(server, req, response; body_override=body)
+    return response
 end
 
 function jsonrpc_success(server::MCPServer, session::Union{MCPSession,Nothing}, id, result)
@@ -1140,19 +1112,18 @@ end
 function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
     server.request_hook !== nothing && server.request_hook(req)
     body = read_request_body(req)
-    log_server_http_request(server, req, body)
     header_error = validate_jsonrpc_headers(server, req)
-    header_error !== nothing && return respond(server, req, header_error)
+    header_error !== nothing && return header_error
     payload = try
         JSON.parse(body)
     catch err
         response = jsonrpc_error(server, nothing, nothing, -32700, "Failed to parse JSON-RPC body: $(sprint(showerror, err))")
-        return respond(server, req, response)
+        return response
     end
-    payload isa AbstractDict || return respond(server, req, jsonrpc_error(server, nothing, nothing, -32600, "JSON-RPC payload must be an object"))
+    payload isa AbstractDict || return jsonrpc_error(server, nothing, nothing, -32600, "JSON-RPC payload must be an object")
     id = get(payload, "id", nothing)
     method_value = get(payload, "method", nothing)
-    method_value isa AbstractString || return respond(server, req, jsonrpc_error(server, nothing, id, -32600, "JSON-RPC method must be a string"))
+    method_value isa AbstractString || return jsonrpc_error(server, nothing, id, -32600, "JSON-RPC method must be a string")
     method = String(method_value)
     params = params_dict(get(payload, "params", Dict{String,Any}()))
     timeout_ms = try
@@ -1161,7 +1132,7 @@ function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
         if err isa MCPError
             code, message = classify_error(err)
             response = jsonrpc_error(server, nothing, id, code, message)
-            return respond(server, req, response)
+            return response
         else
             rethrow(err)
         end
@@ -1172,7 +1143,7 @@ function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
         if err isa MCPError
             code, message = classify_error(err)
             response = jsonrpc_error(server, nothing, id, code, message)
-            return respond(server, req, response)
+            return response
         else
             rethrow(err)
         end
@@ -1188,32 +1159,31 @@ function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
             @warn "Error handling JSON-RPC notification" method=context.method err
         end
         response = HTTP.Response(204, response_headers(server; session=session, content_type=nothing))
-        return respond(server, req, response)
+        return response
     end
     try
         result = dispatch_jsonrpc(server, context, params)
         response = jsonrpc_success(server, session, id, result)
-        return respond(server, req, response)
+        return response
     catch err
         code, message = classify_error(err)
         response = jsonrpc_error(server, session, id, code, message)
-        return respond(server, req, response)
+        return response
     end
 end
 
 function handle_stream_request(server::MCPServer, req::HTTP.Request)
-    log_server_http_request(server, req, "")
     header_error = validate_stream_headers(server, req)
-    header_error !== nothing && return respond(server, req, header_error)
+    header_error !== nothing && return header_error
     session_id = HTTP.header(req, "Mcp-Session-Id")
     if session_id === nothing
         response = HTTP.Response(400, response_headers(server), JSON.json(Dict("error" => "Missing Mcp-Session-Id header")))
-        return respond(server, req, response)
+        return response
     end
     session = find_session(server, session_id)
     if session === nothing
         response = HTTP.Response(404, response_headers(server), JSON.json(Dict("error" => "Unknown session")))
-        return respond(server, req, response)
+            return response
     end
     ensure_session_initialized!(session, "event-stream")
     last_event = HTTP.header(req, "Last-Event-ID")
@@ -1239,7 +1209,7 @@ function handle_stream_request(server::MCPServer, req::HTTP.Request)
     end
     body = String(take!(buffer))
     response = HTTP.Response(200, response_headers(server; session=session, content_type=nothing, extra=extra_headers), body)
-    return respond(server, req, response; body_override=body)
+    return response
 end
 
 read_request_body(req::HTTP.Request) = begin
@@ -1269,9 +1239,18 @@ function build_router(server::MCPServer)
     return router
 end
 
+function handle_verbose_logging(f, verbose)
+    function (req::HTTP.Request)
+        verbose && @info req
+        resp = f(req)
+        verbose && @info resp
+        return resp
+    end
+end
+
 function serve_mcp_http(server::MCPServer; host::AbstractString="127.0.0.1", port::Integer=0, verbose::Bool=server.config.verbose)
     router = build_router(server)
-    http_server = HTTP.serve!(router, host, port; verbose=verbose)
+    http_server = HTTP.serve!(handle_verbose_logging(router, verbose), host, port)
     sock = Sockets.getsockname(http_server.listener.server)
     actual_port = sock isa Tuple ? sock[end] : sock.port
     actual_host = host
