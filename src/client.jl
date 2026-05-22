@@ -186,9 +186,9 @@ function open_event_stream(client::MCPClient; headers=nothing, timeout=nothing)
     header_pairs = normalize_headers(headers)
     request_headers = build_request_headers(client, header_pairs; content_type=nothing, accept="text/event-stream")
     if client.last_event_id !== nothing
-        HTTP.setheader(request_headers, "Last-Event-ID" => String(client.last_event_id))
+        set_header!(request_headers, "Last-Event-ID", String(client.last_event_id))
     end
-    timeout_settings = normalize_timeout(client, timeout)
+    timeout_settings = transport_timeout_kwargs(normalize_timeout(client, timeout))
     log_client_http_request(client, "GET", client.transport.url, request_headers, nothing)
     events = Any[]
     response = client.http.request(
@@ -457,7 +457,7 @@ function terminate_session!(client::MCPClient; headers=nothing, timeout=nothing)
     client.session_id === nothing && return nothing
     header_pairs = normalize_headers(headers)
     request_headers = build_request_headers(client, header_pairs; content_type=nothing)
-    timeout_settings = normalize_timeout(client, timeout)
+    timeout_settings = transport_timeout_kwargs(normalize_timeout(client, timeout))
     log_client_http_request(client, "DELETE", client.transport.url, request_headers, nothing)
     response = client.http.request(
         "DELETE",

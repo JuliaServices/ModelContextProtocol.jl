@@ -143,8 +143,7 @@ function start_auth_stub_server()
         HTTP.Response(200, ["Content-Type" => "application/json"], stub_protected_resource(base))
     end)
     server = HTTP.serve!(router, "127.0.0.1", 0; verbose=false)
-    sock = Sockets.getsockname(server.listener.server)
-    port = sock isa Tuple ? sock[end] : sock.port
+    port = ModelContextProtocol.bound_http_port(server)
     base = "http://127.0.0.1:$(port)"
     return server, base
 end
@@ -229,7 +228,7 @@ stop_auth_stub_server(server) = close(server)
         @test resource["contents"][1]["text"] == "Hello from stub resource"
 
         @test any(h -> get(h, "X-Test", "") == "alpha", state.headers)
-        @test any(h -> get(h, "MCP-Protocol-Version", "") == ModelContextProtocol.DEFAULT_PROTOCOL_VERSION, state.headers)
+        @test any(h -> any(lowercase(k) == "mcp-protocol-version" && v == ModelContextProtocol.DEFAULT_PROTOCOL_VERSION for (k, v) in h), state.headers)
         @test any(h -> any(lowercase(k) == "mcp-session-id" && !isempty(v) for (k, v) in h), state.headers)
         @test any(h -> any(lowercase(k) == "accept" && occursin("text/event-stream", lowercase(v)) for (k, v) in h), state.headers)
 

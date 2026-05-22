@@ -1,4 +1,6 @@
 normalize_pair(name, value) = String(name) => String(value)
+header_tuple(pair::Pair) = (String(pair.first), String(pair.second))
+header_tuple(pair::Tuple) = (String(pair[1]), String(pair[2]))
 
 function normalize_headers(headers)
     headers === nothing && return HeaderPair[]
@@ -25,15 +27,62 @@ function normalize_headers(headers)
     end
 end
 
-build_headers(headers::Vector{HeaderPair}) = HTTP.Headers(headers)
+function build_headers(headers::AbstractVector)
+    tuples = header_tuple.(headers)
+    try
+        return HTTP.Headers(tuples)
+    catch err
+        err isa MethodError || rethrow()
+        return HTTP.Headers(headers)
+    end
+end
+
+function set_header!(headers::HTTP.Headers, name::AbstractString, value::AbstractString)
+    entry = (String(name), String(value))
+    try
+        HTTP.setheader(headers, entry)
+    catch err
+        err isa MethodError || rethrow()
+        HTTP.setheader(headers, entry[1] => entry[2])
+    end
+    return headers
+end
+
+function http_header_value(headers, name::AbstractString, default=nothing)
+    sentinel = gensym()
+    value = HTTP.header(headers, name, sentinel)
+    value === sentinel || return value
+    for header in headers
+        key, val = header_tuple(header)
+        if lowercase(key) == lowercase(String(name))
+            return val
+        end
+    end
+    return default
+end
 
 function merge_headers(base::HTTP.Headers, additions::Vector{HeaderPair})
     isempty(additions) && return base
-    merged = HTTP.Headers(base)
+    merged = build_headers(normalize_headers(base))
     for (name, value) in additions
-        HTTP.setheader(merged, name => value)
+        set_header!(merged, name, value)
     end
     return merged
+end
+
+function transport_timeout_kwargs(timeout::NamedTuple)
+    kwargs = Pair{Symbol,Any}[]
+    for (key, value) in Base.pairs(timeout)
+        normalized_key = if !isdefined(HTTP, :Servers) && key == :connecttimeout
+            :connect_timeout
+        elseif !isdefined(HTTP, :Servers) && key == :readtimeout
+            :read_idle_timeout
+        else
+            key
+        end
+        push!(kwargs, normalized_key => value)
+    end
+    return (; kwargs...)
 end
 
 function ensure_http_url(url::AbstractString, label::AbstractString)

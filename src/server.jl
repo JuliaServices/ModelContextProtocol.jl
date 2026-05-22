@@ -15,7 +15,7 @@ end
 struct MCPHTTPServer
     server::MCPServer
     router::HTTP.Router
-    http::HTTP.Servers.Server
+    http::Any
     host::String
     port::Int
 end
@@ -399,7 +399,7 @@ function prune_session_events!(session::MCPSession, last_event_id::AbstractStrin
 end
 
 function parse_timeout_header(req::HTTP.Request)
-    header = HTTP.header(req, "Mcp-Timeout-Ms")
+    header = http_header_value(req.headers, "Mcp-Timeout-Ms")
     header === nothing && return nothing
     value_str = strip(String(header))
     isempty(value_str) && return nothing
@@ -413,7 +413,7 @@ function parse_timeout_header(req::HTTP.Request)
 end
 
 function ensure_session_for_request(server::MCPServer, req::HTTP.Request, method::AbstractString)
-    raw_header = HTTP.header(req, "MCP-Session-Id")
+    raw_header = http_header_value(req.headers, "MCP-Session-Id")
     header_value = raw_header === nothing ? nothing : String(raw_header)
     header_blank = header_value === nothing ? true : isempty(strip(header_value))
     if method == JSONRPC_METHOD_INITIALIZE
@@ -440,7 +440,7 @@ end
 function validate_jsonrpc_headers(server::MCPServer, req::HTTP.Request)
     origin_error = validate_origin_header(server, req)
     origin_error !== nothing && return origin_error
-    accept = HTTP.header(req, "Accept")
+    accept = http_header_value(req.headers, "Accept")
     accept_value = accept === nothing ? "" : lowercase(String(accept))
     if isempty(accept_value) || !occursin("application/json", accept_value)
         data = Dict("error" => "Request must accept application/json responses", "required" => "application/json, text/event-stream")
@@ -492,7 +492,7 @@ function is_loopback_origin(origin::AbstractString)
 end
 
 function validate_origin_header(server::MCPServer, req::HTTP.Request)
-    origin = HTTP.header(req, "Origin")
+    origin = http_header_value(req.headers, "Origin")
     origin === nothing && return nothing
     origin_str = strip(String(origin))
     isempty(origin_str) && return nothing
@@ -501,7 +501,7 @@ function validate_origin_header(server::MCPServer, req::HTTP.Request)
         origin_str in allowed && return nothing
         return HTTP.Response(403, response_headers(server), JSON.json(Dict("error" => "Forbidden Origin header")))
     end
-    request_host = HTTP.header(req, "Host")
+    request_host = http_header_value(req.headers, "Host")
     if is_loopback_origin(origin_str) && is_loopback_host(request_host)
         return nothing
     end
@@ -519,11 +519,11 @@ function response_headers(
     push!(headers, "MCP-Protocol-Version" => server.config.protocol_version)
     session !== nothing && push!(headers, "MCP-Session-Id" => session.id)
     append!(headers, extra)
-    return headers
+    return build_headers(headers)
 end
 
 function resolve_protocol_version(server::MCPServer, req::HTTP.Request, context::AbstractString)
-    protocol_raw = HTTP.header(req, "MCP-Protocol-Version")
+    protocol_raw = http_header_value(req.headers, "MCP-Protocol-Version")
     version = protocol_raw === nothing ? "" : String(protocol_raw)
     if isempty(strip(version))
         behavior = server.missing_protocol_header_behavior
@@ -542,7 +542,7 @@ end
 function validate_stream_headers(server::MCPServer, req::HTTP.Request)
     origin_error = validate_origin_header(server, req)
     origin_error !== nothing && return origin_error
-    accept = HTTP.header(req, "Accept")
+    accept = http_header_value(req.headers, "Accept")
     accept_value = accept === nothing ? "" : lowercase(String(accept))
     if isempty(accept_value) || !occursin("text/event-stream", accept_value)
         data = Dict("error" => "Event stream must accept text/event-stream responses")
@@ -1336,7 +1336,7 @@ end
 function handle_stream_request(server::MCPServer, req::HTTP.Request)
     header_error = validate_stream_headers(server, req)
     header_error !== nothing && return header_error
-    session_id = HTTP.header(req, "MCP-Session-Id")
+    session_id = http_header_value(req.headers, "MCP-Session-Id")
     if session_id === nothing
         response = HTTP.Response(400, response_headers(server), JSON.json(Dict("error" => "Missing MCP-Session-Id header")))
         return response
@@ -1347,7 +1347,7 @@ function handle_stream_request(server::MCPServer, req::HTTP.Request)
             return response
     end
     ensure_session_initialized!(session, "event-stream")
-    last_event = HTTP.header(req, "Last-Event-ID")
+    last_event = http_header_value(req.headers, "Last-Event-ID")
     last_event !== nothing && prune_session_events!(session, String(last_event))
     events = copy(session.pending_events)
     empty!(session.pending_events)
@@ -1357,11 +1357,7 @@ function handle_stream_request(server::MCPServer, req::HTTP.Request)
         heartbeat_event = MCPEvent(id=heartbeat_id, event="heartbeat", data=serialize_event_payload(heartbeat_payload))
         events = MCPEvent[heartbeat_event]
     end
-    response = HTTP.Response(
-        200,
-        response_headers(server; session=session, content_type=nothing, extra=HeaderPair["Connection" => "close"]),
-    )
-    HTTP.sse_stream(response) do stream
+    response = build_sse_response(response_headers(server; session=session, content_type=nothing)) do stream
         first_event = true
         for event in events
             write(
@@ -1392,13 +1388,29 @@ function handle_session_delete(server::MCPServer, req::HTTP.Request)
         )
         return HTTP.Response(400, response_headers(server), JSON.json(data))
     end
-    session_id = HTTP.header(req, "MCP-Session-Id")
+    session_id = http_header_value(req.headers, "MCP-Session-Id")
     if session_id === nothing || isempty(strip(String(session_id)))
         return HTTP.Response(400, response_headers(server), JSON.json(Dict("error" => "Missing MCP-Session-Id header")))
     end
     delete!(server.sessions, String(session_id))
     return HTTP.Response(202, response_headers(server; content_type=nothing))
 end
+
+function build_sse_response(headers::HTTP.Headers, writer::Function)
+    if isdefined(HTTP, :Servers)
+        response = HTTP.Response(200, headers)
+        HTTP.sse_stream(response) do stream
+            writer(stream)
+        end
+        return response
+    else
+        return HTTP.sse_stream(200; headers=headers) do stream
+            writer(stream)
+        end
+    end
+end
+
+build_sse_response(writer::Function, headers::HTTP.Headers) = build_sse_response(headers, writer)
 
 read_request_body(req::HTTP.Request) = begin
     body = req.body
@@ -1437,11 +1449,18 @@ function handle_verbose_logging(f, verbose)
     end
 end
 
+function bound_http_port(http_server)
+    if hasproperty(http_server, :bound_port)
+        return Int(getproperty(http_server, :bound_port))
+    end
+    sock = Sockets.getsockname(http_server.listener.server)
+    return sock isa Tuple ? Int(sock[end]) : Int(sock.port)
+end
+
 function serve_mcp_http(server::MCPServer; host::AbstractString="127.0.0.1", port::Integer=0, verbose::Bool=server.config.verbose)
     router = build_router(server)
     http_server = HTTP.serve!(handle_verbose_logging(router, verbose), host, port)
-    sock = Sockets.getsockname(http_server.listener.server)
-    actual_port = sock isa Tuple ? sock[end] : sock.port
+    actual_port = bound_http_port(http_server)
     actual_host = host
     return MCPHTTPServer(server, router, http_server, actual_host, actual_port)
 end
