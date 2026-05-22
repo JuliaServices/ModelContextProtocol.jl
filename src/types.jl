@@ -1,7 +1,7 @@
 const JSONDict = Dict{String,Any}
 const HeaderPair = Pair{String,String}
 
-const DEFAULT_PROTOCOL_VERSION = "2025-06-18"
+const DEFAULT_PROTOCOL_VERSION = "2025-11-25"
 const DEFAULT_MANIFEST_PATHS = (
     "/.well-known/ai-plugin.json",
     "/.well-known/mcp.json",
@@ -38,7 +38,8 @@ Base.@kwdef struct MCPServerConfig
     instructions::Union{String,Nothing}=nothing
     instructions_url::Union{String,Nothing}=nothing
     protocol_version::String=DEFAULT_PROTOCOL_VERSION
-    missing_protocol_header::Symbol=:warn
+    missing_protocol_header::Symbol=:error
+    allowed_origins::Union{Nothing,Vector{String}}=nothing
     transport_path::String="/v1/mcp"
     manifest_paths::Vector{String}=String[DEFAULT_MANIFEST_PATHS...]
     capabilities::Dict{String,Any}=Dict{String,Any}()
@@ -63,32 +64,47 @@ Base.@kwdef struct MCPServerTool
     description::Union{String,Nothing}=nothing
     input_schema::Union{Dict{String,Any},Nothing}=nothing
     output_schema::Union{Dict{String,Any},Nothing}=nothing
+    execution::Dict{String,Any}=Dict{String,Any}()
+    icons::Vector{Dict{String,Any}}=Dict{String,Any}[]
     annotations::Dict{String,Any}=Dict{String,Any}()
+    meta::Dict{String,Any}=Dict{String,Any}()
 end
 
 Base.@kwdef struct MCPServerPrompt
     name::String
     handler::Function
+    title::Union{String,Nothing}=nothing
     description::Union{String,Nothing}=nothing
+    arguments::Vector{Dict{String,Any}}=Dict{String,Any}[]
+    icons::Vector{Dict{String,Any}}=Dict{String,Any}[]
     annotations::Dict{String,Any}=Dict{String,Any}()
+    meta::Dict{String,Any}=Dict{String,Any}()
 end
 
 Base.@kwdef struct MCPServerResource
     uri::String
     handler::Function
+    name::Union{String,Nothing}=nothing
     title::Union{String,Nothing}=nothing
     description::Union{String,Nothing}=nothing
     mime_type::Union{String,Nothing}=nothing
     size::Union{Int,Nothing}=nothing
+    icons::Vector{Dict{String,Any}}=Dict{String,Any}[]
     annotations::Dict{String,Any}=Dict{String,Any}()
+    meta::Dict{String,Any}=Dict{String,Any}()
 end
 
 Base.@kwdef struct MCPServerResourceTemplate
     name::String
     handler::Function
+    uri_template::Union{String,Nothing}=nothing
+    title::Union{String,Nothing}=nothing
     description::Union{String,Nothing}=nothing
+    mime_type::Union{String,Nothing}=nothing
+    icons::Vector{Dict{String,Any}}=Dict{String,Any}[]
     annotations::Dict{String,Any}=Dict{String,Any}()
     input_schema::Union{Dict{String,Any},Nothing}=nothing
+    meta::Dict{String,Any}=Dict{String,Any}()
 end
 
 struct MCPClientConfig
@@ -120,6 +136,7 @@ mutable struct MCPClient
     initialized::Bool
     next_id::Base.RefValue{Int}
     notification_handlers::Dict{String,Vector{Function}}
+    request_handlers::Dict{String,Function}
     event_task::Union{Task,Nothing}
     last_event_id::Union{String,Nothing}
 end

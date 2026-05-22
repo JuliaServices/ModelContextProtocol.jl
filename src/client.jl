@@ -29,6 +29,7 @@ function prepare_manual_client(
         false,
         Base.Ref(0),
         Dict{String,Vector{Function}}(),
+        Dict{String,Function}(),
         nothing,
         nothing,
     )
@@ -96,10 +97,19 @@ end
 get_resource(client::MCPClient, uri::AbstractString; headers=nothing, timeout_ms=nothing) =
     read_resource(client, uri; headers=headers, timeout_ms=timeout_ms)
 
-function subscribe_resource(client::MCPClient, uri::AbstractString; mode::AbstractString="updates", headers=nothing, timeout_ms=nothing)
-    params = Dict("uri" => String(uri), "mode" => String(mode))
+function subscribe_resource(client::MCPClient, uri::AbstractString; mode::Union{Nothing,AbstractString}=nothing, headers=nothing, timeout_ms=nothing)
+    mode === nothing || @warn "subscribe_resource(mode=...) is ignored by MCP 2025-11-25; the wire request only includes uri"
+    params = Dict("uri" => String(uri))
     return jsonrpc_call(client, JSONRPC_METHOD_RESOURCES_SUBSCRIBE; params=params, headers=headers, timeout_ms=timeout_ms)
 end
+
+function unsubscribe_resource(client::MCPClient, uri::AbstractString; headers=nothing, timeout_ms=nothing)
+    params = Dict("uri" => String(uri))
+    return jsonrpc_call(client, JSONRPC_METHOD_RESOURCES_UNSUBSCRIBE; params=params, headers=headers, timeout_ms=timeout_ms)
+end
+
+ping(client::MCPClient; headers=nothing, timeout_ms=nothing) =
+    jsonrpc_call(client, JSONRPC_METHOD_PING; headers=headers, timeout_ms=timeout_ms)
 
 function set_log_level!(client::MCPClient, level::AbstractString; headers=nothing, timeout_ms=nothing)
     params = Dict("level" => String(level))
@@ -159,8 +169,6 @@ function initialize_client!(
     result = jsonrpc_call(client, JSONRPC_METHOD_INITIALIZE; params=params, headers=headers, timeout_ms=timeout_ms)
     session_data = result isa AbstractDict ? to_json_dict(result) : Dict{String,Any}()
     client.session = session_data
-    session_id = get(session_data, "sessionId", nothing)
-    client.session_id = session_id === nothing ? nothing : String(session_id)
     client.last_event_id = nothing
     send_initialized_notification!(client; headers=headers)
     return result
@@ -176,20 +184,36 @@ end
 function open_event_stream(client::MCPClient; headers=nothing, timeout=nothing)
     client.initialized || throw(mcp_error(:not_initialized, "Client must be initialized before opening an event stream"))
     header_pairs = normalize_headers(headers)
-    request_headers = build_request_headers(client, header_pairs)
-    HTTP.setheader(request_headers, "Accept" => "text/event-stream")
+    request_headers = build_request_headers(client, header_pairs; content_type=nothing, accept="text/event-stream")
     if client.last_event_id !== nothing
         HTTP.setheader(request_headers, "Last-Event-ID" => String(client.last_event_id))
     end
     timeout_settings = normalize_timeout(client, timeout)
     log_client_http_request(client, "GET", client.transport.url, request_headers, nothing)
+    events = Any[]
     response = client.http.request(
         "GET",
         client.transport.url;
         headers=request_headers,
         status_exception=false,
+        sse_callback=(stream, event) -> begin
+            push!(events, event)
+        end,
         timeout_settings...,
     )
+    buffer = IOBuffer()
+    for event in events
+        event.retry !== nothing && println(buffer, "retry: ", event.retry)
+        if event.event !== nothing && !isempty(event.event)
+            println(buffer, "event: ", event.event)
+        end
+        event.id !== nothing && println(buffer, "id: ", event.id)
+        for line in split(event.data, '\n'; keepempty=true)
+            println(buffer, "data: ", line)
+        end
+        println(buffer)
+    end
+    response = HTTP.Response(response.status, headers_to_pairs(response.headers), String(take!(buffer)))
     log_client_http_response(client, "GET", client.transport.url, response; streaming=true)
     status = response.status
     status in 200:299 || throw(mcp_error(:http_error, "Event stream request failed with status $(status)"))
@@ -209,6 +233,20 @@ function clear_notification_handlers!(client::MCPClient; method=nothing)
         empty!(client.notification_handlers)
     else
         delete!(client.notification_handlers, String(method))
+    end
+    return client
+end
+
+function register_request_handler!(client::MCPClient, method::AbstractString, handler::Function)
+    client.request_handlers[String(method)] = handler
+    return client
+end
+
+function clear_request_handlers!(client::MCPClient; method=nothing)
+    if method === nothing
+        empty!(client.request_handlers)
+    else
+        delete!(client.request_handlers, String(method))
     end
     return client
 end
@@ -233,6 +271,55 @@ function notify_handlers!(client::MCPClient, method::String, params)
         end
     end
     return nothing
+end
+
+function normalize_jsonrpc_response_error(error)
+    error isa AbstractDict && return to_json_dict(error)
+    if error isa MCPError
+        return Dict{String,Any}(
+            "code" => -32000,
+            "message" => error.message,
+        )
+    end
+    return Dict{String,Any}(
+        "code" => -32603,
+        "message" => sprint(showerror, error),
+    )
+end
+
+function send_jsonrpc_response!(client::MCPClient, id; result=nothing, error=nothing, headers=nothing, timeout=nothing)
+    payload = Dict{String,Any}(
+        "jsonrpc" => JSONRPC_VERSION,
+        "id" => id,
+    )
+    if error === nothing
+        payload["result"] = result === nothing ? Dict{String,Any}() : result
+    else
+        payload["error"] = normalize_jsonrpc_response_error(error)
+    end
+    body = JSON.json(payload)
+    response = submit_jsonrpc_request(client, body; headers=normalize_headers(headers), timeout=timeout)
+    return response
+end
+
+function handle_jsonrpc_request_event!(client::MCPClient, id, method::AbstractString, params)
+    handler = get(client.request_handlers, String(method), nothing)
+    if handler === nothing
+        return send_jsonrpc_response!(
+            client,
+            id;
+            error=Dict{String,Any}(
+                "code" => -32601,
+                "message" => "No client request handler registered for $(method)",
+            ),
+        )
+    end
+    try
+        result = handler(client, String(method), to_notification_payload(params), id)
+        return send_jsonrpc_response!(client, id; result=result)
+    catch err
+        return send_jsonrpc_response!(client, id; error=err)
+    end
 end
 
 function parse_sse_events(body::AbstractString)
@@ -281,7 +368,8 @@ function handle_jsonrpc_event!(client::MCPClient, payload)
     method_value = get(payload, "method", nothing)
     method_value === nothing && return
     if haskey(payload, "id") && payload["id"] !== nothing
-        @warn "Server initiated requests are not yet supported" method=method_value
+        method_value isa AbstractString || return
+        handle_jsonrpc_request_event!(client, payload["id"], method_value, get(payload, "params", Dict{String,Any}()))
         return
     end
     params = get(payload, "params", Dict{String,Any}())
@@ -310,7 +398,8 @@ function handle_sse_event!(client::MCPClient, event)
 end
 
 function event_listener_loop(client::MCPClient, poll_interval::Real, headers)
-    while true
+    current = current_task()
+    while client.event_task === current
         try
             response = open_event_stream(client; headers=headers)
             body = String(response.body)
@@ -318,7 +407,7 @@ function event_listener_loop(client::MCPClient, poll_interval::Real, headers)
                 handle_sse_event!(client, event)
             end
         catch err
-            if err isa InterruptException
+            if client.event_task !== current || err isa InterruptException
                 break
             elseif err isa MCPError
                 @warn "Event listener encountered MCP error" err
@@ -328,6 +417,7 @@ function event_listener_loop(client::MCPClient, poll_interval::Real, headers)
                 @warn "Event listener error" err
             end
         end
+        client.event_task === current || break
         poll_interval > 0 && sleep(poll_interval)
     end
 end
@@ -354,17 +444,34 @@ end
 function stop_event_listener!(client::MCPClient)
     task = client.event_task
     task === nothing && return nothing
+    client.event_task = nothing
     if !istaskdone(task)
-        try
-            Base.throwto(task, InterruptException())
-        catch
-        end
-        try
-            wait(task)
-        catch err
-            err isa InterruptException || @warn "Event listener stop error" err
-        end
+        timedwait(() -> istaskdone(task), 1.0; pollint=0.05)
     end
     client.event_task = nothing
     return nothing
+end
+
+function terminate_session!(client::MCPClient; headers=nothing, timeout=nothing)
+    ensure_http_transport(client.transport)
+    client.session_id === nothing && return nothing
+    header_pairs = normalize_headers(headers)
+    request_headers = build_request_headers(client, header_pairs; content_type=nothing)
+    timeout_settings = normalize_timeout(client, timeout)
+    log_client_http_request(client, "DELETE", client.transport.url, request_headers, nothing)
+    response = client.http.request(
+        "DELETE",
+        client.transport.url;
+        headers=request_headers,
+        status_exception=false,
+        timeout_settings...,
+    )
+    log_client_http_response(client, "DELETE", client.transport.url, response)
+    if !(response.status in (200, 202, 204, 405))
+        throw(mcp_error(:http_error, "Session termination failed with status $(response.status)"))
+    end
+    client.session = nothing
+    client.session_id = nothing
+    client.initialized = false
+    return response
 end

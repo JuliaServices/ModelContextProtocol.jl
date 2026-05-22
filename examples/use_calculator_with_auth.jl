@@ -2,7 +2,7 @@
 
 using ModelContextProtocol
 using OAuth
-using JSON3
+using JSON
 
 const MCP = ModelContextProtocol
 
@@ -28,16 +28,25 @@ function start_pkce_flow()
     return result
 end
 
+function print_json(value)
+    io = IOBuffer()
+    JSON.print(io, value, 2)
+    println(String(take!(io)))
+end
+
 function with_authenticated_client(f::Function)
     discovery = discover_server(SERVER_BASE_URL)
     flow = start_pkce_flow()
     client = prepare_manual_client(discovery)
     attach_token!(client, flow.token)
+    initialize_client!(
+        client;
+        client_info=Dict("name" => "Authenticated Calculator Example", "version" => "1.0.0"),
+    )
     try
-        initialize_client!(client; client_name="Authenticated Calculator Example", client_version="1.0")
         return f(client)
     finally
-        close(client)
+        terminate_session!(client)
     end
 end
 
@@ -45,7 +54,7 @@ function add_numbers(numbers::Vector{<:Real})
     with_authenticated_client() do client
         response = call_tool(client, "add"; arguments=Dict("numbers" => numbers))
         println("Tool call response:")
-        println(JSON3.write(response; indent=2))
+        print_json(response)
         return response
     end
 end

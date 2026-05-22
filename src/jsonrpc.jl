@@ -11,8 +11,10 @@ const JSONRPC_METHOD_RESOURCES_LIST = "resources/list"
 const JSONRPC_METHOD_RESOURCES_READ = "resources/read"
 const JSONRPC_METHOD_RESOURCES_TEMPLATES_LIST = "resources/templates/list"
 const JSONRPC_METHOD_RESOURCES_SUBSCRIBE = "resources/subscribe"
+const JSONRPC_METHOD_RESOURCES_UNSUBSCRIBE = "resources/unsubscribe"
 const JSONRPC_METHOD_COMPLETION_COMPLETE = "completion/complete"
 const JSONRPC_METHOD_LOGGING_SET_LEVEL = "logging/setLevel"
+const JSONRPC_METHOD_PING = "ping"
 const JSONRPC_METHOD_NOTIFICATIONS_MESSAGE = "notifications/message"
 const JSONRPC_METHOD_NOTIFICATIONS_TOOLS_LIST_CHANGED = "notifications/tools/list_changed"
 const JSONRPC_METHOD_NOTIFICATIONS_PROMPTS_LIST_CHANGED = "notifications/prompts/list_changed"
@@ -85,6 +87,12 @@ function jsonrpc_call(
         push!(header_pairs, normalize_pair("Mcp-Timeout-Ms", string(timeout_value)))
     end
     response = submit_jsonrpc_request(client, body; headers=header_pairs, timeout=timeout)
+    if String(method) == JSONRPC_METHOD_INITIALIZE
+        session_header = HTTP.header(response.headers, "MCP-Session-Id")
+        if session_header !== nothing && !isempty(strip(String(session_header)))
+            client.session_id = String(session_header)
+        end
+    end
     notification && return nothing
     isempty(response.body) && throw(mcp_error(:jsonrpc_error, "JSON-RPC response from $(client.transport.url) was empty"))
     data = parse_jsonrpc_response(response.body)
@@ -145,16 +153,21 @@ function parse_jsonrpc_response(body)
     return data
 end
 
-function build_request_headers(client::MCPClient, extra::Vector{HeaderPair})
+function build_request_headers(
+    client::MCPClient,
+    extra::Vector{HeaderPair};
+    content_type::Union{String,Nothing}="application/json",
+    accept::Union{String,Nothing}="application/json, text/event-stream",
+)
     headers = HTTP.Headers(client.headers)
-    HTTP.setheader(headers, "Content-Type" => "application/json")
-    HTTP.setheader(headers, "Accept" => "application/json, text/event-stream")
+    content_type !== nothing && HTTP.setheader(headers, "Content-Type" => content_type)
+    accept !== nothing && HTTP.setheader(headers, "Accept" => accept)
     HTTP.setheader(headers, "MCP-Protocol-Version" => client.protocol_version)
     if client.auth_token !== nothing
         HTTP.setheader(headers, "Authorization" => authorization_value(client.auth_token))
     end
     if client.session_id !== nothing
-        HTTP.setheader(headers, "Mcp-Session-Id" => String(client.session_id))
+        HTTP.setheader(headers, "MCP-Session-Id" => String(client.session_id))
     end
     for (name, value) in extra
         HTTP.setheader(headers, name => value)

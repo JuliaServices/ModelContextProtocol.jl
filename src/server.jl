@@ -22,7 +22,7 @@ end
 
 canonical_transport_path(path::AbstractString) = startswith(path, "/") ? String(path) : string("/", path)
 
-const MCP_LOG_LEVELS = ["trace", "debug", "info", "warn", "error"]
+const MCP_LOG_LEVELS = ["debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"]
 const DEFAULT_LOG_LEVEL = "info"
 const MISSING_PROTOCOL_HEADER_BEHAVIORS = (:error, :warn, :ignore)
 
@@ -58,16 +58,14 @@ server_body_text(body) = body === nothing ? "" : body isa AbstractString ? Strin
 function normalize_log_level(level)
     level === nothing && return DEFAULT_LOG_LEVEL
     lowered = lowercase(String(level))
+    lowered == "warn" && return "warning"
+    lowered == "trace" && return "debug"
     lowered in MCP_LOG_LEVELS || throw(mcp_error(:invalid_params, "Unsupported log level $(level)"))
     return lowered
 end
 
 function default_server_capabilities()
-    return Dict{String,Any}(
-        "tools" => Dict{String,Any}(),
-        "prompts" => Dict{String,Any}(),
-        "resources" => Dict{String,Any}(),
-    )
+    return Dict{String,Any}()
 end
 
 function MCPServer(config::MCPServerConfig)
@@ -160,8 +158,8 @@ function clear_logging_handler!(server::MCPServer)
 end
 
 function ensure_completion_capability!(server::MCPServer)
-    caps = ensure_capability!(server, "completion")
-    caps isa AbstractDict || (server.capabilities["completion"] = Dict{String,Any}(); caps = server.capabilities["completion"])
+    caps = ensure_capability!(server, "completions")
+    caps isa AbstractDict || (server.capabilities["completions"] = Dict{String,Any}(); caps = server.capabilities["completions"])
     caps["structured"] = true
     return caps
 end
@@ -200,9 +198,13 @@ normalize_dict_or_empty(value, label) = begin
 end
 
 function parse_positive_int(value, label)
-    ivalue = try
-        parse(Int, String(value))
-    catch
+    ivalue = if value isa Integer
+        Int(value)
+    elseif value isa AbstractString
+        parsed = tryparse(Int, strip(value))
+        parsed === nothing && throw(mcp_error(:invalid_params, "$(label) must be an integer"))
+        parsed
+    else
         throw(mcp_error(:invalid_params, "$(label) must be an integer"))
     end
     ivalue > 0 || throw(mcp_error(:invalid_params, "$(label) must be positive"))
@@ -236,7 +238,7 @@ end
 
 function paginate_collection(items::Vector, params::Dict{String,Any}, key::String)
     page, next_cursor = paginate_vector(items, params)
-    response = Dict(key => page)
+    response = Dict{String,Any}(key => page)
     next_cursor !== nothing && (response["nextCursor"] = next_cursor)
     return response
 end
@@ -244,7 +246,9 @@ end
 function log_message!(
     server::MCPServer;
     level=server.logging_level,
-    message,
+    message=nothing,
+    data=message,
+    logger=nothing,
     session::Union{MCPSession,Nothing}=nothing,
     session_id::Union{AbstractString,Nothing}=nothing,
     annotations=nothing,
@@ -254,8 +258,9 @@ function log_message!(
     lvl = normalize_log_level(level)
     payload = Dict{String,Any}(
         "level" => lvl,
-        "message" => String(message),
+        "data" => data === nothing ? "" : data,
     )
+    logger !== nothing && (payload["logger"] = String(logger))
     ann = annotations === nothing ? Dict{String,Any}() : normalize_dict(annotations, "annotations")
     metadata !== nothing && begin
         meta = normalize_dict(metadata, "metadata")
@@ -408,7 +413,7 @@ function parse_timeout_header(req::HTTP.Request)
 end
 
 function ensure_session_for_request(server::MCPServer, req::HTTP.Request, method::AbstractString)
-    raw_header = HTTP.header(req, "Mcp-Session-Id")
+    raw_header = HTTP.header(req, "MCP-Session-Id")
     header_value = raw_header === nothing ? nothing : String(raw_header)
     header_blank = header_value === nothing ? true : isempty(strip(header_value))
     if method == JSONRPC_METHOD_INITIALIZE
@@ -420,7 +425,7 @@ function ensure_session_for_request(server::MCPServer, req::HTTP.Request, method
             return session
         end
     else
-        (header_value === nothing || header_blank) && throw(mcp_error(:session_required, "Mcp-Session-Id header is required for $(method)"))
+        (header_value === nothing || header_blank) && throw(mcp_error(:session_required, "MCP-Session-Id header is required for $(method)"))
         session = find_session(server, header_value)
         session === nothing && throw(mcp_error(:invalid_session, "Unknown MCP session $(String(header_value))"))
         return session
@@ -433,6 +438,8 @@ function ensure_session_initialized!(session::MCPSession, method::AbstractString
 end
 
 function validate_jsonrpc_headers(server::MCPServer, req::HTTP.Request)
+    origin_error = validate_origin_header(server, req)
+    origin_error !== nothing && return origin_error
     accept = HTTP.header(req, "Accept")
     accept_value = accept === nothing ? "" : lowercase(String(accept))
     if isempty(accept_value) || !occursin("application/json", accept_value)
@@ -451,9 +458,54 @@ function validate_jsonrpc_headers(server::MCPServer, req::HTTP.Request)
             "expected" => server.config.protocol_version,
             "received" => version,
         )
-        return HTTP.Response(426, response_headers(server), JSON.json(data))
+        return HTTP.Response(400, response_headers(server), JSON.json(data))
     end
     return nothing
+end
+
+function normalize_host_for_origin(host)
+    host === nothing && return ""
+    host_str = lowercase(String(host))
+    isempty(host_str) && return ""
+    if startswith(host_str, "[")
+        closing = findfirst(']', host_str)
+        closing === nothing && return host_str
+        return host_str[1:closing]
+    end
+    return split(host_str, ':')[1]
+end
+
+function is_loopback_host(host)
+    normalized = normalize_host_for_origin(host)
+    return normalized in ("localhost", "127.0.0.1", "::1", "[::1]")
+end
+
+function is_loopback_origin(origin::AbstractString)
+    uri = try
+        HTTP.URI(String(origin))
+    catch
+        return false
+    end
+    scheme = uri.scheme === nothing ? "" : lowercase(String(uri.scheme))
+    scheme in ("http", "https") || return false
+    return is_loopback_host(uri.host)
+end
+
+function validate_origin_header(server::MCPServer, req::HTTP.Request)
+    origin = HTTP.header(req, "Origin")
+    origin === nothing && return nothing
+    origin_str = strip(String(origin))
+    isempty(origin_str) && return nothing
+    allowed = server.config.allowed_origins
+    if allowed !== nothing
+        origin_str in allowed && return nothing
+        return HTTP.Response(403, response_headers(server), JSON.json(Dict("error" => "Forbidden Origin header")))
+    end
+    request_host = HTTP.header(req, "Host")
+    if is_loopback_origin(origin_str) && is_loopback_host(request_host)
+        return nothing
+    end
+    return HTTP.Response(403, response_headers(server), JSON.json(Dict("error" => "Forbidden Origin header")))
 end
 
 function response_headers(
@@ -465,7 +517,7 @@ function response_headers(
     headers = HeaderPair[]
     content_type !== nothing && push!(headers, "Content-Type" => content_type)
     push!(headers, "MCP-Protocol-Version" => server.config.protocol_version)
-    session !== nothing && push!(headers, "Mcp-Session-Id" => session.id)
+    session !== nothing && push!(headers, "MCP-Session-Id" => session.id)
     append!(headers, extra)
     return headers
 end
@@ -477,7 +529,7 @@ function resolve_protocol_version(server::MCPServer, req::HTTP.Request, context:
         behavior = server.missing_protocol_header_behavior
         if behavior == :error
             data = Dict("error" => "Missing MCP-Protocol-Version header", "expected" => server.config.protocol_version)
-            return nothing, HTTP.Response(426, response_headers(server), JSON.json(data))
+            return nothing, HTTP.Response(400, response_headers(server), JSON.json(data))
         end
         if behavior == :warn
             @warn "MCP $(context) missing MCP-Protocol-Version header; defaulting to $(server.config.protocol_version)" method=request_method_string(req) target=request_target_string(req)
@@ -488,6 +540,8 @@ function resolve_protocol_version(server::MCPServer, req::HTTP.Request, context:
 end
 
 function validate_stream_headers(server::MCPServer, req::HTTP.Request)
+    origin_error = validate_origin_header(server, req)
+    origin_error !== nothing && return origin_error
     accept = HTTP.header(req, "Accept")
     accept_value = accept === nothing ? "" : lowercase(String(accept))
     if isempty(accept_value) || !occursin("text/event-stream", accept_value)
@@ -502,7 +556,7 @@ function validate_stream_headers(server::MCPServer, req::HTTP.Request)
             "expected" => server.config.protocol_version,
             "received" => version,
         )
-        return HTTP.Response(426, response_headers(server), JSON.json(data))
+        return HTTP.Response(400, response_headers(server), JSON.json(data))
     end
     return nothing
 end
@@ -530,7 +584,10 @@ function register_tool!(server::MCPServer, tool::MCPServerTool)
         description=maybe_string(tool.description),
         input_schema=normalize_dict(tool.input_schema, "input_schema"),
         output_schema=normalize_dict(tool.output_schema, "output_schema"),
+        execution=normalize_dict_or_empty(tool.execution, "execution"),
+        icons=[normalize_dict_or_empty(icon, "icon") for icon in tool.icons],
         annotations=normalize_dict_or_empty(tool.annotations, "annotations"),
+        meta=normalize_dict_or_empty(tool.meta, "_meta"),
     )
     ensure_capability!(server, "tools")
     notify_list_changed!(server, "tools")
@@ -545,7 +602,10 @@ function register_tool!(
     description=nothing,
     input_schema=nothing,
     output_schema=nothing,
+    execution=Dict{String,Any}(),
+    icons=Dict{String,Any}[],
     annotations=Dict{String,Any}(),
+    meta=Dict{String,Any}(),
     metadata=nothing,
 )
     annotation_data = normalize_dict_or_empty(annotations, "annotations")
@@ -560,9 +620,19 @@ function register_tool!(
         description=description,
         input_schema=input_schema,
         output_schema=output_schema,
+        execution=normalize_dict_or_empty(execution, "execution"),
+        icons=[normalize_dict_or_empty(icon, "icon") for icon in icons],
         annotations=annotation_data,
+        meta=normalize_dict_or_empty(meta, "_meta"),
     )
     return register_tool!(server, tool)
+end
+
+function register_tools!(server::MCPServer, tools; kwargs...)
+    for tool in tools
+        register_tool!(server, tool; kwargs...)
+    end
+    return server
 end
 
 function register_prompt!(server::MCPServer, prompt::MCPServerPrompt)
@@ -571,15 +641,19 @@ function register_prompt!(server::MCPServer, prompt::MCPServerPrompt)
     server.prompts[name] = MCPServerPrompt(
         name=name,
         handler=prompt.handler,
+        title=maybe_string(prompt.title),
         description=maybe_string(prompt.description),
+        arguments=[normalize_dict_or_empty(arg, "argument") for arg in prompt.arguments],
+        icons=[normalize_dict_or_empty(icon, "icon") for icon in prompt.icons],
         annotations=normalize_dict_or_empty(prompt.annotations, "annotations"),
+        meta=normalize_dict_or_empty(prompt.meta, "_meta"),
     )
     ensure_capability!(server, "prompts")
     notify_list_changed!(server, "prompts")
     return server.prompts[name]
 end
 
-function register_prompt!(server::MCPServer; name, handler::Function, description=nothing, annotations=Dict{String,Any}(), metadata=nothing)
+function register_prompt!(server::MCPServer; name, handler::Function, title=nothing, description=nothing, arguments=Dict{String,Any}[], icons=Dict{String,Any}[], annotations=Dict{String,Any}(), meta=Dict{String,Any}(), metadata=nothing)
     annotation_data = normalize_dict_or_empty(annotations, "annotations")
     if metadata !== nothing
         meta = normalize_dict(metadata, "metadata")
@@ -588,8 +662,12 @@ function register_prompt!(server::MCPServer; name, handler::Function, descriptio
     prompt = MCPServerPrompt(
         name=String(name),
         handler=handler,
+        title=title,
         description=description,
+        arguments=[normalize_dict_or_empty(arg, "argument") for arg in arguments],
+        icons=[normalize_dict_or_empty(icon, "icon") for icon in icons],
         annotations=annotation_data,
+        meta=normalize_dict_or_empty(meta, "_meta"),
     )
     return register_prompt!(server, prompt)
 end
@@ -601,11 +679,14 @@ function register_resource!(server::MCPServer, resource::MCPServerResource)
     server.resources[uri] = MCPServerResource(
         uri=uri,
         handler=resource.handler,
+        name=maybe_string(resource.name),
         title=maybe_string(resource.title),
         description=maybe_string(resource.description),
         mime_type=maybe_string(resource.mime_type),
         size=size_value,
+        icons=[normalize_dict_or_empty(icon, "icon") for icon in resource.icons],
         annotations=normalize_dict_or_empty(resource.annotations, "annotations"),
+        meta=normalize_dict_or_empty(resource.meta, "_meta"),
     )
     ensure_capability!(server, "resources")
     notify_list_changed!(server, "resources")
@@ -621,7 +702,9 @@ function register_resource!(
     description=nothing,
     mime_type=nothing,
     size=nothing,
+    icons=Dict{String,Any}[],
     annotations=Dict{String,Any}(),
+    meta=Dict{String,Any}(),
     metadata=nothing,
 )
     annotation_data = normalize_dict_or_empty(annotations, "annotations")
@@ -633,11 +716,14 @@ function register_resource!(
     resource = MCPServerResource(
         uri=String(uri),
         handler=handler,
+        name=name === nothing ? nothing : String(name),
         title=effective_title,
         description=description,
         mime_type=mime_type,
         size=size,
+        icons=[normalize_dict_or_empty(icon, "icon") for icon in icons],
         annotations=annotation_data,
+        meta=normalize_dict_or_empty(meta, "_meta"),
     )
     return register_resource!(server, resource)
 end
@@ -648,16 +734,18 @@ function register_resource_template!(server::MCPServer, template::MCPServerResou
     server.resource_templates[name] = MCPServerResourceTemplate(
         name=name,
         handler=template.handler,
+        uri_template=maybe_string(template.uri_template),
+        title=maybe_string(template.title),
         description=maybe_string(template.description),
+        mime_type=maybe_string(template.mime_type),
+        icons=[normalize_dict_or_empty(icon, "icon") for icon in template.icons],
         annotations=normalize_dict_or_empty(template.annotations, "annotations"),
         input_schema=normalize_dict(template.input_schema, "input_schema"),
+        meta=normalize_dict_or_empty(template.meta, "_meta"),
     )
     resources_cap = ensure_capability!(server, "resources")
     if resources_cap isa AbstractDict
-        templates_block = get!(resources_cap, "templates", Dict{String,Any}())
-        templates_block["list"] = true
-        resources_cap["templates"] = templates_block
-        resources_cap["subscriptions"] = true
+        resources_cap["subscribe"] = true
     end
     notify_list_changed!(server, "resources/templates")
     return server.resource_templates[name]
@@ -667,8 +755,13 @@ function register_resource_template!(
     server::MCPServer;
     name,
     handler::Function,
+    uri_template=nothing,
+    title=nothing,
     description=nothing,
+    mime_type=nothing,
+    icons=Dict{String,Any}[],
     annotations=Dict{String,Any}(),
+    meta=Dict{String,Any}(),
     metadata=nothing,
     input_schema=nothing,
 )
@@ -680,9 +773,14 @@ function register_resource_template!(
     template = MCPServerResourceTemplate(
         name=String(name),
         handler=handler,
+        uri_template=uri_template,
+        title=title,
         description=description,
+        mime_type=mime_type,
+        icons=[normalize_dict_or_empty(icon, "icon") for icon in icons],
         annotations=annotation_data,
         input_schema=input_schema,
+        meta=normalize_dict_or_empty(meta, "_meta"),
     )
     return register_resource_template!(server, template)
 end
@@ -719,21 +817,15 @@ function manifest_capabilities(server::MCPServer)
     if !isempty(server.resources) || !isempty(server.resource_templates)
         resources_cap = ensure_dict_capability!(capabilities, "resources")
         resources_cap["listChanged"] = true
-        resources_cap["subscriptions"] = true
-        if !isempty(server.resource_templates)
-            templates_cap = get(resources_cap, "templates", Dict{String,Any}())
-            templates_cap isa AbstractDict || (templates_cap = Dict{String,Any}())
-            templates_cap["list"] = true
-            resources_cap["templates"] = templates_cap
-        end
+        resources_cap["subscribe"] = true
     end
     if server.logging_handler !== nothing || haskey(capabilities, "logging")
         logging_cap = ensure_dict_capability!(capabilities, "logging")
         haskey(logging_cap, "levels") || (logging_cap["levels"] = MCP_LOG_LEVELS)
         logging_cap["setLevel"] = true
     end
-    if server.completion_handler !== nothing || haskey(capabilities, "completion")
-        completion_cap = ensure_dict_capability!(capabilities, "completion")
+    if server.completion_handler !== nothing || haskey(capabilities, "completions")
+        completion_cap = ensure_dict_capability!(capabilities, "completions")
         completion_cap["structured"] = true
     end
     return capabilities
@@ -821,42 +913,60 @@ function tool_descriptor(tool::MCPServerTool)
     data = Dict{String,Any}("name" => tool.name)
     tool.title !== nothing && (data["title"] = tool.title)
     tool.description !== nothing && (data["description"] = tool.description)
-    tool.input_schema !== nothing && (data["inputSchema"] = tool.input_schema)
+    data["inputSchema"] = tool.input_schema === nothing ? Dict{String,Any}("type" => "object") : tool.input_schema
     tool.output_schema !== nothing && (data["outputSchema"] = tool.output_schema)
+    !isempty(tool.execution) && (data["execution"] = tool.execution)
+    !isempty(tool.icons) && (data["icons"] = tool.icons)
     if !isempty(tool.annotations)
         data["annotations"] = tool.annotations
     end
+    !isempty(tool.meta) && (data["_meta"] = tool.meta)
     return data
 end
 
 function prompt_descriptor(prompt::MCPServerPrompt)
     data = Dict{String,Any}("name" => prompt.name)
+    prompt.title !== nothing && (data["title"] = prompt.title)
     prompt.description !== nothing && (data["description"] = prompt.description)
+    !isempty(prompt.arguments) && (data["arguments"] = prompt.arguments)
+    !isempty(prompt.icons) && (data["icons"] = prompt.icons)
     if !isempty(prompt.annotations)
         data["annotations"] = prompt.annotations
     end
+    !isempty(prompt.meta) && (data["_meta"] = prompt.meta)
     return data
 end
 
 function resource_descriptor(resource::MCPServerResource)
-    data = Dict{String,Any}("uri" => resource.uri)
+    data = Dict{String,Any}(
+        "name" => resource.name === nothing ? resource.uri : resource.name,
+        "uri" => resource.uri,
+    )
     resource.title !== nothing && (data["title"] = resource.title)
     resource.description !== nothing && (data["description"] = resource.description)
     resource.mime_type !== nothing && (data["mimeType"] = resource.mime_type)
     resource.size !== nothing && (data["size"] = resource.size)
+    !isempty(resource.icons) && (data["icons"] = resource.icons)
     if !isempty(resource.annotations)
         data["annotations"] = resource.annotations
     end
+    !isempty(resource.meta) && (data["_meta"] = resource.meta)
     return data
 end
 
 function resource_template_descriptor(template::MCPServerResourceTemplate)
-    data = Dict{String,Any}("name" => template.name)
+    data = Dict{String,Any}(
+        "name" => template.name,
+        "uriTemplate" => template.uri_template === nothing ? template.name : template.uri_template,
+    )
+    template.title !== nothing && (data["title"] = template.title)
     template.description !== nothing && (data["description"] = template.description)
-    template.input_schema !== nothing && (data["inputSchema"] = template.input_schema)
+    template.mime_type !== nothing && (data["mimeType"] = template.mime_type)
+    !isempty(template.icons) && (data["icons"] = template.icons)
     if !isempty(template.annotations)
         data["annotations"] = template.annotations
     end
+    !isempty(template.meta) && (data["_meta"] = template.meta)
     return data
 end
 
@@ -892,6 +1002,10 @@ function normalize_tool_result(result)
     if haskey(result, "annotations")
         annotations = normalize_dict(result["annotations"], "annotations")
         annotations !== nothing && !isempty(annotations) && (normalized["annotations"] = annotations)
+    end
+    if haskey(result, "_meta")
+        meta = normalize_dict(result["_meta"], "_meta")
+        meta !== nothing && !isempty(meta) && (normalized["_meta"] = meta)
     end
     if haskey(result, "outputSchema")
         normalized["outputSchema"] = result["outputSchema"]
@@ -974,7 +1088,7 @@ end
 
 function list_resource_templates(server::MCPServer, params::Dict{String,Any})
     items = [resource_template_descriptor(template) for template in values(server.resource_templates)]
-    return paginate_collection(items, params, "templates")
+    return paginate_collection(items, params, "resourceTemplates")
 end
 
 function read_resource(server::MCPServer, context::MCPRequestContext, params::Dict{String,Any})
@@ -990,13 +1104,20 @@ function subscribe_resource(server::MCPServer, context::MCPRequestContext, param
     context.session === nothing && throw(mcp_error(:invalid_request, "resources/subscribe requires a session"))
     haskey(params, "uri") || throw(mcp_error(:invalid_params, "Subscription requires a uri"))
     uri = String(params["uri"])
-    mode = get(params, "mode", "updates")
     push!(context.session.subscriptions, uri)
     resources_cap = ensure_capability!(server, "resources")
     if resources_cap isa AbstractDict
-        resources_cap["subscriptions"] = true
+        resources_cap["subscribe"] = true
     end
-    return Dict("uri" => uri, "mode" => mode)
+    return Dict{String,Any}()
+end
+
+function unsubscribe_resource(server::MCPServer, context::MCPRequestContext, params::Dict{String,Any})
+    context.session === nothing && throw(mcp_error(:invalid_request, "resources/unsubscribe requires a session"))
+    haskey(params, "uri") || throw(mcp_error(:invalid_params, "Unsubscribe requires a uri"))
+    uri = String(params["uri"])
+    delete!(context.session.subscriptions, uri)
+    return Dict{String,Any}()
 end
 
 function notify_resource_updated!(
@@ -1039,18 +1160,21 @@ end
 
 function initialize_response(server::MCPServer, session::MCPSession, params::Dict{String,Any})
     _ = params # currently unused, retained for future extensions
-    return Dict(
+    result = Dict(
         "protocolVersion" => server.config.protocol_version,
-        "capabilities" => server.capabilities,
+        "capabilities" => manifest_capabilities(server),
         "serverInfo" => server.server_info,
-        "sessionId" => session.id,
     )
+    server.config.instructions !== nothing && (result["instructions"] = String(server.config.instructions))
+    return result
 end
 
 function dispatch_jsonrpc(server::MCPServer, context::MCPRequestContext, params::Dict{String,Any})
     method = context.method
     if method == JSONRPC_METHOD_INITIALIZE
         return initialize_response(server, context.session, params)
+    elseif method == JSONRPC_METHOD_PING
+        return Dict{String,Any}()
     elseif method == JSONRPC_METHOD_NOTIFICATIONS_INITIALIZED
         context.session === nothing && throw(mcp_error(:invalid_request, "notifications/initialized requires a session"))
         context.session.initialized = true
@@ -1071,6 +1195,8 @@ function dispatch_jsonrpc(server::MCPServer, context::MCPRequestContext, params:
         return list_resource_templates(server, params)
     elseif method == JSONRPC_METHOD_RESOURCES_SUBSCRIBE
         return subscribe_resource(server, context, params)
+    elseif method == JSONRPC_METHOD_RESOURCES_UNSUBSCRIBE
+        return unsubscribe_resource(server, context, params)
     elseif method == JSONRPC_METHOD_COMPLETION_COMPLETE
         return handle_completion_request(server, context, params)
     elseif method == JSONRPC_METHOD_LOGGING_SET_LEVEL
@@ -1122,6 +1248,31 @@ function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
     end
     payload isa AbstractDict || return jsonrpc_error(server, nothing, nothing, -32600, "JSON-RPC payload must be an object")
     id = get(payload, "id", nothing)
+    if !haskey(payload, "method") && id !== nothing && (haskey(payload, "result") || haskey(payload, "error"))
+        session = try
+            ensure_session_for_request(server, req, "JSON-RPC response")
+        catch err
+            if err isa MCPError
+                code, message = classify_error(err)
+                response = jsonrpc_error(server, nothing, nothing, code, message)
+                return response
+            else
+                rethrow(err)
+            end
+        end
+        try
+            ensure_session_initialized!(session, "JSON-RPC response")
+        catch err
+            if err isa MCPError
+                code, message = classify_error(err)
+                response = jsonrpc_error(server, session, nothing, code, message)
+                return response
+            else
+                rethrow(err)
+            end
+        end
+        return HTTP.Response(202, response_headers(server; session=session, content_type=nothing))
+    end
     method_value = get(payload, "method", nothing)
     method_value isa AbstractString || return jsonrpc_error(server, nothing, id, -32600, "JSON-RPC method must be a string")
     method = String(method_value)
@@ -1148,9 +1299,19 @@ function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
             rethrow(err)
         end
     end
-    context = MCPRequestContext(server, req, method, id, payload, session, timeout_ms)
-    if method != JSONRPC_METHOD_INITIALIZE && method != JSONRPC_METHOD_NOTIFICATIONS_INITIALIZED
-        ensure_session_initialized!(session, method)
+    context = MCPRequestContext(server, req, method, id, params, session, timeout_ms)
+    try
+        if method != JSONRPC_METHOD_INITIALIZE && method != JSONRPC_METHOD_NOTIFICATIONS_INITIALIZED
+            ensure_session_initialized!(session, method)
+        end
+    catch err
+        if err isa MCPError
+            code, message = classify_error(err)
+            response = jsonrpc_error(server, session, id, code, message)
+            return response
+        else
+            rethrow(err)
+        end
     end
     if id === nothing
         try
@@ -1158,7 +1319,7 @@ function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
         catch err
             @warn "Error handling JSON-RPC notification" method=context.method err
         end
-        response = HTTP.Response(204, response_headers(server; session=session, content_type=nothing))
+        response = HTTP.Response(202, response_headers(server; session=session, content_type=nothing))
         return response
     end
     try
@@ -1175,9 +1336,9 @@ end
 function handle_stream_request(server::MCPServer, req::HTTP.Request)
     header_error = validate_stream_headers(server, req)
     header_error !== nothing && return header_error
-    session_id = HTTP.header(req, "Mcp-Session-Id")
+    session_id = HTTP.header(req, "MCP-Session-Id")
     if session_id === nothing
-        response = HTTP.Response(400, response_headers(server), JSON.json(Dict("error" => "Missing Mcp-Session-Id header")))
+        response = HTTP.Response(400, response_headers(server), JSON.json(Dict("error" => "Missing MCP-Session-Id header")))
         return response
     end
     session = find_session(server, session_id)
@@ -1196,20 +1357,47 @@ function handle_stream_request(server::MCPServer, req::HTTP.Request)
         heartbeat_event = MCPEvent(id=heartbeat_id, event="heartbeat", data=serialize_event_payload(heartbeat_payload))
         events = MCPEvent[heartbeat_event]
     end
-    extra_headers = HeaderPair[
-        "Cache-Control" => "no-cache",
-        "Connection" => "keep-alive",
-        "Content-Type" => "text/event-stream",
-    ]
-    buffer = IOBuffer()
-    println(buffer, "retry: 15000")
-    println(buffer)
-    for event in events
-        write(buffer, format_sse_event(event))
+    response = HTTP.Response(
+        200,
+        response_headers(server; session=session, content_type=nothing, extra=HeaderPair["Connection" => "close"]),
+    )
+    HTTP.sse_stream(response) do stream
+        first_event = true
+        for event in events
+            write(
+                stream,
+                HTTP.SSEEvent(
+                    event.data;
+                    event=event.event,
+                    id=event.id,
+                    retry=first_event ? 15000 : nothing,
+                ),
+            )
+            first_event = false
+        end
     end
-    body = String(take!(buffer))
-    response = HTTP.Response(200, response_headers(server; session=session, content_type=nothing, extra=extra_headers), body)
     return response
+end
+
+function handle_session_delete(server::MCPServer, req::HTTP.Request)
+    origin_error = validate_origin_header(server, req)
+    origin_error !== nothing && return origin_error
+    version, version_error = resolve_protocol_version(server, req, "session delete request")
+    version_error !== nothing && return version_error
+    if version != server.config.protocol_version
+        data = Dict(
+            "error" => "Unsupported MCP protocol version",
+            "expected" => server.config.protocol_version,
+            "received" => version,
+        )
+        return HTTP.Response(400, response_headers(server), JSON.json(data))
+    end
+    session_id = HTTP.header(req, "MCP-Session-Id")
+    if session_id === nothing || isempty(strip(String(session_id)))
+        return HTTP.Response(400, response_headers(server), JSON.json(Dict("error" => "Missing MCP-Session-Id header")))
+    end
+    delete!(server.sessions, String(session_id))
+    return HTTP.Response(202, response_headers(server; content_type=nothing))
 end
 
 read_request_body(req::HTTP.Request) = begin
@@ -1236,6 +1424,7 @@ function build_router(server::MCPServer)
     end
     HTTP.register!(router, "POST", server.transport_path, req -> handle_jsonrpc_request(server, req))
     HTTP.register!(router, "GET", server.transport_path, req -> handle_stream_request(server, req))
+    HTTP.register!(router, "DELETE", server.transport_path, req -> handle_session_delete(server, req))
     return router
 end
 

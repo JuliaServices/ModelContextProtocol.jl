@@ -1,40 +1,40 @@
 #!/usr/bin/env julia
 
+using JSON
 using ModelContextProtocol
-using HTTP
-using JSON3
 
-const MCP = ModelContextProtocol
+const SERVER_BASE_URL = "http://127.0.0.1:3010"
 
-function use_calculator_to_add(numbers::Vector)
-    # Connect to the calculator MCP server
-    client = MCPClient("http://127.0.0.1:3010/v1/calculator")
-    
+function print_json(value)
+    io = IOBuffer()
+    JSON.print(io, value, 2)
+    println(String(take!(io)))
+end
+
+function with_calculator_client(f::Function)
+    discovery = discover_server(SERVER_BASE_URL)
+    client = prepare_manual_client(discovery)
+    initialize_client!(
+        client;
+        client_info=Dict("name" => "Calculator User", "version" => "1.0.0"),
+    )
     try
-        # Initialize the connection
-        initialize!(client; client_name="Calculator User", client_version="1.0")
-        
-        # Call the add tool with the numbers
-        result = call_tool(client, "add", Dict("numbers" => numbers))
-        
-        # Extract and display the result
-        if haskey(result, "content") && !isempty(result["content"])
-            text_content = result["content"][1]["text"]
-            println("Result: ", text_content)
-        end
-        
-        if haskey(result, "annotations")
-            annotations = result["annotations"]
-            println("Sum: ", annotations["result"])
-        end
-        
-        return result
+        return f(client)
     finally
-        close(client)
+        terminate_session!(client)
     end
 end
 
-# Add the numbers: 1, 3, 4
-println("Using calculator MCP server to add: 1, 3, 4")
-use_calculator_to_add([1, 3, 4])
+function add_numbers(numbers::Vector{<:Real})
+    with_calculator_client() do client
+        response = call_tool(client, "add"; arguments=Dict("numbers" => collect(numbers)))
+        println("Tool call response:")
+        print_json(response)
+        return response
+    end
+end
 
+if abspath(PROGRAM_FILE) == @__FILE__
+    println("Calling the calculator tool with numbers 1, 3, 4.")
+    add_numbers([1, 3, 4])
+end

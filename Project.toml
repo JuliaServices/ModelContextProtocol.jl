@@ -5,16 +5,22 @@ version = "1.0.0"
 [deps]
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
-OAuth = "818da804-8b6f-40df-b4a5-e161c4d67f0f"
+OAuth = "22d8b318-f366-56fb-a292-a93f7d76c017"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
+[weakdeps]
+Agentif = "b1e21dde-9d8e-492f-89d0-ee48af23bfc5"
+
+[extensions]
+ModelContextProtocolAgentifExt = ["Agentif"]
+
 [compat]
-julia = "1.6"
-HTTP = "1"
+HTTP = "1.11, 2"
 JSON = "1"
-OAuth = "1"
+OAuth = "2"
+julia = "1.10"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
