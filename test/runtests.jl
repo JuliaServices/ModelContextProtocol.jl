@@ -104,7 +104,7 @@ function start_mcp_test_server()
         push!(state.log_levels, level)
     end
     set_completion_handler!(server) do _context, params
-        push!(state.completion_requests, to_json_dict(params))
+        push!(state.completion_requests, ModelContextProtocol.to_json_dict(params))
         prompt = get(params, "prompt", "")
         return Dict(
             "choices" => [
@@ -143,8 +143,7 @@ function start_auth_stub_server()
         HTTP.Response(200, ["Content-Type" => "application/json"], stub_protected_resource(base))
     end)
     server = HTTP.serve!(router, "127.0.0.1", 0; verbose=false)
-    sock = Sockets.getsockname(server.listener.server)
-    port = sock isa Tuple ? sock[end] : sock.port
+    port = ModelContextProtocol.bound_http_port(server)
     base = "http://127.0.0.1:$(port)"
     return server, base
 end
@@ -164,27 +163,40 @@ stop_auth_stub_server(server) = close(server)
         init = initialize_client!(client; capabilities=Dict("tools" => Dict("listChanged" => true)))
         @test get(init, "serverInfo", Dict())["name"] == "Stub MCP Server"
         @test haskey(get(init, "capabilities", Dict()), "tools")
-        @test haskey(init, "sessionId")
-        @test client.session_id == init["sessionId"]
+        @test !haskey(init, "sessionId")
+        @test client.session_id !== nothing
         @test client.initialized
+        @test isempty(ping(client))
 
         log_events = Dict{String,Any}[]
         resource_events = Dict{String,Any}[]
         tool_list_changes = String[]
+        client_requests = String[]
 
         register_notification_handler!(client, "notifications/message", (__, _, params) -> begin
-            payload = params isa AbstractDict ? to_json_dict(params) : Dict{String,Any}("value" => params)
+            payload = params isa AbstractDict ? ModelContextProtocol.to_json_dict(params) : Dict{String,Any}("value" => params)
             push!(log_events, payload)
             nothing
         end)
         register_notification_handler!(client, "notifications/resources/updated", (__, _, params) -> begin
-            payload = params isa AbstractDict ? to_json_dict(params) : Dict{String,Any}("value" => params)
+            payload = params isa AbstractDict ? ModelContextProtocol.to_json_dict(params) : Dict{String,Any}("value" => params)
             push!(resource_events, payload)
             nothing
         end)
         register_notification_handler!(client, "notifications/tools/list_changed", (__, _, __) -> begin
             push!(tool_list_changes, "tools")
             nothing
+        end)
+        register_request_handler!(client, "sampling/createMessage", (__, method, params, id) -> begin
+            @test method == "sampling/createMessage"
+            @test id == "server-request-1"
+            @test haskey(params, "messages")
+            push!(client_requests, String(id))
+            Dict(
+                "role" => "assistant",
+                "content" => [Dict("type" => "text", "text" => "sampled")],
+                "model" => "stub-model",
+            )
         end)
 
         tools = list_tools(client; timeout_ms=5000)
@@ -216,7 +228,7 @@ stop_auth_stub_server(server) = close(server)
         @test resource["contents"][1]["text"] == "Hello from stub resource"
 
         @test any(h -> get(h, "X-Test", "") == "alpha", state.headers)
-        @test any(h -> get(h, "MCP-Protocol-Version", "") == ModelContextProtocol.DEFAULT_PROTOCOL_VERSION, state.headers)
+        @test any(h -> any(lowercase(k) == "mcp-protocol-version" && v == ModelContextProtocol.DEFAULT_PROTOCOL_VERSION for (k, v) in h), state.headers)
         @test any(h -> any(lowercase(k) == "mcp-session-id" && !isempty(v) for (k, v) in h), state.headers)
         @test any(h -> any(lowercase(k) == "accept" && occursin("text/event-stream", lowercase(v)) for (k, v) in h), state.headers)
 
@@ -237,9 +249,9 @@ stop_auth_stub_server(server) = close(server)
 
         listener = start_event_listener!(client; poll_interval=0.1)
         try
-            log_message!(http_server.server; message="test-event", level="warn", session_id=client.session_id)
+            log_message!(http_server.server; message="test-event", level="warning", session_id=client.session_id)
             sleep(0.2)
-            @test any(evt -> get(evt, "level", "") == "warn", log_events)
+            @test any(evt -> get(evt, "level", "") == "warning" && get(evt, "data", "") == "test-event", log_events)
 
             result_level = set_log_level!(client, "debug")
             @test result_level["level"] == "debug"
@@ -265,14 +277,34 @@ stop_auth_stub_server(server) = close(server)
             @test length(get(paged2, "tools", [])) >= 1
 
             templates = list_resource_templates(client)
-            @test !isempty(get(templates, "templates", []))
-            @test templates["templates"][1]["name"] == "memory_template"
+            @test !isempty(get(templates, "resourceTemplates", []))
+            @test templates["resourceTemplates"][1]["name"] == "memory_template"
 
             sub = subscribe_resource(client, "memory://welcome")
-            @test sub["uri"] == "memory://welcome"
+            @test isempty(sub)
+            unsub = unsubscribe_resource(client, "memory://welcome")
+            @test isempty(unsub)
+            subscribe_resource(client, "memory://welcome")
             notify_resource_updated!(http_server.server, "memory://welcome"; annotations=Dict("kind" => "greeting"))
             sleep(0.2)
             @test any(evt -> evt["uri"] == "memory://welcome", resource_events)
+
+            enqueue_server_event!(
+                http_server.server,
+                client.session_id,
+                "jsonrpc",
+                Dict(
+                    "jsonrpc" => "2.0",
+                    "id" => "server-request-1",
+                    "method" => "sampling/createMessage",
+                    "params" => Dict("messages" => Any[]),
+                ),
+            )
+            request_stream = open_event_stream(client)
+            for event in ModelContextProtocol.parse_sse_events(String(request_stream.body))
+                ModelContextProtocol.handle_sse_event!(client, event)
+            end
+            @test client_requests == ["server-request-1"]
 
             completion = completion_complete(client; prompt="hello")
             @test completion["choices"][1]["content"][1]["text"] == "Echo: hello"
@@ -293,6 +325,51 @@ stop_auth_stub_server(server) = close(server)
         attach_token!(client, token)
         list_tools(client)
         @test any(h -> get(h, "Authorization", "") == "Bearer stubtoken", state.headers)
+        response = terminate_session!(client)
+        @test response.status in (200, 202, 204, 405)
+        @test client.session_id === nothing
+    finally
+        stop_mcp_test_server(http_server)
+    end
+end
+
+@testset "HTTP transport edge cases" begin
+    @test ModelContextProtocol.normalize_host_for_origin("[::1]:4321") == "[::1]"
+    @test ModelContextProtocol.is_loopback_host("[::1]:4321")
+
+    _state, http_server = start_mcp_test_server()
+    base = base_url(http_server)
+    try
+        discovery = discover_server(base)
+        client = prepare_manual_client(discovery)
+        ModelContextProtocol.jsonrpc_call(
+            client,
+            "initialize";
+            params=Dict(
+                "protocolVersion" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
+                "capabilities" => Dict{String,Any}(),
+                "clientInfo" => Dict("name" => "edge-test", "version" => "0.1.0"),
+            ),
+        )
+        @test client.session_id !== nothing
+
+        body = JSON.json(Dict("jsonrpc" => "2.0", "id" => "edge-1", "method" => "ping"))
+        response = HTTP.request(
+            "POST",
+            client.transport.url;
+            headers=[
+                "Content-Type" => "application/json",
+                "Accept" => "application/json, text/event-stream",
+                "MCP-Protocol-Version" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
+                "MCP-Session-Id" => client.session_id,
+            ],
+            body=body,
+            status_exception=false,
+        )
+        @test response.status == 200
+        payload = JSON.parse(String(response.body))
+        @test payload["error"]["code"] == -32002
+        @test occursin("not initialized", payload["error"]["message"])
     finally
         stop_mcp_test_server(http_server)
     end

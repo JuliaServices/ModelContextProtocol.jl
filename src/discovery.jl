@@ -64,7 +64,7 @@ function perform_manifest_request(url::String, headers::Vector{HeaderPair}; http
         println("MCP discovery HTTP request:")
         println(printable_request)
     end
-    response = http.request("GET", url; headers=request_headers, status_exception=false, DISCOVERY_TIMEOUT...)
+    response = http.request("GET", url; headers=request_headers, status_exception=false, transport_timeout_kwargs(DISCOVERY_TIMEOUT)...)
     if verbose
         body_text = try
             String(response.body)

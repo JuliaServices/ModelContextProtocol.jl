@@ -263,4 +263,6 @@ function start_server()
     end
 end
 
-start_server()
+if abspath(PROGRAM_FILE) == @__FILE__
+    start_server()
+end
