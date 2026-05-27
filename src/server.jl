@@ -982,16 +982,59 @@ function flatten_legacy_tool_outputs(outputs)
     return content_items
 end
 
+function json_object(value, label::String)
+    if value isa AbstractDict
+        return Dict{String,Any}(String(k) => v for (k, v) in value)
+    end
+    parsed = JSON.parse(JSON.json(value; omit_null=true))
+    parsed isa AbstractDict || throw(mcp_error(:invalid_response, "$(label) must lower to a JSON object"))
+    return Dict{String,Any}(String(k) => v for (k, v) in parsed)
+end
+
+function normalize_content_item(item)
+    if item isa MCPTextContent
+        data = Dict{String,Any}("type" => "text", "text" => item.text)
+        !isempty(item.annotations) && (data["annotations"] = item.annotations)
+        !isempty(item.meta) && (data["_meta"] = item.meta)
+        return data
+    end
+    return json_object(item, "Tool content item")
+end
+
+function normalize_content_items(content)
+    content isa AbstractVector || throw(mcp_error(:invalid_response, "Tool result content must be an array"))
+    return Any[normalize_content_item(item) for item in content]
+end
+
+function normalize_tool_result(result::MCPToolResult)
+    normalized = Dict{String,Any}()
+    if !isempty(result.content)
+        normalized["content"] = normalize_content_items(result.content)
+    end
+    if result.structured_content !== nothing
+        normalized["structuredContent"] = json_object(result.structured_content, "Tool structuredContent")
+    end
+    if !haskey(normalized, "content") && !haskey(normalized, "structuredContent")
+        throw(mcp_error(:invalid_response, "Tool handler must provide content or structuredContent"))
+    end
+    result.is_error !== nothing && (normalized["isError"] = result.is_error)
+    !isempty(result.annotations) && (normalized["annotations"] = result.annotations)
+    !isempty(result.meta) && (normalized["_meta"] = result.meta)
+    result.output_schema !== nothing && (normalized["outputSchema"] = json_object(result.output_schema, "Tool outputSchema"))
+    result.next_cursor !== nothing && (normalized["nextCursor"] = result.next_cursor)
+    return normalized
+end
+
 function normalize_tool_result(result)
     result isa AbstractDict || throw(mcp_error(:invalid_response, "Tool handler must return a dictionary"))
     normalized = Dict{String,Any}()
     if haskey(result, "content")
-        normalized["content"] = result["content"]
+        normalized["content"] = normalize_content_items(result["content"])
     elseif haskey(result, "outputs")
-        normalized["content"] = flatten_legacy_tool_outputs(result["outputs"])
+        normalized["content"] = normalize_content_items(flatten_legacy_tool_outputs(result["outputs"]))
     end
     if haskey(result, "structuredContent")
-        normalized["structuredContent"] = result["structuredContent"]
+        normalized["structuredContent"] = json_object(result["structuredContent"], "Tool structuredContent")
     end
     if !haskey(normalized, "content") && !haskey(normalized, "structuredContent")
         throw(mcp_error(:invalid_response, "Tool handler must provide content or structuredContent"))

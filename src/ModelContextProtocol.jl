@@ -16,7 +16,8 @@ include("client.jl")
 export MCPError, MCPAuthenticationRequired
 export MCPTransportDescriptor, MCPDiscovery
 export MCPClient, MCPClientConfig, MCPAuthenticationChallenge
-export MCPServer, MCPServerConfig, MCPServerTool, MCPServerPrompt, MCPServerResource
+export MCPServer, MCPServerConfig, MCPServerTool, MCPToolResult, MCPTextContent
+export MCPServerPrompt, MCPServerResource
 export MCPRequestContext, MCPHTTPServer
 export discover_server, prepare_manual_client, attach_token!
 export start_public_client_flow, request_client_credentials_token

@@ -37,10 +37,10 @@ function start_mcp_test_server()
     echo_handler = function (context::MCPRequestContext, args::Dict{String,Any})
         push!(state.timeouts, context.timeout_ms)
         message = get(args, "message", "")
-        return Dict(
-            "content" => [Dict("type" => "text", "text" => String(message))],
-            "structuredContent" => Dict(),
-            "annotations" => Dict("echoed" => true),
+        return MCPToolResult(
+            content=[MCPTextContent(text=String(message))],
+            structured_content=(;),
+            annotations=Dict("echoed" => true),
         )
     end
     register_tool!(
