@@ -70,6 +70,22 @@ Base.@kwdef struct MCPServerTool
     meta::Dict{String,Any}=Dict{String,Any}()
 end
 
+Base.@kwdef struct MCPTextContent
+    text::String
+    annotations::Dict{String,Any}=Dict{String,Any}()
+    meta::Dict{String,Any}=Dict{String,Any}()
+end
+
+Base.@kwdef struct MCPToolResult
+    content::Vector{Any}=Any[]
+    structured_content=nothing
+    is_error::Union{Bool,Nothing}=nothing
+    annotations::Dict{String,Any}=Dict{String,Any}()
+    meta::Dict{String,Any}=Dict{String,Any}()
+    output_schema=nothing
+    next_cursor::Union{String,Nothing}=nothing
+end
+
 Base.@kwdef struct MCPServerPrompt
     name::String
     handler::Function
