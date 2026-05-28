@@ -121,6 +121,19 @@ end
 
 stop_mcp_test_server(http_server::MCPHTTPServer) = stop_mcp_server(http_server)
 
+function jsonrpc_http_request(method::String; id="1", params=Dict{String,Any}(), session_id=nothing)
+    headers = [
+        "Content-Type" => "application/json",
+        "Accept" => "application/json, text/event-stream",
+        "MCP-Protocol-Version" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
+    ]
+    session_id !== nothing && push!(headers, "MCP-Session-Id" => session_id)
+    body = Dict{String,Any}("jsonrpc" => "2.0", "method" => method)
+    id !== nothing && (body["id"] = id)
+    isempty(params) || (body["params"] = params)
+    return HTTP.Request("POST", "/v1/mcp", headers, codeunits(JSON.json(body)))
+end
+
 function stub_protected_resource(base::String)
     return JSON.json(Dict(
         "resource" => string(base, "/resource"),
@@ -149,6 +162,83 @@ function start_auth_stub_server()
 end
 
 stop_auth_stub_server(server) = close(server)
+
+@testset "Session stores" begin
+    shared_store = InMemorySessionStore()
+    config = MCPServerConfig(name="Shared Store Server", version="0.1.0", session_store=shared_store)
+    server_a = MCPServer(config)
+    server_b = MCPServer(config)
+
+    init_response = ModelContextProtocol.handle_jsonrpc_request(
+        server_a,
+        jsonrpc_http_request(
+            "initialize";
+            id="init",
+            params=Dict(
+                "protocolVersion" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
+                "capabilities" => Dict{String,Any}(),
+                "clientInfo" => Dict("name" => "store-test", "version" => "0.1.0"),
+            ),
+        ),
+    )
+    session_id = HTTP.header(init_response, "MCP-Session-Id")
+    @test init_response.status == 200
+    @test !isempty(session_id)
+    @test length(ModelContextProtocol.list_sessions(shared_store)) == 1
+
+    initialized_response = ModelContextProtocol.handle_jsonrpc_request(
+        server_b,
+        jsonrpc_http_request("notifications/initialized"; id=nothing, session_id),
+    )
+    @test initialized_response.status == 202
+    session = ModelContextProtocol.find_session(shared_store, session_id)
+    @test session !== nothing
+    @test session.initialized
+
+    ping_response = ModelContextProtocol.handle_jsonrpc_request(
+        server_a,
+        jsonrpc_http_request("ping"; id="ping", session_id),
+    )
+    @test ping_response.status == 200
+    ping_payload = JSON.parse(String(ping_response.body))
+    @test ping_payload["result"] == Dict{String,Any}()
+
+    event_id = ModelContextProtocol.enqueue_server_event!(server_b, session_id, "message", Dict("text" => "shared"))
+    @test event_id == "1"
+    stream_response = ModelContextProtocol.handle_stream_request(
+        server_a,
+        HTTP.Request(
+            "GET",
+            "/v1/mcp",
+            [
+                "Accept" => "text/event-stream",
+                "MCP-Protocol-Version" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
+                "MCP-Session-Id" => session_id,
+            ],
+            UInt8[],
+        ),
+    )
+    @test stream_response.status == 200
+    streamed_session = ModelContextProtocol.find_session(shared_store, session_id)
+    @test streamed_session !== nothing
+    @test isempty(streamed_session.pending_events)
+    @test streamed_session.event_sequence == 1
+
+    delete_response = ModelContextProtocol.handle_session_delete(
+        server_b,
+        HTTP.Request(
+            "DELETE",
+            "/v1/mcp",
+            [
+                "MCP-Protocol-Version" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
+                "MCP-Session-Id" => session_id,
+            ],
+            UInt8[],
+        ),
+    )
+    @test delete_response.status == 202
+    @test ModelContextProtocol.find_session(shared_store, session_id) === nothing
+end
 
 @testset "MCP client over HTTP" begin
     state, http_server = start_mcp_test_server()
