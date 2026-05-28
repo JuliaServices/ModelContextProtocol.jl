@@ -30,6 +30,8 @@ Base.@kwdef struct MCPEvent
     data::String
 end
 
+abstract type MCPSessionStore end
+
 Base.@kwdef struct MCPServerConfig
     name::String
     version::String
@@ -46,6 +48,7 @@ Base.@kwdef struct MCPServerConfig
     server_info::Dict{String,Any}=Dict{String,Any}()
     manifest::Dict{String,Any}=Dict{String,Any}()
     transport_metadata::Dict{String,Any}=Dict{String,Any}()
+    session_store::Union{MCPSessionStore,Nothing}=nothing
     verbose::Bool=false
 end
 
@@ -55,6 +58,11 @@ Base.@kwdef mutable struct MCPSession
     event_sequence::Int=0
     pending_events::Vector{MCPEvent}=MCPEvent[]
     subscriptions::Set{String}=Set{String}()
+end
+
+Base.@kwdef mutable struct InMemorySessionStore <: MCPSessionStore
+    sessions::Dict{String,MCPSession}=Dict{String,MCPSession}()
+    lock::ReentrantLock=ReentrantLock()
 end
 
 Base.@kwdef struct MCPServerTool
@@ -167,6 +175,7 @@ mutable struct MCPServer
     resources::Dict{String,MCPServerResource}
     resource_templates::Dict{String,MCPServerResourceTemplate}
     sessions::Dict{String,MCPSession}
+    session_store::MCPSessionStore
     request_hook::Union{Function,Nothing}
     cancellation_handler::Union{Function,Nothing}
     logging_handler::Union{Function,Nothing}

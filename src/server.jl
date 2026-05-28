@@ -75,6 +75,8 @@ function MCPServer(config::MCPServerConfig)
     haskey(info, "version") || (info["version"] = config.version)
     transport_path = canonical_transport_path(config.transport_path)
     behavior = normalize_missing_protocol_header_behavior(config.missing_protocol_header)
+    sessions = Dict{String,MCPSession}()
+    store = config.session_store === nothing ? InMemorySessionStore(; sessions=sessions) : config.session_store
     return MCPServer(
         config,
         transport_path,
@@ -84,7 +86,8 @@ function MCPServer(config::MCPServerConfig)
         Dict{String,MCPServerPrompt}(),
         Dict{String,MCPServerResource}(),
         Dict{String,MCPServerResourceTemplate}(),
-        Dict{String,MCPSession}(),
+        sessions,
+        store,
         nothing,
         nothing,
         nothing,
@@ -177,6 +180,97 @@ end
 function clear_completion_handler!(server::MCPServer)
     server.completion_handler = nothing
     return server
+end
+
+function create_session!(store::MCPSessionStore, session::MCPSession)
+    throw(ArgumentError("$(typeof(store)) must implement create_session!"))
+end
+
+function find_session(store::MCPSessionStore, session_id)
+    throw(ArgumentError("$(typeof(store)) must implement find_session"))
+end
+
+function save_session!(store::MCPSessionStore, session::MCPSession)
+    throw(ArgumentError("$(typeof(store)) must implement save_session!"))
+end
+
+function delete_session!(store::MCPSessionStore, session_id::AbstractString)
+    throw(ArgumentError("$(typeof(store)) must implement delete_session!"))
+end
+
+function list_sessions(store::MCPSessionStore)
+    throw(ArgumentError("$(typeof(store)) must implement list_sessions"))
+end
+
+function create_session!(store::InMemorySessionStore, session::MCPSession)
+    @lock store.lock store.sessions[session.id] = session
+    return session
+end
+
+function find_session(store::InMemorySessionStore, session_id)
+    session_id === nothing && return nothing
+    @lock store.lock begin
+        return get(store.sessions, String(session_id), nothing)
+    end
+end
+
+function save_session!(store::InMemorySessionStore, session::MCPSession)
+    @lock store.lock store.sessions[session.id] = session
+    return session
+end
+
+function delete_session!(store::InMemorySessionStore, session_id::AbstractString)
+    @lock store.lock delete!(store.sessions, String(session_id))
+    return nothing
+end
+
+function list_sessions(store::InMemorySessionStore)
+    @lock store.lock begin
+        return collect(values(store.sessions))
+    end
+end
+
+create_session!(server::MCPServer, session::MCPSession) = create_session!(server.session_store, session)
+save_session!(server::MCPServer, session::MCPSession) = save_session!(server.session_store, session)
+delete_session!(server::MCPServer, session_id::AbstractString) = delete_session!(server.session_store, session_id)
+list_sessions(server::MCPServer) = list_sessions(server.session_store)
+
+function session_to_dict(session::MCPSession)
+    return Dict{String,Any}(
+        "id" => session.id,
+        "initialized" => session.initialized,
+        "eventSequence" => session.event_sequence,
+        "pendingEvents" => [
+            Dict{String,Any}(
+                "id" => event.id,
+                "event" => event.event,
+                "data" => event.data,
+            ) for event in session.pending_events
+        ],
+        "subscriptions" => collect(session.subscriptions),
+    )
+end
+
+function session_from_dict(data::AbstractDict)
+    id = String(data["id"])
+    initialized = Bool(get(data, "initialized", false))
+    event_sequence = Int(get(data, "eventSequence", get(data, "event_sequence", 0)))
+    raw_events = get(data, "pendingEvents", get(data, "pending_events", Any[]))
+    events = MCPEvent[
+        MCPEvent(
+            id=String(event["id"]),
+            event=get(event, "event", nothing) === nothing ? nothing : String(event["event"]),
+            data=String(event["data"]),
+        ) for event in raw_events
+    ]
+    subscriptions = Set(String.(get(data, "subscriptions", String[])))
+    return MCPSession(
+        id=id,
+        initialized=initialized,
+        event_sequence=event_sequence,
+        pending_events=events,
+        subscriptions=subscriptions,
+    )
 end
 
 function normalize_dict(value, label)
@@ -278,7 +372,7 @@ function log_message!(
         existing = find_session(server, session_id)
         existing !== nothing && push!(recipients, existing)
     else
-        recipients = collect(values(server.sessions))
+        recipients = list_sessions(server)
     end
     isempty(recipients) && return nothing
     broadcast_jsonrpc_notification!(server, JSONRPC_METHOD_NOTIFICATIONS_MESSAGE; params=payload, sessions=recipients)
@@ -308,13 +402,12 @@ end
 function register_session!(server::MCPServer; session_id::Union{AbstractString,Nothing}=nothing)
     id = session_id === nothing ? string(uuid4()) : String(session_id)
     session = MCPSession(id=id)
-    server.sessions[id] = session
-    return session
+    return create_session!(server, session)
 end
 
 function find_session(server::MCPServer, session_id)
     session_id === nothing && return nothing
-    return get(server.sessions, String(session_id), nothing)
+    return find_session(server.session_store, String(session_id))
 end
 
 function next_event_id!(session::MCPSession)
@@ -333,7 +426,9 @@ function enqueue_session_event!(session::MCPSession, event::Union{AbstractString
 end
 
 function enqueue_server_event!(server::MCPServer, session::MCPSession, event::Union{AbstractString,Nothing}, payload)
-    return enqueue_session_event!(session, event, payload)
+    event_id = enqueue_session_event!(session, event, payload)
+    save_session!(server, session)
+    return event_id
 end
 
 function enqueue_server_event!(server::MCPServer, session_id::AbstractString, event::Union{AbstractString,Nothing}, payload)
@@ -343,9 +438,9 @@ function enqueue_server_event!(server::MCPServer, session_id::AbstractString, ev
 end
 
 function broadcast_server_event!(server::MCPServer, event::Union{AbstractString,Nothing}, payload)
-    for session in values(server.sessions)
+    for session in list_sessions(server)
         session.initialized || continue
-        enqueue_session_event!(session, event, payload)
+        enqueue_server_event!(server, session, event, payload)
     end
     return nothing
 end
@@ -376,7 +471,7 @@ function broadcast_jsonrpc_notification!(
     params::Union{Dict{String,Any},Nothing}=nothing,
     sessions::Union{Nothing,Vector{MCPSession}}=nothing,
 )
-    recipients = sessions === nothing ? collect(values(server.sessions)) : sessions
+    recipients = sessions === nothing ? list_sessions(server) : sessions
     for session in recipients
         session.initialized || continue
         enqueue_jsonrpc_notification!(server, session, method; params=params)
@@ -1178,7 +1273,7 @@ function notify_resource_updated!(
     end
     !isempty(annotation_data) && (payload["annotations"] = annotation_data)
     recipients = MCPSession[]
-    for session in values(server.sessions)
+    for session in list_sessions(server)
         session.initialized || continue
         if session_ids !== nothing && !(session.id in session_ids)
             continue
@@ -1221,6 +1316,7 @@ function dispatch_jsonrpc(server::MCPServer, context::MCPRequestContext, params:
     elseif method == JSONRPC_METHOD_NOTIFICATIONS_INITIALIZED
         context.session === nothing && throw(mcp_error(:invalid_request, "notifications/initialized requires a session"))
         context.session.initialized = true
+        save_session!(server, context.session)
         return nothing
     elseif method == JSONRPC_METHOD_TOOLS_LIST
         return list_tools(server, params)
@@ -1359,6 +1455,7 @@ function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
     if id === nothing
         try
             dispatch_jsonrpc(server, context, params)
+            save_session!(server, session)
         catch err
             @warn "Error handling JSON-RPC notification" method=context.method err
         end
@@ -1367,6 +1464,7 @@ function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
     end
     try
         result = dispatch_jsonrpc(server, context, params)
+        save_session!(server, session)
         response = jsonrpc_success(server, session, id, result)
         return response
     catch err
@@ -1400,6 +1498,7 @@ function handle_stream_request(server::MCPServer, req::HTTP.Request)
         heartbeat_event = MCPEvent(id=heartbeat_id, event="heartbeat", data=serialize_event_payload(heartbeat_payload))
         events = MCPEvent[heartbeat_event]
     end
+    save_session!(server, session)
     response = build_sse_response(response_headers(server; session=session, content_type=nothing)) do stream
         first_event = true
         for event in events
@@ -1435,7 +1534,7 @@ function handle_session_delete(server::MCPServer, req::HTTP.Request)
     if session_id === nothing || isempty(strip(String(session_id)))
         return HTTP.Response(400, response_headers(server), JSON.json(Dict("error" => "Missing MCP-Session-Id header")))
     end
-    delete!(server.sessions, String(session_id))
+    delete_session!(server, String(session_id))
     return HTTP.Response(202, response_headers(server; content_type=nothing))
 end
 
