@@ -175,7 +175,7 @@ function build_request_headers(
     return headers
 end
 
-authorization_value(token::TokenResponse) = string(token.token_type, " ", token.access_token)
+authorization_value(token::AbstractString) = String(token)
 
 function normalize_params(params)
     params === nothing && return nothing

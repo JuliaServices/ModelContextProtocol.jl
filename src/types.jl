@@ -140,6 +140,20 @@ struct MCPClientConfig
     verbose::Bool
 end
 
+Base.@kwdef struct WWWAuthenticateChallenge
+    scheme::String
+    token::Union{String,Nothing}
+    params::Dict{String,String}
+end
+
+function WWWAuthenticateChallenge(scheme::AbstractString; token=nothing, params=Dict{String,String}())
+    return WWWAuthenticateChallenge(
+        scheme=String(scheme),
+        token=token === nothing ? nothing : String(token),
+        params=Dict{String,String}(params),
+    )
+end
+
 Base.@kwdef struct MCPAuthenticationChallenge
     challenge::WWWAuthenticateChallenge
     resource_metadata::Union{String,Nothing}
@@ -154,7 +168,7 @@ mutable struct MCPClient
     headers::HTTP.Headers
     timeout::NamedTuple
     verbose::Bool
-    auth_token::Union{TokenResponse,Nothing}
+    auth_token::Union{String,Nothing}
     session::Union{JSONDict,Nothing}
     session_id::Union{String,Nothing}
     initialized::Bool

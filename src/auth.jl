@@ -1,67 +1,10 @@
-function start_public_client_flow(
-    prm_url::AbstractString,
-    config::PublicClientConfig;
-    http=HTTP,
-    issuer::Union{String,Nothing}=nothing,
-    kwargs...
-)
-    result = OAuth.complete_pkce_authorization(
-        prm_url,
-        config;
-        http=http,
-        issuer=issuer,
-        kwargs...,
-    )
-    resource = result.session.resource
-    return (
-        token=result.token,
-        authorization_server=result.session.authorization_server,
-        resource=resource,
-        session=result.session,
-        callback=result.callback,
-    )
-end
+function start_public_client_flow end
 
-function start_public_client_flow(
-    prm_url::AbstractString;
-    client_id::AbstractString,
-    redirect_uri=nothing,
-    scopes=String[],
-    additional_parameters=nothing,
-    dpop=nothing,
-    kwargs...
-)
-    config = PublicClientConfig(
-        client_id=String(client_id),
-        redirect_uri=redirect_uri,
-        scopes=scopes,
-        additional_parameters=additional_parameters,
-        dpop=dpop,
-    )
-    return start_public_client_flow(prm_url, config; kwargs...)
-end
+function request_client_credentials_token end
 
-function request_client_credentials_token(
-    prm_url::AbstractString,
-    config::ConfidentialClientConfig;
-    http=HTTP,
-    issuer=nothing,
-    extra_token_params=Dict{String,String}(),
-    verbose::Bool=false,
-)
-    return OAuth.request_client_credentials_token(
-        prm_url,
-        config;
-        http=http,
-        issuer=issuer,
-        extra_token_params=extra_token_params,
-        verbose=verbose,
-    )
-end
-
-function attach_token!(client::MCPClient, token::TokenResponse)
-    client.auth_token = token
-    return token
+function attach_token!(client::MCPClient, authorization::AbstractString)
+    client.auth_token = String(authorization)
+    return authorization
 end
 
 function preferred_resource_metadata(challenges::Vector{MCPAuthenticationChallenge})

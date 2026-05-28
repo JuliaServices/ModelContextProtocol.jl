@@ -410,6 +410,10 @@ end
         @test cancel_entry["sessionId"] == client.session_id
         @test cancel_entry["params"]["requestId"] == "req-1"
 
+        attach_token!(client, "Bearer rawtoken")
+        list_tools(client)
+        @test any(h -> get(h, "Authorization", "") == "Bearer rawtoken", state.headers)
+        @test Base.get_extension(ModelContextProtocol, :ModelContextProtocolOAuthExt) !== nothing
         token_data = JSON.Object(Dict{String,Any}("access_token" => "stubtoken", "token_type" => "Bearer"))
         token = OAuth.TokenResponse(token_data)
         attach_token!(client, token)

@@ -2,7 +2,6 @@ module ModelContextProtocol
 
 using HTTP
 using JSON
-using OAuth
 
 include("types.jl")
 include("errors.jl")
