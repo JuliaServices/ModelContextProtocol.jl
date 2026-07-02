@@ -1296,10 +1296,18 @@ function handle_cancellation_notification(server::MCPServer, context::MCPRequest
     return nothing
 end
 
+function negotiate_protocol_version(server::MCPServer, requested)
+    requested isa AbstractString || return server.config.protocol_version
+    version = String(strip(requested))
+    isempty(version) && return server.config.protocol_version
+    version == server.config.protocol_version && return version
+    version in server.config.supported_protocol_versions && return version
+    return server.config.protocol_version
+end
+
 function initialize_response(server::MCPServer, session::MCPSession, params::Dict{String,Any})
-    _ = params # currently unused, retained for future extensions
     result = Dict(
-        "protocolVersion" => server.config.protocol_version,
+        "protocolVersion" => negotiate_protocol_version(server, get(params, "protocolVersion", nothing)),
         "capabilities" => manifest_capabilities(server),
         "serverInfo" => server.server_info,
     )

@@ -8,7 +8,10 @@ Julia server and client utilities for the Model Context Protocol (MCP).
 
 The package targets MCP protocol version `2025-11-25` and currently focuses on
 Streamable HTTP, discovery manifests, OAuth-protected resources, tools, prompts,
-resources, completions, logging notifications, and client smoke tests.
+resources, completions, logging notifications, and client smoke tests. It also
+ships first-class support for [MCP Apps](MCP-App-playbook.md) (SEP-1865) —
+interactive HTML widgets rendered inline by hosts like Cursor and Claude; see
+[MCP-App-playbook.md](MCP-App-playbook.md) for the end-to-end guide.
 
 ## Installation
 

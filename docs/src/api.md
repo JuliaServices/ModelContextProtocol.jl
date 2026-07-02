@@ -28,6 +28,27 @@
 - `broadcast_server_event!`
 - `notify_resource_updated!`
 
+## MCP Apps (SEP-1865)
+
+Helpers for serving interactive HTML widgets that hosts render inline. See
+[MCP-App-playbook.md](https://github.com/JuliaServices/ModelContextProtocol.jl/blob/main/MCP-App-playbook.md)
+for the full guide.
+
+- `MCP_APPS_EXTENSION_ID`
+- `MCP_APP_HTML_MIME_TYPE`
+- `MCP_APPS_UI_PROTOCOL_VERSION`
+- `MCPUIResource`
+- `ui_extension_capability`
+- `add_ui_extension_capability!`
+- `ui_tool_meta`
+- `ui_resource_meta`
+- `ui_resource_contents`
+- `embedded_ui_resource`
+- `ui_tool_content`
+- `register_ui_resource!`
+- `mcp_app_html`
+- `MCP_APP_BOOTSTRAP_JS`
+
 ## Client Types
 
 - `MCPDiscovery`

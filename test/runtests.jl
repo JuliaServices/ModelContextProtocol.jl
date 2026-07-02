@@ -486,3 +486,150 @@ end
         stop_auth_stub_server(server)
     end
 end
+
+@testset "MCP Apps" begin
+    @testset "capability helpers" begin
+        caps = ui_extension_capability()
+        @test caps["extensions"][MCP_APPS_EXTENSION_ID]["mimeTypes"] == [MCP_APP_HTML_MIME_TYPE]
+        merged = add_ui_extension_capability!(Dict{String,Any}("logging" => Dict{String,Any}()))
+        @test haskey(merged, "logging")
+        @test merged["extensions"][MCP_APPS_EXTENSION_ID]["mimeTypes"] == [MCP_APP_HTML_MIME_TYPE]
+        existing = Dict{String,Any}("extensions" => Dict{String,Any}("acme/other" => Dict{String,Any}()))
+        add_ui_extension_capability!(existing)
+        @test haskey(existing["extensions"], "acme/other")
+        @test haskey(existing["extensions"], MCP_APPS_EXTENSION_ID)
+    end
+
+    @testset "tool and resource meta" begin
+        meta = ui_tool_meta("ui://acme/card")
+        @test meta["ui"]["resourceUri"] == "ui://acme/card"
+        @test meta["ui/resourceUri"] == "ui://acme/card"
+        @test meta["ui"]["visibility"] == ["model", "app"]
+        app_only = ui_tool_meta("ui://acme/card"; visibility=["app"])
+        @test app_only["ui"]["visibility"] == ["app"]
+        no_uri = ui_tool_meta()
+        @test !haskey(no_uri, "ui/resourceUri")
+        rmeta = ui_resource_meta()
+        @test rmeta["ui"]["prefersBorder"] === true
+        @test rmeta["ui"]["displayMode"] == "inline"
+    end
+
+    @testset "protocol version negotiation" begin
+        server = MCPServer(name="apps", version="1.0.0", supported_protocol_versions=["2025-06-18"])
+        session = ModelContextProtocol.MCPSession(id="s")
+        respond(version) = ModelContextProtocol.initialize_response(server, session, Dict{String,Any}("protocolVersion" => version))["protocolVersion"]
+        @test respond("2025-06-18") == "2025-06-18"
+        @test respond(ModelContextProtocol.DEFAULT_PROTOCOL_VERSION) == ModelContextProtocol.DEFAULT_PROTOCOL_VERSION
+        @test respond("1999-01-01") == ModelContextProtocol.DEFAULT_PROTOCOL_VERSION
+        no_params = ModelContextProtocol.initialize_response(server, session, Dict{String,Any}())
+        @test no_params["protocolVersion"] == ModelContextProtocol.DEFAULT_PROTOCOL_VERSION
+    end
+
+    @testset "mcp_app_html shell" begin
+        html = mcp_app_html(
+            app_name="acme-card",
+            app_version="2.0.0",
+            body="<main id=\"app\"></main>",
+            css=".card{padding:16px}",
+            script="mcpApp.onRender(function(data){document.getElementById('app').textContent=String(data);});",
+        )
+        for needle in (
+            "<!doctype html>",
+            "\"name\":\"acme-card\"",
+            "\"version\":\"2.0.0\"",
+            "\"protocolVersion\":\"$(MCP_APPS_UI_PROTOCOL_VERSION)\"",
+            "ui/initialize",
+            "appInfo",
+            "appCapabilities",
+            "ui/notifications/initialized",
+            "ui/notifications/tool-result",
+            "ui/notifications/size-changed",
+            "ev.source !== window.parent",
+            "tools/call",
+            ".card{padding:16px}",
+            "<main id=\"app\"></main>",
+        )
+            @test occursin(needle, html)
+        end
+        with_head = mcp_app_html(
+            app_name="acme-card",
+            body="<main></main>",
+            head="<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">",
+            css="@import url('https://fonts.googleapis.com/css2?family=Inter');",
+        )
+        @test occursin("<meta name=\"color-scheme\" content=\"light dark\">", with_head)
+        @test occursin("<link rel=\"preconnect\"", with_head)
+        # @import stays first in the stylesheet so it remains valid CSS
+        @test occursin("<style>\n@import", with_head)
+        @test_throws ArgumentError mcp_app_html(app_name="x", body="", script="var a=\"</script>\";")
+        @test_throws ArgumentError mcp_app_html(app_name="x", body="", css="/*</style>*/")
+        @test_throws ArgumentError mcp_app_html(app_name="x", body="<script>var a=1;</script>")
+    end
+
+    @testset "widget-backed server end to end" begin
+        server = MCPServer(
+            name="Apps Stub Server",
+            version="0.1.0",
+            capabilities=ui_extension_capability(),
+            supported_protocol_versions=["2025-06-18"],
+            missing_protocol_header=:ignore,
+        )
+        card = register_ui_resource!(
+            server;
+            uri="ui://apps-stub/card",
+            html=mcp_app_html(app_name="apps-stub-card", body="<main id=\"app\"></main>"),
+            name="apps-stub-card",
+            title="Apps Stub Card",
+            description="Test widget",
+        )
+        @test card isa MCPUIResource
+        @test_throws ArgumentError register_ui_resource!(server; uri="https://not-ui", html="x")
+        register_tool!(
+            server;
+            name="card-data",
+            description="Returns data rendered by the card widget.",
+            input_schema=Dict{String,Any}("type" => "object"),
+            meta=ui_tool_meta(card),
+            handler=(context, args) -> MCPToolResult(
+                content=ui_tool_content("Card summary", card),
+                structured_content=Dict{String,Any}("greeting" => "hi"),
+            ),
+        )
+        http_server = serve_mcp_http(server; host="127.0.0.1", port=0)
+        base = base_url(http_server)
+        try
+            discovery = discover_server(base)
+            client = prepare_manual_client(discovery)
+            init = initialize_client!(client; protocol_version="2025-06-18")
+            @test init["protocolVersion"] == "2025-06-18"
+            @test init["capabilities"]["extensions"][MCP_APPS_EXTENSION_ID]["mimeTypes"] == [MCP_APP_HTML_MIME_TYPE]
+
+            tools = list_tools(client)
+            tool = only(filter(t -> t["name"] == "card-data", tools["tools"]))
+            @test tool["_meta"]["ui"]["resourceUri"] == "ui://apps-stub/card"
+            @test tool["_meta"]["ui/resourceUri"] == "ui://apps-stub/card"
+
+            resources = list_resources(client)
+            resource = only(filter(r -> r["uri"] == "ui://apps-stub/card", resources["resources"]))
+            @test resource["mimeType"] == MCP_APP_HTML_MIME_TYPE
+            @test resource["_meta"]["ui"]["displayMode"] == "inline"
+
+            contents = read_resource(client, "ui://apps-stub/card")
+            entry = only(contents["contents"])
+            @test entry["uri"] == "ui://apps-stub/card"
+            @test entry["mimeType"] == MCP_APP_HTML_MIME_TYPE
+            @test occursin("ui/initialize", entry["text"])
+
+            result = call_tool(client, "card-data"; arguments=Dict{String,Any}())
+            @test result["structuredContent"]["greeting"] == "hi"
+            @test result["content"][1]["type"] == "text"
+            embedded = result["content"][2]
+            @test embedded["type"] == "resource"
+            @test embedded["resource"]["uri"] == "ui://apps-stub/card"
+            @test embedded["resource"]["mimeType"] == MCP_APP_HTML_MIME_TYPE
+            @test embedded["resource"]["text"] == card.html
+        finally
+            stop_mcp_server(http_server)
+        end
+    end
+end
