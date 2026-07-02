@@ -11,6 +11,7 @@ include("auth.jl")
 include("jsonrpc.jl")
 include("server.jl")
 include("client.jl")
+include("apps.jl")
 
 export MCPError, MCPAuthenticationRequired
 export MCPTransportDescriptor, MCPDiscovery
@@ -36,5 +37,9 @@ export register_request_handler!, clear_request_handlers!
 export start_event_listener!, stop_event_listener!
 export terminate_session!
 export enqueue_server_event!, broadcast_server_event!, notify_resource_updated!
+export MCP_APPS_EXTENSION_ID, MCP_APP_HTML_MIME_TYPE, MCP_APPS_UI_PROTOCOL_VERSION
+export MCPUIResource, ui_extension_capability, add_ui_extension_capability!
+export ui_tool_meta, ui_resource_meta, ui_resource_contents, embedded_ui_resource
+export ui_tool_content, register_ui_resource!, mcp_app_html, MCP_APP_BOOTSTRAP_JS
 
 end

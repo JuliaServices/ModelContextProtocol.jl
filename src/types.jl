@@ -40,6 +40,7 @@ Base.@kwdef struct MCPServerConfig
     instructions::Union{String,Nothing}=nothing
     instructions_url::Union{String,Nothing}=nothing
     protocol_version::String=DEFAULT_PROTOCOL_VERSION
+    supported_protocol_versions::Vector{String}=String[]
     missing_protocol_header::Symbol=:error
     allowed_origins::Union{Nothing,Vector{String}}=nothing
     transport_path::String="/v1/mcp"
