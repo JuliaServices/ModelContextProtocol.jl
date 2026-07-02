@@ -274,8 +274,9 @@ The iframe is sandboxed and hosts apply restrictive CSPs. Author widgets as if
 - No CDN scripts, no external stylesheets, no `fetch`/XHR to your own API — go
   through `mcpApp.callTool` instead, which the host proxies and authenticates.
 - External images *may* load in some hosts; don't depend on them. Prefer data
-  URIs or inline SVG. Web fonts (e.g. Google Fonts `@import`) are progressive
-  enhancement only — always specify a system-font fallback stack, and expect the
+  URIs or inline SVG. Web fonts are progressive enhancement only (pass font
+  `<link>` tags via `mcp_app_html`'s `head` keyword, or lead your `css` with
+  `@import`) — always specify a system-font fallback stack, and expect the
   fallback to be what renders in stricter hosts.
 - Support both themes cheaply: `:root{color-scheme:light dark}` (set by
   `mcp_app_html`) + `@media (prefers-color-scheme: dark)` overrides.

@@ -551,6 +551,16 @@ end
         )
             @test occursin(needle, html)
         end
+        with_head = mcp_app_html(
+            app_name="acme-card",
+            body="<main></main>",
+            head="<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">",
+            css="@import url('https://fonts.googleapis.com/css2?family=Inter');",
+        )
+        @test occursin("<meta name=\"color-scheme\" content=\"light dark\">", with_head)
+        @test occursin("<link rel=\"preconnect\"", with_head)
+        # @import stays first in the stylesheet so it remains valid CSS
+        @test occursin("<style>\n@import", with_head)
         @test_throws ArgumentError mcp_app_html(app_name="x", body="", script="var a=\"</script>\";")
         @test_throws ArgumentError mcp_app_html(app_name="x", body="", css="/*</style>*/")
         @test_throws ArgumentError mcp_app_html(app_name="x", body="<script>var a=1;</script>")

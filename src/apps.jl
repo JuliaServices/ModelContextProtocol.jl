@@ -408,14 +408,17 @@ window.mcpApp = (function () {
 """
 
 """
-    mcp_app_html(; app_name, body, css="", script="", app_version="1.0.0", title=app_name,
+    mcp_app_html(; app_name, body, css="", script="", head="", app_version="1.0.0", title=app_name,
                  lang="en", color_scheme="light dark", init_timeout_ms=4000) -> String
 
 Assemble a complete, handshake-correct MCP App HTML document:
 
 - `app_name` / `app_version` identify the widget in its `ui/initialize` handshake.
 - `body` is the widget's inner HTML (placed directly inside `<body>`).
-- `css` is inlined into a `<style>` tag in `<head>`.
+- `css` is inlined into a `<style>` tag in `<head>`. It is the first stylesheet
+  content in the document, so leading `@import` rules (e.g. web fonts as
+  progressive enhancement) remain valid.
+- `head` is optional extra raw head markup (e.g. font `<link>` tags).
 - `script` is the widget's own JavaScript, run AFTER the bootstrap so
   `window.mcpApp` is available. A typical widget is just:
 
@@ -438,6 +441,7 @@ one is found since it would truncate the document in the host iframe.
 """
 function mcp_app_html(; app_name::AbstractString, body::AbstractString,
                       css::AbstractString="", script::AbstractString="",
+                      head::AbstractString="",
                       app_version::AbstractString="1.0.0",
                       title::AbstractString=app_name, lang::AbstractString="en",
                       color_scheme::AbstractString="light dark",
@@ -456,8 +460,10 @@ function mcp_app_html(; app_name::AbstractString, body::AbstractString,
     print(io, "<!doctype html>\n<html lang=\"", lang, "\">\n<head>\n")
     print(io, "<meta charset=\"utf-8\">\n")
     print(io, "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n")
+    print(io, "<meta name=\"color-scheme\" content=\"", html_escape(color_scheme), "\">\n")
     print(io, "<title>", html_escape(title), "</title>\n")
-    print(io, "<style>\n:root{color-scheme:", color_scheme, "}\n", css, "\n</style>\n")
+    isempty(head) || print(io, head, "\n")
+    print(io, "<style>\n", css, "\n</style>\n")
     print(io, "</head>\n<body>\n", body, "\n")
     print(io, "<script>\nwindow.__MCP_APP_CONFIG__=", config, ";\n", MCP_APP_BOOTSTRAP_JS, "\n</script>\n")
     isempty(script) || print(io, "<script>\n", script, "\n</script>\n")
