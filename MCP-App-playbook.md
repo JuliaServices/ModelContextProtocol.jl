@@ -255,6 +255,10 @@ Empirically discovered constraints, all handled by `MCP_APP_BOOTSTRAP_JS`
   checks all of them and replays the latest data to `onRender` callbacks that
   register late — eliminating the startup race where data arrives before the
   widget's own script has subscribed.
+- Hosts may attach their message listener *after* the iframe's scripts have
+  already run, silently dropping the first `ui/initialize`. The bootstrap
+  retries the request (at ~0.8s and ~3.2s) before giving up, so a dropped first
+  message doesn't leave the widget hung on its loading state.
 
 Widget authors only see this API:
 

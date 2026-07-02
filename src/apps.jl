@@ -350,32 +350,43 @@ window.mcpApp = (function () {
     }
   });
 
+  // ui/initialize is retried: if the host attaches its message listener after the
+  // iframe's scripts run (observed in real hosts and test harnesses), the first
+  // request is silently dropped and a single-shot handshake would hang forever.
+  var INIT_RETRY_DELAYS = [800, 2400];
   var ready = new Promise(function (resolve) {
     var settled = false;
-    var timer = setTimeout(function () {
+    function finish(ok) {
       if (settled) return;
       settled = true;
-      console.warn("mcpApp: ui/initialize timed out after " + initTimeoutMs + "ms; continuing without handshake");
-      resolve(false);
-    }, initTimeoutMs);
-    request("ui/initialize", { protocolVersion: protocolVersion, appInfo: appInfo, appCapabilities: {} })
-      .then(function (result) {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        notify("ui/notifications/initialized", {});
-        sendSize(true);
-        var data = extractRenderData(result);
-        if (data !== undefined) deliver(data, result);
-        resolve(true);
-      })
-      .catch(function (err) {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        console.warn("mcpApp: ui/initialize failed", err);
-        resolve(false);
-      });
+      resolve(ok);
+    }
+    function attempt(round) {
+      if (settled) return;
+      request("ui/initialize", { protocolVersion: protocolVersion, appInfo: appInfo, appCapabilities: {} })
+        .then(function (result) {
+          if (settled) return;
+          notify("ui/notifications/initialized", {});
+          sendSize(true);
+          var data = extractRenderData(result);
+          if (data !== undefined) deliver(data, result);
+          finish(true);
+        })
+        .catch(function (err) {
+          console.warn("mcpApp: ui/initialize failed", err);
+          finish(false);
+        });
+      if (round < INIT_RETRY_DELAYS.length) {
+        setTimeout(function () { attempt(round + 1); }, INIT_RETRY_DELAYS[round]);
+      } else {
+        setTimeout(function () {
+          if (settled) return;
+          console.warn("mcpApp: ui/initialize timed out after " + initTimeoutMs + "ms; continuing without handshake");
+          finish(false);
+        }, initTimeoutMs);
+      }
+    }
+    attempt(0);
   });
 
   if (typeof ResizeObserver !== "undefined") {
