@@ -134,6 +134,122 @@ function jsonrpc_http_request(method::String; id="1", params=Dict{String,Any}(),
     return HTTP.Request("POST", "/v1/mcp", headers, codeunits(JSON.json(body)))
 end
 
+Base.@kwdef struct StaticEchoArgs
+    message::String=""
+end
+
+struct StaticEchoHandler end
+
+function (::StaticEchoHandler)(
+    ::ModelContextProtocol.StaticMCPRequestContext,
+    arguments::JSON.JSONText,
+)
+    parsed = JSON.parse(arguments.value, StaticEchoArgs)
+    return ModelContextProtocol.StaticMCPToolResult(
+        text=parsed.message,
+        structured_content=JSON.JSONText(JSON.json((; echoed=parsed.message))),
+    )
+end
+
+function static_test_server()
+    tool = ModelContextProtocol.StaticMCPTool(
+        name="echo",
+        title="Echo",
+        description="Return the supplied message.",
+        input_schema=JSON.JSONText(
+            "{\"type\":\"object\",\"properties\":{\"message\":{\"type\":\"string\"}},\"required\":[\"message\"]}",
+        ),
+        annotations=JSON.JSONText("{\"readOnlyHint\":true}"),
+        handler=StaticEchoHandler(),
+    )
+    return ModelContextProtocol.StaticMCPServer(
+        [tool];
+        name="Static Test",
+        version="0.1.0",
+        description="Static MCP test server.",
+        instructions="Use the echo tool.",
+    )
+end
+
+@testset "Static tools server" begin
+    server = static_test_server()
+    initialize = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        jsonrpc_http_request(
+            "initialize";
+            id=1,
+            params=Dict(
+                "protocolVersion" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
+                "capabilities" => Dict{String,Any}(),
+                "clientInfo" => Dict("name" => "static-test", "version" => "0.1.0"),
+            ),
+        ),
+    )
+    @test initialize.status == 200
+    session_id = HTTP.header(initialize, "MCP-Session-Id")
+    @test !isempty(session_id)
+    initialize_payload = JSON.parse(String(initialize.body))
+    @test initialize_payload["id"] == 1
+    @test initialize_payload["result"]["serverInfo"]["name"] == "Static Test"
+    @test initialize_payload["result"]["capabilities"]["tools"]["listChanged"] == false
+
+    before_initialized = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        jsonrpc_http_request("tools/list"; session_id),
+    )
+    @test before_initialized.status == 400
+
+    initialized = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        jsonrpc_http_request("notifications/initialized"; id=nothing, session_id),
+    )
+    @test initialized.status == 202
+
+    listed = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        jsonrpc_http_request("tools/list"; session_id),
+    )
+    @test listed.status == 200
+    listed_payload = JSON.parse(String(listed.body))
+    @test only(listed_payload["result"]["tools"])["name"] == "echo"
+    @test only(listed_payload["result"]["tools"])["inputSchema"]["required"] == ["message"]
+
+    called = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        jsonrpc_http_request(
+            "tools/call";
+            session_id,
+            params=Dict("name" => "echo", "arguments" => Dict("message" => "hello\n\"world\"")),
+        ),
+    )
+    @test called.status == 200
+    called_payload = JSON.parse(String(called.body))
+    @test called_payload["result"]["structuredContent"] == Dict("echoed" => "hello\n\"world\"")
+    @test called_payload["result"]["content"][1]["text"] == "hello\n\"world\""
+
+    unknown = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        jsonrpc_http_request(
+            "tools/call";
+            session_id,
+            params=Dict("name" => "missing", "arguments" => Dict{String,Any}()),
+        ),
+    )
+    @test JSON.parse(String(unknown.body))["error"]["code"] == -32602
+
+    stream = ModelContextProtocol.handle_static_stream_request(
+        server,
+        HTTP.Request("GET", "/v1/mcp"),
+    )
+    @test stream.status == 405
+
+    deleted = ModelContextProtocol.handle_static_session_delete(
+        server,
+        HTTP.Request("DELETE", "/v1/mcp", ["MCP-Session-Id" => session_id]),
+    )
+    @test deleted.status == 204
+end
+
 function stub_protected_resource(base::String)
     return JSON.json(Dict(
         "resource" => string(base, "/resource"),
