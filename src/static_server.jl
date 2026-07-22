@@ -84,6 +84,18 @@ struct StaticToolCallParams
     arguments::JSON.JSONText
 end
 
+struct StaticJSONKeySelector
+    key::String
+end
+
+function (selector::StaticJSONKeySelector)(
+    key::JSON.PtrString,
+    value::JSON.LazyValue{String},
+)
+    key == selector.key && return StructUtils.EarlyReturn(value)
+    return nothing
+end
+
 # StructUtils' trim-specialized tier is available on newer releases and on
 # applications that pin its trim branch. Keep this package compatible with
 # older supported StructUtils versions while opting these parser DTOs into the
@@ -167,11 +179,18 @@ function _static_error(
     )
 end
 
+function _static_object_value(value::JSON.LazyValue{String}, key::String)::JSON.LazyValue{String}
+    result = JSON.applyobject(StaticJSONKeySelector(key), value)
+    result isa StructUtils.EarlyReturn || throw(KeyError(key))
+    return result.value::JSON.LazyValue{String}
+end
+
 function _static_tool_call_params(body::String)::StaticToolCallParams
-    params = JSON.lazy(body)["params"]
-    name = JSON.parse(params["name"], String)
+    request = JSON.lazy(body)::JSON.LazyValue{String}
+    params = _static_object_value(request, "params")
+    name = JSON.parse(_static_object_value(params, "name"), String)
     arguments = try
-        JSON.parse(params["arguments"], JSON.JSONText)
+        JSON.parse(_static_object_value(params, "arguments"), JSON.JSONText)
     catch err
         err isa KeyError || rethrow()
         JSON.JSONText("{}")
