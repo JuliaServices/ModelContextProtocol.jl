@@ -2,6 +2,8 @@ module ModelContextProtocol
 
 using HTTP
 using JSON
+using StructUtils: @defaults
+using UUIDs
 
 include("types.jl")
 include("errors.jl")
@@ -10,6 +12,7 @@ include("discovery.jl")
 include("auth.jl")
 include("jsonrpc.jl")
 include("server.jl")
+include("static_server.jl")
 include("client.jl")
 include("apps.jl")
 
