@@ -456,8 +456,14 @@ end
         listener = start_event_listener!(client; poll_interval=0.1)
         try
             log_message!(http_server.server; message="test-event", level="warning", session_id=client.session_id)
-            sleep(0.2)
-            @test any(evt -> get(evt, "level", "") == "warning" && get(evt, "data", "") == "test-event", log_events)
+            @test timedwait(
+                () -> any(
+                    evt -> get(evt, "level", "") == "warning" && get(evt, "data", "") == "test-event",
+                    log_events,
+                ),
+                5.0;
+                pollint=0.05,
+            ) == :ok
 
             result_level = set_log_level!(client, "debug")
             @test result_level["level"] == "debug"
@@ -472,8 +478,7 @@ end
                     "content" => [Dict("type" => "text", "text" => reverse(String(get(args, "message", ""))))],
                 ),
             )
-            sleep(0.2)
-            @test !isempty(tool_list_changes)
+            @test timedwait(() -> !isempty(tool_list_changes), 5.0; pollint=0.05) == :ok
 
             paged = list_tools(client; limit=1)
             @test length(get(paged, "tools", [])) == 1
@@ -492,8 +497,11 @@ end
             @test isempty(unsub)
             subscribe_resource(client, "memory://welcome")
             notify_resource_updated!(http_server.server, "memory://welcome"; annotations=Dict("kind" => "greeting"))
-            sleep(0.2)
-            @test any(evt -> evt["uri"] == "memory://welcome", resource_events)
+            @test timedwait(
+                () -> any(evt -> evt["uri"] == "memory://welcome", resource_events),
+                5.0;
+                pollint=0.05,
+            ) == :ok
 
             enqueue_server_event!(
                 http_server.server,
