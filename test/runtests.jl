@@ -877,4 +877,257 @@ end
     end
 end
 
+function modern_http_request(method::String; id="1", params=Dict{String,Any}(), version=ModelContextProtocol.PROTOCOL_VERSION_2026_07_28, mcp_method=method, mcp_name=nothing, header_version=version, include_meta=true)
+    body_params = Dict{String,Any}(params)
+    if include_meta
+        meta = get(body_params, "_meta", Dict{String,Any}())
+        meta = Dict{String,Any}(meta)
+        get!(meta, ModelContextProtocol.META_PROTOCOL_VERSION, version)
+        get!(meta, ModelContextProtocol.META_CLIENT_CAPABILITIES, Dict{String,Any}())
+        body_params["_meta"] = meta
+    end
+    headers = [
+        "Content-Type" => "application/json",
+        "Accept" => "application/json, text/event-stream",
+    ]
+    header_version !== nothing && push!(headers, "MCP-Protocol-Version" => header_version)
+    mcp_method !== nothing && push!(headers, "Mcp-Method" => mcp_method)
+    mcp_name !== nothing && push!(headers, "Mcp-Name" => mcp_name)
+    body = Dict{String,Any}("jsonrpc" => "2.0", "method" => method, "params" => body_params)
+    id !== nothing && (body["id"] = id)
+    return HTTP.Request("POST", "/v1/mcp", headers, codeunits(JSON.json(body)))
+end
+
+@testset "MCP 2026-07-28" begin
+    @testset "stateless server requests" begin
+        server = MCPServer(name="Modern Server", version="1.2.3", instructions="Use the echo tool.")
+        register_tool!(
+            server;
+            name="echo",
+            handler=(::MCPRequestContext, args::Dict{String,Any}) -> Dict(
+                "content" => [Dict("type" => "text", "text" => String(get(args, "message", "")))],
+            ),
+        )
+        register_resource!(
+            server;
+            uri="memory://doc",
+            handler=(::MCPRequestContext, ::Dict{String,Any}) -> Dict("contents" => Any[]),
+        )
+        respond(req) = ModelContextProtocol.handle_jsonrpc_request(server, req)
+
+        discover = respond(modern_http_request("server/discover"))
+        @test discover.status == 200
+        discover_payload = JSON.parse(String(discover.body))["result"]
+        @test discover_payload["resultType"] == "complete"
+        @test ModelContextProtocol.PROTOCOL_VERSION_2026_07_28 in discover_payload["supportedVersions"]
+        @test ModelContextProtocol.DEFAULT_PROTOCOL_VERSION in discover_payload["supportedVersions"]
+        @test discover_payload["_meta"][ModelContextProtocol.META_SERVER_INFO]["name"] == "Modern Server"
+        @test discover_payload["instructions"] == "Use the echo tool."
+        @test discover_payload["ttlMs"] == 60_000
+
+        listed = respond(modern_http_request("tools/list"))
+        @test listed.status == 200
+        listed_payload = JSON.parse(String(listed.body))["result"]
+        @test listed_payload["resultType"] == "complete"
+        @test listed_payload["ttlMs"] == 60_000
+        @test listed_payload["cacheScope"] == "private"
+        @test listed_payload["_meta"][ModelContextProtocol.META_SERVER_INFO]["version"] == "1.2.3"
+        @test only(listed_payload["tools"])["name"] == "echo"
+
+        called = respond(modern_http_request(
+            "tools/call";
+            params=Dict{String,Any}("name" => "echo", "arguments" => Dict("message" => "hi")),
+            mcp_name="echo",
+        ))
+        @test called.status == 200
+        called_payload = JSON.parse(String(called.body))["result"]
+        @test called_payload["resultType"] == "complete"
+        @test called_payload["content"][1]["text"] == "hi"
+
+        missing_method_header = respond(modern_http_request("tools/list"; mcp_method=nothing))
+        @test missing_method_header.status == 400
+        @test JSON.parse(String(missing_method_header.body))["error"]["code"] == -32020
+
+        name_mismatch = respond(modern_http_request(
+            "tools/call";
+            params=Dict{String,Any}("name" => "echo"),
+            mcp_name="other",
+        ))
+        @test name_mismatch.status == 400
+        @test JSON.parse(String(name_mismatch.body))["error"]["code"] == -32020
+
+        version_mismatch = respond(modern_http_request("tools/list"; header_version="2025-11-25"))
+        @test version_mismatch.status == 400
+        @test JSON.parse(String(version_mismatch.body))["error"]["code"] == -32020
+
+        unsupported = respond(modern_http_request("tools/list"; version="1900-01-01"))
+        @test unsupported.status == 400
+        unsupported_error = JSON.parse(String(unsupported.body))["error"]
+        @test unsupported_error["code"] == -32022
+        @test ModelContextProtocol.PROTOCOL_VERSION_2026_07_28 in unsupported_error["data"]["supported"]
+        @test unsupported_error["data"]["requested"] == "1900-01-01"
+
+        removed = respond(modern_http_request("ping"))
+        @test removed.status == 404
+        @test JSON.parse(String(removed.body))["error"]["code"] == -32601
+
+        not_found = respond(modern_http_request(
+            "resources/read";
+            params=Dict{String,Any}("uri" => "memory://missing"),
+            mcp_name="memory://missing",
+        ))
+        @test JSON.parse(String(not_found.body))["error"]["code"] == -32602
+
+        encoded_name = string("=?base64?", ModelContextProtocol.base64encode("echo"), "?=")
+        encoded = respond(modern_http_request(
+            "tools/call";
+            params=Dict{String,Any}("name" => "echo", "arguments" => Dict("message" => "enc")),
+            mcp_name=encoded_name,
+        ))
+        @test encoded.status == 200
+    end
+
+    @testset "MRTR input_required round trip" begin
+        server = MCPServer(name="MRTR Server", version="0.1.0")
+        register_tool!(
+            server;
+            name="confirm-op",
+            handler=(context::MCPRequestContext, args::Dict{String,Any}) -> begin
+                responses = ModelContextProtocol.input_responses(context)
+                if responses === nothing
+                    return MCPInputRequired(
+                        input_requests=Dict{String,Any}(
+                            "approval" => Dict{String,Any}(
+                                "method" => "elicitation/create",
+                                "params" => Dict{String,Any}("mode" => "form", "message" => "Confirm?"),
+                            ),
+                        ),
+                        request_state="state-token",
+                    )
+                end
+                state = ModelContextProtocol.request_state(context)
+                return Dict(
+                    "content" => [Dict("type" => "text", "text" => "approved:$(state)")],
+                )
+            end,
+        )
+        respond(req) = JSON.parse(String(ModelContextProtocol.handle_jsonrpc_request(server, req).body))
+
+        first_attempt = respond(modern_http_request(
+            "tools/call";
+            params=Dict{String,Any}("name" => "confirm-op"),
+            mcp_name="confirm-op",
+        ))["result"]
+        @test first_attempt["resultType"] == "input_required"
+        @test haskey(first_attempt["inputRequests"], "approval")
+        @test first_attempt["requestState"] == "state-token"
+
+        retry = respond(modern_http_request(
+            "tools/call";
+            id="2",
+            params=Dict{String,Any}(
+                "name" => "confirm-op",
+                "inputResponses" => Dict{String,Any}("approval" => Dict{String,Any}("action" => "accept")),
+                "requestState" => "state-token",
+            ),
+            mcp_name="confirm-op",
+        ))["result"]
+        @test retry["resultType"] == "complete"
+        @test retry["content"][1]["text"] == "approved:state-token"
+    end
+
+    @testset "modern client end to end" begin
+        state, http_server = start_mcp_test_server()
+        base = base_url(http_server)
+        register_tool!(
+            http_server.server;
+            name="noisy",
+            handler=(context::MCPRequestContext, ::Dict{String,Any}) -> begin
+                send_progress!(context; progress=1, total=2, message="halfway")
+                send_log!(context, "info", "working")
+                Dict("content" => [Dict("type" => "text", "text" => "done")])
+            end,
+        )
+        try
+            discovery = discover_server(base)
+            client = prepare_manual_client(
+                discovery;
+                config=MCPClientConfig(protocol_version=ModelContextProtocol.PROTOCOL_VERSION_2026_07_28),
+            )
+            info = initialize_client!(client)
+            @test ModelContextProtocol.PROTOCOL_VERSION_2026_07_28 in info["supportedVersions"]
+            @test info["_meta"][ModelContextProtocol.META_SERVER_INFO]["name"] == "Stub MCP Server"
+
+            tools = list_tools(client)
+            @test tools["resultType"] == "complete"
+            @test tools["ttlMs"] == 60_000
+            @test "echo" in [t["name"] for t in tools["tools"]]
+
+            echo = call_tool(client, "echo"; arguments=Dict("message" => "modern hello"))
+            @test !is_input_required(echo)
+            @test echo["content"][1]["text"] == "modern hello"
+            @test any(h -> get(h, "Mcp-Method", "") == "tools/call", state.headers)
+            @test any(h -> get(h, "Mcp-Name", "") == "echo", state.headers)
+
+            progress_events = Dict{String,Any}[]
+            log_events = Dict{String,Any}[]
+            register_notification_handler!(client, "notifications/progress", (__, _, params) -> begin
+                push!(progress_events, ModelContextProtocol.to_json_dict(params))
+                nothing
+            end)
+            register_notification_handler!(client, "notifications/message", (__, _, params) -> begin
+                push!(log_events, ModelContextProtocol.to_json_dict(params))
+                nothing
+            end)
+            noisy = call_tool(
+                client,
+                "noisy";
+                meta=Dict(
+                    "progressToken" => "tok-1",
+                    ModelContextProtocol.META_LOG_LEVEL => "info",
+                ),
+            )
+            @test noisy["content"][1]["text"] == "done"
+            @test length(progress_events) == 1
+            @test progress_events[1]["progressToken"] == "tok-1"
+            @test progress_events[1]["message"] == "halfway"
+            @test length(log_events) == 1
+            @test log_events[1]["data"] == "working"
+
+            # without opt-in _meta, notifications are suppressed and the response is plain JSON
+            quiet = call_tool(client, "noisy")
+            @test quiet["content"][1]["text"] == "done"
+            @test length(progress_events) == 1
+            @test length(log_events) == 1
+
+            acks = Dict{String,Any}[]
+            list_changes = String[]
+            register_notification_handler!(client, "notifications/subscriptions/acknowledged", (__, _, params) -> begin
+                push!(acks, ModelContextProtocol.to_json_dict(params))
+                nothing
+            end)
+            register_notification_handler!(client, "notifications/tools/list_changed", (__, _, __) -> begin
+                push!(list_changes, "tools")
+                nothing
+            end)
+            listen = listen_subscriptions!(client; tools_list_changed=true)
+            @test timedwait(() -> !isempty(acks), 5.0; pollint=0.05) == :ok
+            @test acks[1]["notifications"]["toolsListChanged"] == true
+            @test acks[1]["_meta"][ModelContextProtocol.META_SUBSCRIPTION_ID] == listen.id
+
+            register_tool!(
+                http_server.server;
+                name="late-arrival",
+                handler=(::MCPRequestContext, ::Dict{String,Any}) -> Dict("content" => Any[]),
+            )
+            @test timedwait(() -> !isempty(list_changes), 5.0; pollint=0.05) == :ok
+
+            close_subscription_listeners!(http_server.server)
+            @test timedwait(() -> istaskdone(listen.task), 5.0; pollint=0.05) == :ok
+        finally
+            stop_mcp_test_server(http_server)
+        end
+    end
+end
+
 include("trim_compile_tests.jl")
