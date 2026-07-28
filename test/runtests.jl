@@ -757,3 +757,124 @@ end
         end
     end
 end
+
+@testset "Spec compliance fixes" begin
+    @testset "deterministic list ordering and error codes" begin
+        server = MCPServer(name="Order Server", version="0.1.0")
+        for name in ("zeta", "alpha", "mid")
+            register_tool!(
+                server;
+                name=name,
+                handler=(::MCPRequestContext, ::Dict{String,Any}) -> Dict("content" => [Dict("type" => "text", "text" => name)]),
+            )
+        end
+        for name in ("z_prompt", "a_prompt")
+            register_prompt!(
+                server;
+                name=name,
+                handler=(::MCPRequestContext, ::Dict{String,Any}) -> Dict("messages" => Any[]),
+            )
+        end
+        for uri in ("memory://z", "memory://a")
+            register_resource!(
+                server;
+                uri=uri,
+                handler=(::MCPRequestContext, ::Dict{String,Any}) -> Dict("contents" => Any[]),
+            )
+        end
+
+        init = ModelContextProtocol.handle_jsonrpc_request(
+            server,
+            jsonrpc_http_request(
+                "initialize";
+                id="init",
+                params=Dict(
+                    "protocolVersion" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
+                    "capabilities" => Dict{String,Any}(),
+                ),
+            ),
+        )
+        session_id = HTTP.header(init, "MCP-Session-Id")
+        ModelContextProtocol.handle_jsonrpc_request(
+            server,
+            jsonrpc_http_request("notifications/initialized"; id=nothing, session_id),
+        )
+        respond(method; params=Dict{String,Any}()) = JSON.parse(String(ModelContextProtocol.handle_jsonrpc_request(
+            server,
+            jsonrpc_http_request(method; params, session_id),
+        ).body))
+
+        listed = respond("tools/list")
+        @test [t["name"] for t in listed["result"]["tools"]] == ["alpha", "mid", "zeta"]
+        prompts = respond("prompts/list")
+        @test [p["name"] for p in prompts["result"]["prompts"]] == ["a_prompt", "z_prompt"]
+        resources = respond("resources/list")
+        @test [r["uri"] for r in resources["result"]["resources"]] == ["memory://a", "memory://z"]
+
+        unknown_tool = respond("tools/call"; params=Dict{String,Any}("name" => "missing"))
+        @test unknown_tool["error"]["code"] == -32602
+        unknown_prompt = respond("prompts/get"; params=Dict{String,Any}("name" => "missing"))
+        @test unknown_prompt["error"]["code"] == -32602
+        unknown_resource = respond("resources/read"; params=Dict{String,Any}("uri" => "memory://missing"))
+        @test unknown_resource["error"]["code"] == -32002
+    end
+
+    @testset "streamed POST responses" begin
+        router = HTTP.Router()
+        HTTP.register!(router, "POST", "/mcp", req -> begin
+            payload = JSON.parse(String(req.body))
+            method = get(payload, "method", "")
+            id = get(payload, "id", nothing)
+            if method == "initialize"
+                body = JSON.json(Dict(
+                    "jsonrpc" => "2.0",
+                    "id" => id,
+                    "result" => Dict(
+                        "protocolVersion" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
+                        "capabilities" => Dict{String,Any}(),
+                        "serverInfo" => Dict("name" => "Streamed Stub", "version" => "0.1.0"),
+                    ),
+                ))
+                return HTTP.Response(200, ["Content-Type" => "application/json", "MCP-Session-Id" => "streamed-session"], body)
+            elseif id === nothing
+                return HTTP.Response(202)
+            else
+                notification = JSON.json(Dict(
+                    "jsonrpc" => "2.0",
+                    "method" => "notifications/message",
+                    "params" => Dict("level" => "info", "data" => "stream-note"),
+                ))
+                response = JSON.json(Dict(
+                    "jsonrpc" => "2.0",
+                    "id" => id,
+                    "result" => Dict("tools" => [Dict("name" => "streamed")]),
+                ))
+                body = string(
+                    "event: message\ndata: ", notification, "\n\n",
+                    "data: ", response, "\n\n",
+                )
+                return HTTP.Response(200, ["Content-Type" => "text/event-stream"], body)
+            end
+        end)
+        stub = HTTP.serve!(router, "127.0.0.1", 0; verbose=false)
+        try
+            port = ModelContextProtocol.bound_http_port(stub)
+            transport = ModelContextProtocol.MCPTransportDescriptor(kind=:http, url="http://127.0.0.1:$(port)/mcp")
+            discovery = ModelContextProtocol.MCPDiscovery(manifest=Dict{String,Any}(), transports=[transport], default_transport=transport)
+            client = prepare_manual_client(discovery)
+            initialize_client!(client)
+            streamed_notes = String[]
+            register_notification_handler!(client, "notifications/message", (__, _, params) -> begin
+                push!(streamed_notes, String(get(params, "data", "")))
+                nothing
+            end)
+            tools = list_tools(client)
+            @test [t["name"] for t in tools["tools"]] == ["streamed"]
+            @test streamed_notes == ["stream-note"]
+        finally
+            close(stub)
+        end
+    end
+end
+
+include("trim_compile_tests.jl")
