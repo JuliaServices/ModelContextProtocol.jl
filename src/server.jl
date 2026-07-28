@@ -1158,7 +1158,7 @@ function call_tool(server::MCPServer, context::MCPRequestContext, params::Dict{S
     haskey(params, "name") || throw(mcp_error(:invalid_params, "Tool call requires a name"))
     name = String(params["name"])
     tool = get(server.tools, name, nothing)
-    tool === nothing && throw(mcp_error(:method_not_found, "Tool $(name) is not registered"))
+    tool === nothing && throw(mcp_error(:invalid_params, "Tool $(name) is not registered"))
     args = arguments_dict(params)
     result = tool.handler(context, args)
     normalized = normalize_tool_result(result)
@@ -1200,13 +1200,15 @@ function handle_completion_request(server::MCPServer, context::MCPRequestContext
     return result
 end
 
+# Lists are returned in sorted order so results are deterministic across
+# calls/instances (improves client-side LLM prompt cache hit rates).
 function list_tools(server::MCPServer, params::Dict{String,Any})
-    items = [tool_descriptor(tool) for tool in values(server.tools)]
+    items = [tool_descriptor(server.tools[name]) for name in sort!(collect(keys(server.tools)))]
     return paginate_collection(items, params, "tools")
 end
 
 function list_prompts(server::MCPServer, params::Dict{String,Any})
-    items = [prompt_descriptor(prompt) for prompt in values(server.prompts)]
+    items = [prompt_descriptor(server.prompts[name]) for name in sort!(collect(keys(server.prompts)))]
     return paginate_collection(items, params, "prompts")
 end
 
@@ -1214,18 +1216,18 @@ function get_prompt(server::MCPServer, context::MCPRequestContext, params::Dict{
     haskey(params, "name") || throw(mcp_error(:invalid_params, "Prompt retrieval requires a name"))
     name = String(params["name"])
     prompt = get(server.prompts, name, nothing)
-    prompt === nothing && throw(mcp_error(:method_not_found, "Prompt $(name) is not registered"))
+    prompt === nothing && throw(mcp_error(:invalid_params, "Prompt $(name) is not registered"))
     args = arguments_dict(params)
     return prompt.handler(context, args)
 end
 
 function list_resources(server::MCPServer, params::Dict{String,Any})
-    items = [resource_descriptor(resource) for resource in values(server.resources)]
+    items = [resource_descriptor(server.resources[uri]) for uri in sort!(collect(keys(server.resources)))]
     return paginate_collection(items, params, "resources")
 end
 
 function list_resource_templates(server::MCPServer, params::Dict{String,Any})
-    items = [resource_template_descriptor(template) for template in values(server.resource_templates)]
+    items = [resource_template_descriptor(server.resource_templates[name]) for name in sort!(collect(keys(server.resource_templates)))]
     return paginate_collection(items, params, "resourceTemplates")
 end
 
@@ -1233,7 +1235,7 @@ function read_resource(server::MCPServer, context::MCPRequestContext, params::Di
     haskey(params, "uri") || throw(mcp_error(:invalid_params, "Resource retrieval requires a uri"))
     uri = String(params["uri"])
     resource = get(server.resources, uri, nothing)
-    resource === nothing && throw(mcp_error(:method_not_found, "Resource $(uri) is not registered"))
+    resource === nothing && throw(mcp_error(:resource_not_found, "Resource $(uri) is not registered"))
     args = arguments_dict(params)
     return resource.handler(context, args)
 end
@@ -1364,6 +1366,8 @@ function classify_error(err)
             return -32602, err.message
         elseif err.code == :invalid_request
             return -32600, err.message
+        elseif err.code == :resource_not_found
+            return -32002, err.message
         elseif err.code == :invalid_session
             return -32001, err.message
         elseif err.code == :session_required

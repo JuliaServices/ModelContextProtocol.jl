@@ -95,8 +95,42 @@ function jsonrpc_call(
     end
     notification && return nothing
     isempty(response.body) && throw(mcp_error(:jsonrpc_error, "JSON-RPC response from $(client.transport.url) was empty"))
-    data = parse_jsonrpc_response(response.body)
+    if is_event_stream_response(response)
+        data = extract_streamed_jsonrpc_response(client, response, payload["id"])
+    else
+        data = parse_jsonrpc_response(response.body)
+    end
     return get(data, "result", nothing)
+end
+
+function is_event_stream_response(response::HTTP.Response)
+    content_type = http_header_value(response.headers, "Content-Type")
+    content_type === nothing && return false
+    return occursin("text/event-stream", lowercase(String(content_type)))
+end
+
+# Streamable HTTP servers may answer a POST with an SSE stream carrying
+# request-scoped notifications/server requests before the final response.
+function extract_streamed_jsonrpc_response(client::MCPClient, response::HTTP.Response, request_id)
+    result_payload = nothing
+    for event in parse_sse_events(String(response.body))
+        event.event in (nothing, "", "message", "jsonrpc") || continue
+        isempty(event.data) && continue
+        data = try
+            JSON.parse(event.data)
+        catch err
+            @warn "Failed to parse JSON from streamed response event" err
+            continue
+        end
+        data isa AbstractDict || continue
+        if haskey(data, "method")
+            handle_jsonrpc_event!(client, data)
+        elseif get(data, "id", nothing) == request_id && (haskey(data, "result") || haskey(data, "error"))
+            result_payload = data
+        end
+    end
+    result_payload === nothing && throw(mcp_error(:jsonrpc_error, "Streamed JSON-RPC response from $(client.transport.url) did not include a response for request $(request_id)"))
+    return validate_jsonrpc_payload(result_payload)
 end
 
 jsonrpc_notification(client::MCPClient, method::AbstractString; params=nothing, headers=nothing) =
@@ -135,6 +169,10 @@ end
 
 function parse_jsonrpc_response(body)
     data = JSON.parse(String(body))
+    return validate_jsonrpc_payload(data)
+end
+
+function validate_jsonrpc_payload(data)
     data isa AbstractDict || throw(mcp_error(:jsonrpc_error, "JSON-RPC response must be a JSON object"))
     version = get(data, "jsonrpc", nothing)
     version == JSONRPC_VERSION || throw(mcp_error(:jsonrpc_error, "Unsupported JSON-RPC version $(version)"))
