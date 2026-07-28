@@ -2,7 +2,6 @@ module ModelContextProtocol
 
 using HTTP
 using JSON
-using StructUtils: @defaults
 using UUIDs
 
 include("types.jl")

@@ -73,35 +73,304 @@ end
 
 const StaticJSONRPCID = Union{String,Int64,Nothing}
 
-@defaults struct StaticJSONRPCRequest
-    jsonrpc::String=""
-    id::StaticJSONRPCID=nothing
-    method::String=""
+"Parsed JSON-RPC envelope; params is retained as a raw byte offset into the body."
+struct StaticJSONRPCRequest
+    ok::Bool
+    jsonrpc::String
+    id::StaticJSONRPCID
+    method::String
+    params_start::Int
 end
 
-struct StaticToolCallParams
-    name::String
-    arguments::JSON.JSONText
+const _STATIC_PARSE_ERROR = StaticJSONRPCRequest(false, "", nothing, "", 0)
+
+# --- minimal hand-rolled JSON scanning --------------------------------------
+# The static server scans requests itself instead of using JSON.lazy/typed
+# parse: those paths reach Parsers' recursive float parsing and repr()-based
+# error formatting, neither of which is trim-verifiable.
+
+_static_is_ws(b::UInt8) = b == UInt8(' ') || b == UInt8('\t') || b == UInt8('\n') || b == UInt8('\r')
+
+function _static_skip_ws(s::String, i::Int)::Int
+    n = ncodeunits(s)
+    while i <= n && _static_is_ws(codeunit(s, i))
+        i += 1
+    end
+    return i
 end
 
-struct StaticJSONKeySelector
-    key::String
+# i points at the opening quote; returns the index just past the closing quote, or 0 on error
+function _static_string_end(s::String, i::Int)::Int
+    n = ncodeunits(s)
+    i += 1
+    while i <= n
+        b = codeunit(s, i)
+        if b == UInt8('\\')
+            i += 2
+        elseif b == UInt8('"')
+            return i + 1
+        else
+            i += 1
+        end
+    end
+    return 0
 end
 
-function (selector::StaticJSONKeySelector)(
-    key::JSON.PtrString,
-    value::JSON.LazyValue{String},
-)
-    key == selector.key && return StructUtils.EarlyReturn(value)
-    return nothing
+function _static_hex_digit(b::UInt8)::Int
+    UInt8('0') <= b <= UInt8('9') && return Int(b - UInt8('0'))
+    UInt8('a') <= b <= UInt8('f') && return Int(b - UInt8('a')) + 10
+    UInt8('A') <= b <= UInt8('F') && return Int(b - UInt8('A')) + 10
+    return -1
 end
 
-# StructUtils' trim-specialized tier is available on newer releases and on
-# applications that pin its trim branch. Keep this package compatible with
-# older supported StructUtils versions while opting these parser DTOs into the
-# concrete tier whenever the host environment provides it.
-if isdefined(StructUtils, Symbol("@hot"))
-    @eval StructUtils.@hot StaticJSONRPCRequest
+# i points at the first of four hex digits; returns the code unit or -1 on error
+function _static_hex4(s::String, i::Int)::Int
+    i + 3 <= ncodeunits(s) || return -1
+    code = 0
+    for k in 0:3
+        d = _static_hex_digit(codeunit(s, i + k))
+        d < 0 && return -1
+        code = code * 16 + d
+    end
+    return code
+end
+
+# i points at the opening quote; returns (unescaped value, index past closing quote), index 0 on error
+function _static_scan_string(s::String, i::Int)::Tuple{String,Int}
+    n = ncodeunits(s)
+    io = IOBuffer()
+    i += 1
+    while i <= n
+        b = codeunit(s, i)
+        if b == UInt8('"')
+            return String(take!(io)), i + 1
+        elseif b == UInt8('\\')
+            i + 1 <= n || return "", 0
+            e = codeunit(s, i + 1)
+            if e == UInt8('"')
+                write(io, UInt8('"')); i += 2
+            elseif e == UInt8('\\')
+                write(io, UInt8('\\')); i += 2
+            elseif e == UInt8('/')
+                write(io, UInt8('/')); i += 2
+            elseif e == UInt8('b')
+                write(io, 0x08); i += 2
+            elseif e == UInt8('f')
+                write(io, 0x0c); i += 2
+            elseif e == UInt8('n')
+                write(io, UInt8('\n')); i += 2
+            elseif e == UInt8('r')
+                write(io, UInt8('\r')); i += 2
+            elseif e == UInt8('t')
+                write(io, UInt8('\t')); i += 2
+            elseif e == UInt8('u')
+                code = _static_hex4(s, i + 2)
+                (code < 0 || 0xdc00 <= code <= 0xdfff) && return "", 0
+                i += 6
+                if 0xd800 <= code <= 0xdbff
+                    (i + 1 <= n && codeunit(s, i) == UInt8('\\') && codeunit(s, i + 1) == UInt8('u')) || return "", 0
+                    low = _static_hex4(s, i + 2)
+                    (0xdc00 <= low <= 0xdfff) || return "", 0
+                    code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00)
+                    i += 6
+                end
+                print(io, Char(code))
+            else
+                return "", 0
+            end
+        else
+            write(io, b)
+            i += 1
+        end
+    end
+    return "", 0
+end
+
+_static_is_number_byte(b::UInt8) =
+    (UInt8('0') <= b <= UInt8('9')) || b == UInt8('-') || b == UInt8('+') || b == UInt8('.') || b == UInt8('e') || b == UInt8('E')
+
+function _static_number_end(s::String, i::Int)::Int
+    n = ncodeunits(s)
+    while i <= n && _static_is_number_byte(codeunit(s, i))
+        i += 1
+    end
+    return i
+end
+
+function _static_literal_end(s::String, i::Int, lit::String)::Int
+    len = ncodeunits(lit)
+    i + len - 1 <= ncodeunits(s) || return 0
+    for k in 1:len
+        codeunit(s, i + k - 1) == codeunit(lit, k) || return 0
+    end
+    return i + len
+end
+
+# returns the index just past the value starting at (or after whitespace from) i, or 0 on error
+function _static_value_end(s::String, i::Int)::Int
+    n = ncodeunits(s)
+    i = _static_skip_ws(s, i)
+    i <= n || return 0
+    b = codeunit(s, i)
+    if b == UInt8('"')
+        return _static_string_end(s, i)
+    elseif b == UInt8('{')
+        i = _static_skip_ws(s, i + 1)
+        i <= n || return 0
+        codeunit(s, i) == UInt8('}') && return i + 1
+        while true
+            codeunit(s, i) == UInt8('"') || return 0
+            i = _static_string_end(s, i)
+            i == 0 && return 0
+            i = _static_skip_ws(s, i)
+            (i <= n && codeunit(s, i) == UInt8(':')) || return 0
+            i = _static_value_end(s, i + 1)
+            i == 0 && return 0
+            i = _static_skip_ws(s, i)
+            i <= n || return 0
+            if codeunit(s, i) == UInt8(',')
+                i = _static_skip_ws(s, i + 1)
+                i <= n || return 0
+            elseif codeunit(s, i) == UInt8('}')
+                return i + 1
+            else
+                return 0
+            end
+        end
+    elseif b == UInt8('[')
+        i = _static_skip_ws(s, i + 1)
+        i <= n || return 0
+        codeunit(s, i) == UInt8(']') && return i + 1
+        while true
+            i = _static_value_end(s, i)
+            i == 0 && return 0
+            i = _static_skip_ws(s, i)
+            i <= n || return 0
+            if codeunit(s, i) == UInt8(',')
+                i = _static_skip_ws(s, i + 1)
+                i <= n || return 0
+            elseif codeunit(s, i) == UInt8(']')
+                return i + 1
+            else
+                return 0
+            end
+        end
+    elseif b == UInt8('t')
+        return _static_literal_end(s, i, "true")
+    elseif b == UInt8('f')
+        return _static_literal_end(s, i, "false")
+    elseif b == UInt8('n')
+        return _static_literal_end(s, i, "null")
+    elseif _static_is_number_byte(b)
+        j = _static_number_end(s, i)
+        return j > i ? j : 0
+    else
+        return 0
+    end
+end
+
+function _static_parse_request(s::String)::StaticJSONRPCRequest
+    n = ncodeunits(s)
+    i = _static_skip_ws(s, 1)
+    (i <= n && codeunit(s, i) == UInt8('{')) || return _STATIC_PARSE_ERROR
+    jsonrpc = ""
+    id::StaticJSONRPCID = nothing
+    method = ""
+    params_start = 0
+    i = _static_skip_ws(s, i + 1)
+    i <= n || return _STATIC_PARSE_ERROR
+    codeunit(s, i) == UInt8('}') && return StaticJSONRPCRequest(true, jsonrpc, id, method, params_start)
+    while true
+        (i <= n && codeunit(s, i) == UInt8('"')) || return _STATIC_PARSE_ERROR
+        key, i = _static_scan_string(s, i)
+        i == 0 && return _STATIC_PARSE_ERROR
+        i = _static_skip_ws(s, i)
+        (i <= n && codeunit(s, i) == UInt8(':')) || return _STATIC_PARSE_ERROR
+        i = _static_skip_ws(s, i + 1)
+        i <= n || return _STATIC_PARSE_ERROR
+        value_start = i
+        if key == "jsonrpc"
+            codeunit(s, i) == UInt8('"') || return _STATIC_PARSE_ERROR
+            jsonrpc, i = _static_scan_string(s, i)
+            i == 0 && return _STATIC_PARSE_ERROR
+        elseif key == "id"
+            b = codeunit(s, i)
+            if b == UInt8('"')
+                idstr, i = _static_scan_string(s, i)
+                i == 0 && return _STATIC_PARSE_ERROR
+                id = idstr
+            elseif b == UInt8('n')
+                i = _static_literal_end(s, i, "null")
+                i == 0 && return _STATIC_PARSE_ERROR
+                id = nothing
+            else
+                i = _static_number_end(s, i)
+                i > value_start || return _STATIC_PARSE_ERROR
+                parsed_id = tryparse(Int64, SubString(s, value_start, i - 1))
+                parsed_id === nothing && return _STATIC_PARSE_ERROR
+                id = parsed_id
+            end
+        elseif key == "method"
+            codeunit(s, i) == UInt8('"') || return _STATIC_PARSE_ERROR
+            method, i = _static_scan_string(s, i)
+            i == 0 && return _STATIC_PARSE_ERROR
+        else
+            key == "params" && (params_start = i)
+            i = _static_value_end(s, i)
+            i == 0 && return _STATIC_PARSE_ERROR
+        end
+        i = _static_skip_ws(s, i)
+        i <= n || return _STATIC_PARSE_ERROR
+        if codeunit(s, i) == UInt8(',')
+            i = _static_skip_ws(s, i + 1)
+        elseif codeunit(s, i) == UInt8('}')
+            return StaticJSONRPCRequest(true, jsonrpc, id, method, params_start)
+        else
+            return _STATIC_PARSE_ERROR
+        end
+    end
+end
+
+# Extracts params.name and raw params.arguments JSON from the request body.
+# Returns (name, arguments); name == "" signals missing/invalid params.
+function _static_tool_call_params(s::String, params_start::Int)::Tuple{String,JSON.JSONText}
+    arguments = JSON.JSONText("{}")
+    params_start == 0 && return "", arguments
+    n = ncodeunits(s)
+    i = params_start
+    (i <= n && codeunit(s, i) == UInt8('{')) || return "", arguments
+    name = ""
+    i = _static_skip_ws(s, i + 1)
+    i <= n || return "", arguments
+    codeunit(s, i) == UInt8('}') && return name, arguments
+    while true
+        (i <= n && codeunit(s, i) == UInt8('"')) || return "", arguments
+        key, i = _static_scan_string(s, i)
+        i == 0 && return "", arguments
+        i = _static_skip_ws(s, i)
+        (i <= n && codeunit(s, i) == UInt8(':')) || return "", arguments
+        i = _static_skip_ws(s, i + 1)
+        i <= n || return "", arguments
+        value_start = i
+        if key == "name"
+            codeunit(s, i) == UInt8('"') || return "", arguments
+            name, i = _static_scan_string(s, i)
+            i == 0 && return "", arguments
+        else
+            i = _static_value_end(s, i)
+            i == 0 && return "", arguments
+            key == "arguments" && (arguments = JSON.JSONText(s[value_start:i - 1]))
+        end
+        i = _static_skip_ws(s, i)
+        i <= n || return "", arguments
+        if codeunit(s, i) == UInt8(',')
+            i = _static_skip_ws(s, i + 1)
+        elseif codeunit(s, i) == UInt8('}')
+            return name, arguments
+        else
+            return "", arguments
+        end
+    end
 end
 
 function _static_write_json_string(io::IO, value::String)
@@ -177,25 +446,6 @@ function _static_error(
         _static_json_string(message),
         "}}",
     )
-end
-
-function _static_object_value(value::JSON.LazyValue{String}, key::String)::JSON.LazyValue{String}
-    result = JSON.applyobject(StaticJSONKeySelector(key), value)
-    result isa StructUtils.EarlyReturn || throw(KeyError(key))
-    return result.value::JSON.LazyValue{String}
-end
-
-function _static_tool_call_params(body::String)::StaticToolCallParams
-    request = JSON.lazy(body)::JSON.LazyValue{String}
-    params = _static_object_value(request, "params")
-    name = JSON.parse(_static_object_value(params, "name"), String)
-    arguments = try
-        JSON.parse(_static_object_value(params, "arguments"), JSON.JSONText)
-    catch err
-        err isa KeyError || rethrow()
-        JSON.JSONText("{}")
-    end
-    return StaticToolCallParams(name, arguments)
 end
 
 function _static_create_session!(server::StaticMCPServer)::StaticMCPSession
@@ -289,11 +539,8 @@ function handle_static_jsonrpc_request(server::StaticMCPServer{H}, req::HTTP.Req
         _static_error(nothing, -32600, "Unsupported MCP protocol version"),
     )
     body = String(req.body)
-    rpc = try
-        JSON.parse(body, StaticJSONRPCRequest)
-    catch
-        return _static_response(400, _static_error(nothing, -32700, "Invalid JSON-RPC request"))
-    end
+    rpc = _static_parse_request(body)
+    rpc.ok || return _static_response(400, _static_error(nothing, -32700, "Invalid JSON-RPC request"))
     rpc.jsonrpc == "2.0" ||
         return _static_response(400, _static_error(rpc.id, -32600, "jsonrpc must be 2.0"))
 
@@ -332,16 +579,14 @@ function handle_static_jsonrpc_request(server::StaticMCPServer{H}, req::HTTP.Req
     elseif rpc.method == "tools/list"
         return _static_response(200, _static_success(rpc.id, _static_tools_result(server)))
     elseif rpc.method == "tools/call"
-        params = try
-            _static_tool_call_params(body)
-        catch
+        name, arguments = _static_tool_call_params(body, rpc.params_start)
+        isempty(name) &&
             return _static_response(200, _static_error(rpc.id, -32602, "Invalid tool arguments"))
-        end
-        index = get(server.tool_indices, params.name, 0)
+        index = get(server.tool_indices, name, 0)
         index == 0 &&
             return _static_response(200, _static_error(rpc.id, -32602, "Unknown tool"))
         context = StaticMCPRequestContext(request=req, session_id=session_id)
-        result = server.tools[index].handler(context, params.arguments)
+        result = server.tools[index].handler(context, arguments)
         return _static_response(200, _static_success(rpc.id, _static_tool_result(result)))
     end
 
