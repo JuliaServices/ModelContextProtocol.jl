@@ -10,7 +10,13 @@ struct MCPRequestContext
     params::Any
     session::Union{MCPSession,Nothing}
     timeout_ms::Union{Int,Nothing}
+    protocol_version::String
+    log_level::Union{String,Nothing}
+    notifier::Union{Function,Nothing}
 end
+
+MCPRequestContext(server, http_request, method, id, params, session, timeout_ms) =
+    MCPRequestContext(server, http_request, method, id, params, session, timeout_ms, server.config.protocol_version, nothing, nothing)
 
 struct MCPHTTPServer
     server::MCPServer
@@ -94,6 +100,8 @@ function MCPServer(config::MCPServerConfig)
         "info",
         behavior,
         nothing,
+        MCPSubscriptionListener[],
+        ReentrantLock(),
     )
 end
 
@@ -397,6 +405,7 @@ function notify_list_changed!(server::MCPServer, capability::AbstractString)
     method = list_changed_method(capability)
     method === nothing && return nothing
     broadcast_jsonrpc_notification!(server, method)
+    notify_listeners!(server, method, Dict{String,Any}())
     return nothing
 end
 function register_session!(server::MCPServer; session_id::Union{AbstractString,Nothing}=nothing)
@@ -545,16 +554,6 @@ function validate_jsonrpc_headers(server::MCPServer, req::HTTP.Request)
         data = Dict("error" => "Request must accept text/event-stream responses", "required" => "application/json, text/event-stream")
         return HTTP.Response(406, response_headers(server), JSON.json(data))
     end
-    version, missing_error = resolve_protocol_version(server, req, "JSON-RPC request")
-    missing_error !== nothing && return missing_error
-    if version != server.config.protocol_version
-        data = Dict(
-            "error" => "Unsupported MCP protocol version",
-            "expected" => server.config.protocol_version,
-            "received" => version,
-        )
-        return HTTP.Response(400, response_headers(server), JSON.json(data))
-    end
     return nothing
 end
 
@@ -608,10 +607,11 @@ function response_headers(
     content_type::Union{String,Nothing}="application/json",
     session::Union{MCPSession,Nothing}=nothing,
     extra::Vector{HeaderPair}=HeaderPair[],
+    protocol_version::Union{String,Nothing}=nothing,
 )
     headers = HeaderPair[]
     content_type !== nothing && push!(headers, "Content-Type" => content_type)
-    push!(headers, "MCP-Protocol-Version" => server.config.protocol_version)
+    push!(headers, "MCP-Protocol-Version" => something(protocol_version, server.config.protocol_version))
     session !== nothing && push!(headers, "MCP-Session-Id" => session.id)
     append!(headers, extra)
     return build_headers(headers)
@@ -981,7 +981,7 @@ function jsonrpc_success(server::MCPServer, session::Union{MCPSession,Nothing}, 
     return HTTP.Response(200, response_headers(server; session=session), JSON.json(body))
 end
 
-function jsonrpc_error(server::MCPServer, session::Union{MCPSession,Nothing}, id, code::Int, message::AbstractString; data=nothing)
+function jsonrpc_error(server::MCPServer, session::Union{MCPSession,Nothing}, id, code::Int, message::AbstractString; data=nothing, status::Int=200)
     error = Dict("code" => code, "message" => String(message))
     data === nothing || (error["data"] = data)
     body = Dict(
@@ -989,7 +989,7 @@ function jsonrpc_error(server::MCPServer, session::Union{MCPSession,Nothing}, id
         "id" => id,
         "error" => error,
     )
-    return HTTP.Response(200, response_headers(server; session=session), JSON.json(body))
+    return HTTP.Response(status, response_headers(server; session=session), JSON.json(body))
 end
 
 function params_dict(params)
@@ -1161,6 +1161,7 @@ function call_tool(server::MCPServer, context::MCPRequestContext, params::Dict{S
     tool === nothing && throw(mcp_error(:invalid_params, "Tool $(name) is not registered"))
     args = arguments_dict(params)
     result = tool.handler(context, args)
+    result isa MCPInputRequired && return input_required_result(result)
     normalized = normalize_tool_result(result)
     if tool.output_schema !== nothing && !haskey(normalized, "structuredContent")
         annotations = get(normalized, "annotations", Dict{String,Any}())
@@ -1274,6 +1275,7 @@ function notify_resource_updated!(
         meta !== nothing && merge!(annotation_data, meta)
     end
     !isempty(annotation_data) && (payload["annotations"] = annotation_data)
+    notify_listeners!(server, JSONRPC_METHOD_NOTIFICATIONS_RESOURCES_UPDATED, payload)
     recipients = MCPSession[]
     for session in list_sessions(server)
         session.initialized || continue
@@ -1315,6 +1317,393 @@ function initialize_response(server::MCPServer, session::MCPSession, params::Dic
     )
     server.config.instructions !== nothing && (result["instructions"] = String(server.config.instructions))
     return result
+end
+
+# --- 2026-07-28 (stateless) protocol support ---------------------------------
+
+function request_meta(params::Dict{String,Any})
+    meta = get(params, "_meta", nothing)
+    meta isa AbstractDict || return Dict{String,Any}()
+    return to_json_dict(meta)
+end
+
+function supported_versions(server::MCPServer)
+    versions = String[server.config.protocol_version]
+    for version in server.config.supported_protocol_versions
+        version in versions || push!(versions, version)
+    end
+    return sort!(versions; rev=true)
+end
+
+server_supports_version(server::MCPServer, version::AbstractString) =
+    String(version) == server.config.protocol_version || String(version) in server.config.supported_protocol_versions
+
+const MCP_NAME_BASE64_PREFIX = "=?base64?"
+const MCP_NAME_BASE64_SUFFIX = "?="
+
+function is_header_safe_value(value::AbstractString)
+    isempty(value) && return false
+    for b in codeunits(value)
+        (0x21 <= b <= 0x7e) || return false
+    end
+    startswith(value, MCP_NAME_BASE64_PREFIX) && endswith(value, MCP_NAME_BASE64_SUFFIX) && return false
+    return true
+end
+
+encode_mcp_name(value::AbstractString) =
+    is_header_safe_value(value) ? String(value) : string(MCP_NAME_BASE64_PREFIX, base64encode(String(value)), MCP_NAME_BASE64_SUFFIX)
+
+function decode_mcp_name(value::AbstractString)
+    text = String(value)
+    if startswith(text, MCP_NAME_BASE64_PREFIX) && endswith(text, MCP_NAME_BASE64_SUFFIX)
+        encoded = text[length(MCP_NAME_BASE64_PREFIX)+1:end-length(MCP_NAME_BASE64_SUFFIX)]
+        return try
+            String(base64decode(encoded))
+        catch
+            nothing
+        end
+    end
+    return text
+end
+
+function mcp_name_body_value(method::AbstractString, params::Dict{String,Any})
+    if method == JSONRPC_METHOD_TOOLS_CALL || method == JSONRPC_METHOD_PROMPTS_GET
+        value = get(params, "name", nothing)
+        return value isa AbstractString ? String(value) : nothing
+    elseif method == JSONRPC_METHOD_RESOURCES_READ
+        value = get(params, "uri", nothing)
+        return value isa AbstractString ? String(value) : nothing
+    end
+    return nothing
+end
+
+# Streamable HTTP (2026-07-28) requires Mcp-Method on every request, plus
+# Mcp-Name on tools/call, prompts/get, and resources/read; header values must
+# match the corresponding body values (HeaderMismatch -32020 otherwise).
+function validate_modern_headers(server::MCPServer, req::HTTP.Request, method::AbstractString, params::Dict{String,Any}, id)
+    header_method = http_header_value(req.headers, "Mcp-Method")
+    if header_method === nothing || isempty(strip(String(header_method)))
+        return jsonrpc_error(server, nothing, id, -32020, "Header mismatch: Mcp-Method header is required"; status=400)
+    end
+    if String(header_method) != String(method)
+        return jsonrpc_error(server, nothing, id, -32020, "Header mismatch: Mcp-Method header value '$(header_method)' does not match body method '$(method)'"; status=400)
+    end
+    expected_name = mcp_name_body_value(method, params)
+    if expected_name !== nothing
+        header_name = http_header_value(req.headers, "Mcp-Name")
+        if header_name === nothing || isempty(strip(String(header_name)))
+            return jsonrpc_error(server, nothing, id, -32020, "Header mismatch: Mcp-Name header is required for $(method)"; status=400)
+        end
+        decoded = decode_mcp_name(String(header_name))
+        if decoded === nothing || decoded != expected_name
+            return jsonrpc_error(server, nothing, id, -32020, "Header mismatch: Mcp-Name header value does not match body value"; status=400)
+        end
+    end
+    return nothing
+end
+
+const CACHEABLE_RESULT_METHODS = (
+    JSONRPC_METHOD_TOOLS_LIST,
+    JSONRPC_METHOD_PROMPTS_LIST,
+    JSONRPC_METHOD_RESOURCES_LIST,
+    JSONRPC_METHOD_RESOURCES_TEMPLATES_LIST,
+    JSONRPC_METHOD_RESOURCES_READ,
+)
+
+function decorate_modern_result!(server::MCPServer, method::AbstractString, result)
+    result isa AbstractDict || return result
+    dict = result isa Dict{String,Any} ? result : to_json_dict(result)
+    haskey(dict, "resultType") || (dict["resultType"] = "complete")
+    if method in CACHEABLE_RESULT_METHODS
+        haskey(dict, "ttlMs") || (dict["ttlMs"] = server.config.cache_ttl_ms)
+        haskey(dict, "cacheScope") || (dict["cacheScope"] = server.config.cache_scope)
+    end
+    meta = get(dict, "_meta", nothing)
+    meta_dict = meta isa AbstractDict ? to_json_dict(meta) : Dict{String,Any}()
+    haskey(meta_dict, META_SERVER_INFO) || (meta_dict[META_SERVER_INFO] = server.server_info)
+    dict["_meta"] = meta_dict
+    return dict
+end
+
+input_required_result(input::MCPInputRequired) = begin
+    isempty(input.input_requests) && input.request_state === nothing &&
+        throw(mcp_error(:invalid_response, "MCPInputRequired must carry inputRequests or requestState"))
+    result = Dict{String,Any}("resultType" => "input_required")
+    isempty(input.input_requests) || (result["inputRequests"] = input.input_requests)
+    input.request_state === nothing || (result["requestState"] = String(input.request_state))
+    result
+end
+
+"Client-provided responses to a previous input_required result (MRTR retry), or nothing."
+function input_responses(context::MCPRequestContext)
+    context.params isa AbstractDict || return nothing
+    responses = get(context.params, "inputResponses", nothing)
+    responses isa AbstractDict || return nothing
+    return to_json_dict(responses)
+end
+
+"Opaque requestState echoed back by the client on an MRTR retry, or nothing."
+function request_state(context::MCPRequestContext)
+    context.params isa AbstractDict || return nothing
+    state = get(context.params, "requestState", nothing)
+    return state isa AbstractString ? String(state) : nothing
+end
+
+function progress_token(context::MCPRequestContext)
+    context.params isa AbstractDict || return nothing
+    meta = get(context.params, "_meta", nothing)
+    meta isa AbstractDict || return nothing
+    return get(meta, "progressToken", nothing)
+end
+
+"Emit a notifications/progress event on the request's response stream (no-op without a progressToken or stream)."
+function send_progress!(context::MCPRequestContext; progress, total=nothing, message=nothing)
+    context.notifier === nothing && return nothing
+    token = progress_token(context)
+    token === nothing && return nothing
+    params = Dict{String,Any}("progressToken" => token, "progress" => progress)
+    total === nothing || (params["total"] = total)
+    message === nothing || (params["message"] = String(message))
+    context.notifier(Dict{String,Any}(
+        "jsonrpc" => JSONRPC_VERSION,
+        "method" => JSONRPC_METHOD_NOTIFICATIONS_PROGRESS,
+        "params" => params,
+    ))
+    return nothing
+end
+
+log_level_rank(level::AbstractString) = something(findfirst(==(String(level)), MCP_LOG_LEVELS), 1)
+
+"Emit a notifications/message event on the request's response stream. Servers MUST NOT log to requests that did not opt in via the io.modelcontextprotocol/logLevel _meta key, so this is a no-op unless the request carried it."
+function send_log!(context::MCPRequestContext, level::AbstractString, data; logger=nothing)
+    context.notifier === nothing && return nothing
+    context.log_level === nothing && return nothing
+    normalized = normalize_log_level(level)
+    log_level_rank(normalized) >= log_level_rank(context.log_level) || return nothing
+    params = Dict{String,Any}("level" => normalized, "data" => data)
+    logger === nothing || (params["logger"] = String(logger))
+    context.notifier(Dict{String,Any}(
+        "jsonrpc" => JSONRPC_VERSION,
+        "method" => JSONRPC_METHOD_NOTIFICATIONS_MESSAGE,
+        "params" => params,
+    ))
+    return nothing
+end
+
+function discover_result(server::MCPServer)
+    result = Dict{String,Any}(
+        "resultType" => "complete",
+        "supportedVersions" => supported_versions(server),
+        "capabilities" => manifest_capabilities(server),
+        "ttlMs" => server.config.cache_ttl_ms,
+        "cacheScope" => server.config.cache_scope,
+        "_meta" => Dict{String,Any}(META_SERVER_INFO => server.server_info),
+    )
+    server.config.instructions === nothing || (result["instructions"] = String(server.config.instructions))
+    return result
+end
+
+function register_listener!(server::MCPServer, listener::MCPSubscriptionListener)
+    @lock server.listeners_lock push!(server.listeners, listener)
+    return listener
+end
+
+function unregister_listener!(server::MCPServer, listener::MCPSubscriptionListener)
+    @lock server.listeners_lock filter!(l -> l !== listener, server.listeners)
+    return nothing
+end
+
+function push_listener_notification!(listener::MCPSubscriptionListener, method::AbstractString, params::Dict{String,Any})
+    tagged = copy(params)
+    meta = get(tagged, "_meta", nothing)
+    meta_dict = meta isa AbstractDict ? to_json_dict(meta) : Dict{String,Any}()
+    meta_dict[META_SUBSCRIPTION_ID] = listener.id
+    tagged["_meta"] = meta_dict
+    envelope = Dict{String,Any}(
+        "jsonrpc" => JSONRPC_VERSION,
+        "method" => String(method),
+        "params" => tagged,
+    )
+    try
+        put!(listener.channel, envelope)
+    catch
+        # channel closed by a disconnecting client; the listener is being torn down
+    end
+    return nothing
+end
+
+function notify_listeners!(server::MCPServer, method::AbstractString, params::Dict{String,Any})
+    listeners = @lock server.listeners_lock copy(server.listeners)
+    for listener in listeners
+        wants = if method == JSONRPC_METHOD_NOTIFICATIONS_TOOLS_LIST_CHANGED
+            listener.tools
+        elseif method == JSONRPC_METHOD_NOTIFICATIONS_PROMPTS_LIST_CHANGED
+            listener.prompts
+        elseif method == JSONRPC_METHOD_NOTIFICATIONS_RESOURCES_LIST_CHANGED
+            listener.resources
+        elseif method == JSONRPC_METHOD_NOTIFICATIONS_RESOURCES_UPDATED
+            uri = get(params, "uri", nothing)
+            uri isa AbstractString && String(uri) in listener.resource_uris
+        else
+            false
+        end
+        wants && push_listener_notification!(listener, method, params)
+    end
+    return nothing
+end
+
+"Gracefully end all active subscriptions/listen streams (each sends its closing response before the stream ends)."
+function close_subscription_listeners!(server::MCPServer)
+    listeners = @lock server.listeners_lock copy(server.listeners)
+    for listener in listeners
+        close(listener.channel)
+    end
+    return nothing
+end
+
+function handle_subscriptions_listen(server::MCPServer, context::MCPRequestContext, params::Dict{String,Any}, protocol_version::String)
+    filter = get(params, "notifications", nothing)
+    filter_dict = filter isa AbstractDict ? to_json_dict(filter) : Dict{String,Any}()
+    tools = get(filter_dict, "toolsListChanged", false) === true
+    prompts = get(filter_dict, "promptsListChanged", false) === true
+    resources = get(filter_dict, "resourcesListChanged", false) === true
+    uris = Set{String}(collect_strings(get(filter_dict, "resourceSubscriptions", nothing)))
+    listener = MCPSubscriptionListener(context.id, tools, prompts, resources, uris, Channel{Dict{String,Any}}(64))
+    register_listener!(server, listener)
+    acknowledged = Dict{String,Any}()
+    tools && (acknowledged["toolsListChanged"] = true)
+    prompts && (acknowledged["promptsListChanged"] = true)
+    resources && (acknowledged["resourcesListChanged"] = true)
+    isempty(uris) || (acknowledged["resourceSubscriptions"] = sort!(collect(uris)))
+    ack = Dict{String,Any}(
+        "jsonrpc" => JSONRPC_VERSION,
+        "method" => JSONRPC_METHOD_NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED,
+        "params" => Dict{String,Any}(
+            "_meta" => Dict{String,Any}(META_SUBSCRIPTION_ID => listener.id),
+            "notifications" => acknowledged,
+        ),
+    )
+    closing = Dict{String,Any}(
+        "jsonrpc" => JSONRPC_VERSION,
+        "id" => listener.id,
+        "result" => Dict{String,Any}(
+            "resultType" => "complete",
+            "_meta" => Dict{String,Any}(META_SUBSCRIPTION_ID => listener.id),
+        ),
+    )
+    headers = response_headers(server; content_type=nothing, protocol_version=protocol_version, extra=HeaderPair["X-Accel-Buffering" => "no"])
+    return build_sse_response(headers) do stream
+        try
+            write(stream, HTTP.SSEEvent(JSON.json(ack)))
+            for envelope in listener.channel
+                write(stream, HTTP.SSEEvent(JSON.json(envelope)))
+            end
+            # channel closed by the server: signal graceful closure
+            write(stream, HTTP.SSEEvent(JSON.json(closing)))
+        finally
+            unregister_listener!(server, listener)
+        end
+    end
+end
+
+# Methods removed from the core protocol in 2026-07-28; stateless requests
+# declaring a modern version get 404 + method-not-found for them.
+const LEGACY_ONLY_METHODS = (
+    JSONRPC_METHOD_INITIALIZE,
+    JSONRPC_METHOD_NOTIFICATIONS_INITIALIZED,
+    JSONRPC_METHOD_PING,
+    JSONRPC_METHOD_LOGGING_SET_LEVEL,
+    JSONRPC_METHOD_RESOURCES_SUBSCRIBE,
+    JSONRPC_METHOD_RESOURCES_UNSUBSCRIBE,
+)
+
+function dispatch_modern_jsonrpc(server::MCPServer, context::MCPRequestContext, params::Dict{String,Any})
+    method = context.method
+    if method == JSONRPC_METHOD_SERVER_DISCOVER
+        return discover_result(server)
+    elseif method == JSONRPC_METHOD_TOOLS_LIST
+        return list_tools(server, params)
+    elseif method == JSONRPC_METHOD_TOOLS_CALL
+        return call_tool(server, context, params)
+    elseif method == JSONRPC_METHOD_PROMPTS_LIST
+        return list_prompts(server, params)
+    elseif method == JSONRPC_METHOD_PROMPTS_GET
+        result = get_prompt(server, context, params)
+        return result isa MCPInputRequired ? input_required_result(result) : result
+    elseif method == JSONRPC_METHOD_RESOURCES_LIST
+        return list_resources(server, params)
+    elseif method == JSONRPC_METHOD_RESOURCES_READ
+        result = read_resource(server, context, params)
+        return result isa MCPInputRequired ? input_required_result(result) : result
+    elseif method == JSONRPC_METHOD_RESOURCES_TEMPLATES_LIST
+        return list_resource_templates(server, params)
+    elseif method == JSONRPC_METHOD_COMPLETION_COMPLETE
+        return handle_completion_request(server, context, params)
+    elseif method == JSONRPC_METHOD_NOTIFICATIONS_CANCELLED
+        handle_cancellation_notification(server, context, params)
+        return nothing
+    else
+        throw(mcp_error(:method_not_found, "Unsupported MCP method $(method)"))
+    end
+end
+
+function handle_modern_request(server::MCPServer, req::HTTP.Request, method::String, id, params::Dict{String,Any}, meta::Dict{String,Any}, protocol_version::String, timeout_ms)
+    if id !== nothing
+        header_error = validate_modern_headers(server, req, method, params, id)
+        header_error !== nothing && return header_error
+    end
+    if method in LEGACY_ONLY_METHODS
+        response = jsonrpc_error(server, nothing, id, -32601, "Method $(method) was removed in MCP $(PROTOCOL_VERSION_2026_07_28); see the migration guide"; status=404)
+        return response
+    end
+    log_level = begin
+        raw = get(meta, META_LOG_LEVEL, nothing)
+        raw isa AbstractString ? try
+            normalize_log_level(raw)
+        catch
+            nothing
+        end : nothing
+    end
+    if method == JSONRPC_METHOD_SUBSCRIPTIONS_LISTEN
+        context = MCPRequestContext(server, req, method, id, params, nothing, timeout_ms, protocol_version, log_level, nothing)
+        return handle_subscriptions_listen(server, context, params, protocol_version)
+    end
+    # Handlers run on the request task (task-local auth contexts survive);
+    # notifications they emit are buffered and, if any, delivered as an SSE
+    # response stream ahead of the final response.
+    notifications = Dict{String,Any}[]
+    notifier = envelope -> push!(notifications, envelope)
+    context = MCPRequestContext(server, req, method, id, params, nothing, timeout_ms, protocol_version, log_level, notifier)
+    if id === nothing
+        try
+            dispatch_modern_jsonrpc(server, context, params)
+        catch err
+            @warn "Error handling JSON-RPC notification" method err
+        end
+        return HTTP.Response(202, response_headers(server; content_type=nothing, protocol_version=protocol_version))
+    end
+    envelope = try
+        result = decorate_modern_result!(server, method, dispatch_modern_jsonrpc(server, context, params))
+        Dict{String,Any}("jsonrpc" => JSONRPC_VERSION, "id" => id, "result" => result === nothing ? Dict{String,Any}("resultType" => "complete") : result)
+    catch err
+        code, message = classify_error(err)
+        if code == -32002 && err isa MCPError && err.code == :resource_not_found
+            code = -32602  # 2026-07-28 aligns resource-not-found with JSON-RPC Invalid params
+        end
+        error_body = Dict{String,Any}("code" => code, "message" => message)
+        Dict{String,Any}("jsonrpc" => JSONRPC_VERSION, "id" => id, "error" => error_body)
+    end
+    if isempty(notifications)
+        status = haskey(envelope, "error") && envelope["error"]["code"] == -32601 ? 404 : 200
+        return HTTP.Response(status, response_headers(server; protocol_version=protocol_version), JSON.json(envelope))
+    end
+    headers = response_headers(server; content_type=nothing, protocol_version=protocol_version, extra=HeaderPair["X-Accel-Buffering" => "no"])
+    return build_sse_response(headers) do stream
+        for notification in notifications
+            write(stream, HTTP.SSEEvent(JSON.json(notification)))
+        end
+        write(stream, HTTP.SSEEvent(JSON.json(envelope)))
+    end
 end
 
 function dispatch_jsonrpc(server::MCPServer, context::MCPRequestContext, params::Dict{String,Any})
@@ -1438,6 +1827,36 @@ function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
         else
             rethrow(err)
         end
+    end
+    # Dual-era version resolution: modern (2026-07-28+) requests declare their
+    # version in params._meta and are served statelessly; anything else follows
+    # the legacy initialize/session flow.
+    meta = request_meta(params)
+    meta_version_raw = get(meta, META_PROTOCOL_VERSION, nothing)
+    meta_version = meta_version_raw isa AbstractString ? String(strip(meta_version_raw)) : nothing
+    header_version_raw = http_header_value(req.headers, "MCP-Protocol-Version")
+    header_version = header_version_raw === nothing ? "" : String(strip(String(header_version_raw)))
+    if meta_version !== nothing && !isempty(header_version) && meta_version != header_version
+        return jsonrpc_error(server, nothing, id, -32020, "Header mismatch: MCP-Protocol-Version header '$(header_version)' does not match _meta protocolVersion '$(meta_version)'"; status=400)
+    end
+    effective_version = if meta_version !== nothing
+        meta_version
+    elseif !isempty(header_version)
+        header_version
+    else
+        version, missing_error = resolve_protocol_version(server, req, "JSON-RPC request")
+        missing_error !== nothing && return missing_error
+        version
+    end
+    if !server_supports_version(server, effective_version)
+        return jsonrpc_error(
+            server, nothing, id, -32022, "Unsupported protocol version";
+            data=Dict("supported" => supported_versions(server), "requested" => effective_version),
+            status=400,
+        )
+    end
+    if is_modern_protocol_version(effective_version)
+        return handle_modern_request(server, req, method, id, params, meta, effective_version, timeout_ms)
     end
     session = try
         ensure_session_for_request(server, req, method)

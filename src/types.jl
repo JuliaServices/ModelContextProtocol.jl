@@ -2,6 +2,17 @@ const JSONDict = Dict{String,Any}
 const HeaderPair = Pair{String,String}
 
 const DEFAULT_PROTOCOL_VERSION = "2025-11-25"
+const PROTOCOL_VERSION_2026_07_28 = "2026-07-28"
+
+# Protocol versions are ISO dates, so lexicographic comparison is chronological.
+is_modern_protocol_version(version::AbstractString) = String(version) >= PROTOCOL_VERSION_2026_07_28
+
+const META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
+const META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo"
+const META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities"
+const META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
+const META_LOG_LEVEL = "io.modelcontextprotocol/logLevel"
+const META_SUBSCRIPTION_ID = "io.modelcontextprotocol/subscriptionId"
 const DEFAULT_MANIFEST_PATHS = (
     "/.well-known/ai-plugin.json",
     "/.well-known/mcp.json",
@@ -40,8 +51,10 @@ Base.@kwdef struct MCPServerConfig
     instructions::Union{String,Nothing}=nothing
     instructions_url::Union{String,Nothing}=nothing
     protocol_version::String=DEFAULT_PROTOCOL_VERSION
-    supported_protocol_versions::Vector{String}=String[]
+    supported_protocol_versions::Vector{String}=String[PROTOCOL_VERSION_2026_07_28]
     missing_protocol_header::Symbol=:error
+    cache_ttl_ms::Int=60_000
+    cache_scope::String="private"
     allowed_origins::Union{Nothing,Vector{String}}=nothing
     transport_path::String="/v1/mcp"
     manifest_paths::Vector{String}=String[DEFAULT_MANIFEST_PATHS...]
@@ -83,6 +96,13 @@ Base.@kwdef struct MCPTextContent
     text::String
     annotations::Dict{String,Any}=Dict{String,Any}()
     meta::Dict{String,Any}=Dict{String,Any}()
+end
+
+# MRTR (2026-07-28): handlers return this to request additional client input;
+# the client retries the original request with inputResponses/requestState.
+Base.@kwdef struct MCPInputRequired
+    input_requests::Dict{String,Any}=Dict{String,Any}()
+    request_state::Union{String,Nothing}=nothing
 end
 
 Base.@kwdef struct MCPToolResult
@@ -169,6 +189,8 @@ mutable struct MCPClient
     headers::HTTP.Headers
     timeout::NamedTuple
     verbose::Bool
+    capabilities::Dict{String,Any}
+    client_info::Dict{String,Any}
     auth_token::Union{String,Nothing}
     session::Union{JSONDict,Nothing}
     session_id::Union{String,Nothing}
@@ -178,6 +200,17 @@ mutable struct MCPClient
     request_handlers::Dict{String,Function}
     event_task::Union{Task,Nothing}
     last_event_id::Union{String,Nothing}
+end
+
+# A live subscriptions/listen stream (2026-07-28): notifications matching the
+# opted-in filter are pushed onto the channel by the server broadcast helpers.
+struct MCPSubscriptionListener
+    id::Any
+    tools::Bool
+    prompts::Bool
+    resources::Bool
+    resource_uris::Set{String}
+    channel::Channel{Dict{String,Any}}
 end
 
 mutable struct MCPServer
@@ -197,4 +230,6 @@ mutable struct MCPServer
     logging_level::String
     missing_protocol_header_behavior::Symbol
     completion_handler::Union{Function,Nothing}
+    listeners::Vector{MCPSubscriptionListener}
+    listeners_lock::ReentrantLock
 end
