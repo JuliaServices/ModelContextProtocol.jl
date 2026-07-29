@@ -1160,7 +1160,9 @@ function call_tool(server::MCPServer, context::MCPRequestContext, params::Dict{S
     tool = get(server.tools, name, nothing)
     tool === nothing && throw(mcp_error(:invalid_params, "Tool $(name) is not registered"))
     args = arguments_dict(params)
-    result = tool.handler(context, args)
+    # invokelatest: handlers may be registered after the HTTP server started
+    # serving, and connection tasks would otherwise run in an older world age
+    result = Base.invokelatest(tool.handler, context, args)
     result isa MCPInputRequired && return input_required_result(result)
     normalized = normalize_tool_result(result)
     if tool.output_schema !== nothing && !haskey(normalized, "structuredContent")
@@ -1186,7 +1188,7 @@ function handle_logging_set_level(server::MCPServer, context::MCPRequestContext,
     haskey(params, "level") || throw(mcp_error(:invalid_params, "logging/setLevel requires a level"))
     level = normalize_log_level(params["level"])
     try
-        server.logging_handler !== nothing && server.logging_handler(context, level)
+        server.logging_handler !== nothing && Base.invokelatest(server.logging_handler, context, level)
     catch err
         @warn "logging handler raised" err
     end
@@ -1196,7 +1198,7 @@ end
 
 function handle_completion_request(server::MCPServer, context::MCPRequestContext, params::Dict{String,Any})
     server.completion_handler === nothing && throw(mcp_error(:method_not_found, "completion support not configured"))
-    result = server.completion_handler(context, params)
+    result = Base.invokelatest(server.completion_handler, context, params)
     result isa AbstractDict || throw(mcp_error(:invalid_response, "Completion handler must return a dictionary"))
     return result
 end
@@ -1219,7 +1221,7 @@ function get_prompt(server::MCPServer, context::MCPRequestContext, params::Dict{
     prompt = get(server.prompts, name, nothing)
     prompt === nothing && throw(mcp_error(:invalid_params, "Prompt $(name) is not registered"))
     args = arguments_dict(params)
-    return prompt.handler(context, args)
+    return Base.invokelatest(prompt.handler, context, args)
 end
 
 function list_resources(server::MCPServer, params::Dict{String,Any})
@@ -1238,7 +1240,7 @@ function read_resource(server::MCPServer, context::MCPRequestContext, params::Di
     resource = get(server.resources, uri, nothing)
     resource === nothing && throw(mcp_error(:resource_not_found, "Resource $(uri) is not registered"))
     args = arguments_dict(params)
-    return resource.handler(context, args)
+    return Base.invokelatest(resource.handler, context, args)
 end
 
 function subscribe_resource(server::MCPServer, context::MCPRequestContext, params::Dict{String,Any})
@@ -1293,7 +1295,7 @@ end
 function handle_cancellation_notification(server::MCPServer, context::MCPRequestContext, params::Dict{String,Any})
     server.cancellation_handler === nothing && return nothing
     try
-        server.cancellation_handler(context, params)
+        Base.invokelatest(server.cancellation_handler, context, params)
     catch err
         @warn "Error in cancellation handler" session=context.session === nothing ? "none" : context.session.id err
     end
@@ -1776,7 +1778,7 @@ function classify_error(err)
 end
 
 function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
-    server.request_hook !== nothing && server.request_hook(req)
+    server.request_hook !== nothing && Base.invokelatest(server.request_hook, req)
     body = read_request_body(req)
     header_error = validate_jsonrpc_headers(server, req)
     header_error !== nothing && return header_error

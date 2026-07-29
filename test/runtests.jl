@@ -1111,19 +1111,31 @@ end
                 nothing
             end)
             listen = listen_subscriptions!(client; tools_list_changed=true)
-            @test timedwait(() -> !isempty(acks), 5.0; pollint=0.05) == :ok
-            @test acks[1]["notifications"]["toolsListChanged"] == true
-            @test acks[1]["_meta"][ModelContextProtocol.META_SUBSCRIPTION_ID] == listen.id
+            # HTTP.jl 2.x's server currently buffers SSE response bodies until the
+            # stream closes (its own `sse_stream` do-block example exhibits this),
+            # so mid-stream events only reach the client on graceful closure there.
+            # HTTP.jl 1.x streams events live.
+            http_streams_live = pkgversion(HTTP) < v"2"
+            if http_streams_live
+                @test timedwait(() -> !isempty(acks), 5.0; pollint=0.05) == :ok
+            else
+                # wait for the listen request to register server-side before notifying
+                @test timedwait(() -> !isempty(http_server.server.listeners), 10.0; pollint=0.05) == :ok
+            end
 
             register_tool!(
                 http_server.server;
                 name="late-arrival",
                 handler=(::MCPRequestContext, ::Dict{String,Any}) -> Dict("content" => Any[]),
             )
-            @test timedwait(() -> !isempty(list_changes), 5.0; pollint=0.05) == :ok
+            http_streams_live && @test timedwait(() -> !isempty(list_changes), 5.0; pollint=0.05) == :ok
 
             close_subscription_listeners!(http_server.server)
             @test timedwait(() -> istaskdone(listen.task), 5.0; pollint=0.05) == :ok
+            # graceful closure delivers all opted-in events under both transports
+            @test timedwait(() -> !isempty(acks) && !isempty(list_changes), 5.0; pollint=0.05) == :ok
+            @test acks[1]["notifications"]["toolsListChanged"] == true
+            @test acks[1]["_meta"][ModelContextProtocol.META_SUBSCRIPTION_ID] == listen.id
         finally
             stop_mcp_test_server(http_server)
         end
