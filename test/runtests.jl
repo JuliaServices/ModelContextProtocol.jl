@@ -464,6 +464,31 @@ end
         payload = JSON.parse(String(response.body))
         @test payload["error"]["code"] == -32002
         @test occursin("not initialized", payload["error"]["message"])
+
+        stale_session_id = client.session_id
+        ModelContextProtocol.delete_session!(http_server.server, stale_session_id)
+        stale_body = JSON.json(Dict(
+            "jsonrpc" => "2.0",
+            "id" => "stale-resource",
+            "method" => "resources/read",
+            "params" => Dict("uri" => "memory://example"),
+        ))
+        stale_response = HTTP.request(
+            "POST",
+            client.transport.url;
+            headers=[
+                "Content-Type" => "application/json",
+                "Accept" => "application/json, text/event-stream",
+                "MCP-Protocol-Version" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
+                "MCP-Session-Id" => stale_session_id,
+            ],
+            body=stale_body,
+            status_exception=false,
+        )
+        @test stale_response.status == 404
+        stale_payload = JSON.parse(String(stale_response.body))
+        @test stale_payload["error"]["code"] == -32001
+        @test occursin("Unknown MCP session", stale_payload["error"]["message"])
     finally
         stop_mcp_test_server(http_server)
     end
