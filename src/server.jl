@@ -981,7 +981,15 @@ function jsonrpc_success(server::MCPServer, session::Union{MCPSession,Nothing}, 
     return HTTP.Response(200, response_headers(server; session=session), JSON.json(body))
 end
 
-function jsonrpc_error(server::MCPServer, session::Union{MCPSession,Nothing}, id, code::Int, message::AbstractString; data=nothing)
+function jsonrpc_error(
+    server::MCPServer,
+    session::Union{MCPSession,Nothing},
+    id,
+    code::Int,
+    message::AbstractString;
+    data=nothing,
+    status::Int=200,
+)
     error = Dict("code" => code, "message" => String(message))
     data === nothing || (error["data"] = data)
     body = Dict(
@@ -989,7 +997,7 @@ function jsonrpc_error(server::MCPServer, session::Union{MCPSession,Nothing}, id
         "id" => id,
         "error" => error,
     )
-    return HTTP.Response(200, response_headers(server; session=session), JSON.json(body))
+    return HTTP.Response(status, response_headers(server; session=session), JSON.json(body))
 end
 
 function params_dict(params)
@@ -1401,7 +1409,8 @@ function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
         catch err
             if err isa MCPError
                 code, message = classify_error(err)
-                response = jsonrpc_error(server, nothing, nothing, code, message)
+                status = err.code == :invalid_session ? 404 : 200
+                response = jsonrpc_error(server, nothing, nothing, code, message; status)
                 return response
             else
                 rethrow(err)
@@ -1440,7 +1449,8 @@ function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
     catch err
         if err isa MCPError
             code, message = classify_error(err)
-            response = jsonrpc_error(server, nothing, id, code, message)
+            status = err.code == :invalid_session ? 404 : 200
+            response = jsonrpc_error(server, nothing, id, code, message; status)
             return response
         else
             rethrow(err)
