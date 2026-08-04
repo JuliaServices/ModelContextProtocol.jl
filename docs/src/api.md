@@ -40,6 +40,7 @@ for the full guide.
 - `MCPUIResource`
 - `ui_extension_capability`
 - `add_ui_extension_capability!`
+- `ModelContextProtocol.supports_mcp_apps_ui`
 - `ui_tool_meta`
 - `ui_resource_meta`
 - `ui_resource_contents`

@@ -152,6 +152,13 @@ The `initialize` response must contain:
 merges it into capabilities you already have. Hosts check this **before** looking
 at any resource or tool metadata — it is the master switch.
 
+Clients advertise the same extension shape in their `initialize` request. In a
+tool handler, call `ModelContextProtocol.supports_mcp_apps_ui(context)` when
+adapting presentation-aware output. It returns `true` only when both the server
+and client advertise the exact requested MIME type. This does not guarantee that
+the host will render the app, so always return a meaningful text fallback.
+Missing or malformed client capabilities return `false`.
+
 ### 4.3 The `ui://` resource (requirement 3)
 
 ```julia
