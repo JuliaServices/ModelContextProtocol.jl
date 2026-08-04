@@ -1,6 +1,6 @@
 # JuliaC --trim=safe workload for ModelContextProtocol's statically dispatchable
 # server: the StaticMCPServer tools transport (session lifecycle, protocol
-# header validation, JSON-RPC parsing via typed StructUtils DTOs, tool dispatch,
+# header validation, strict JSON-RPC scanning, tool dispatch,
 # and raw-JSON result serialization) exercised over in-memory HTTP requests. The
 # dynamic MCPServer (Dict{String,Any}-based dispatch) and live HTTP serving are
 # deliberately not part of this workload: released HTTP 1.x socket/TLS init is
@@ -62,7 +62,7 @@ function run_mcp_trim_sample()::Nothing
 
     init = ModelContextProtocol.handle_static_jsonrpc_request(
         server,
-        _request("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{}}}"),
+        _request("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"trim-test\",\"version\":\"0.1.0\"}}}"),
     )
     _trim_assert(init.status == 200, "initialize status")
     session_id = HTTP.header(init, "MCP-Session-Id", "")

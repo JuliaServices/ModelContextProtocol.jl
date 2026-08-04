@@ -134,6 +134,15 @@ function jsonrpc_http_request(method::String; id="1", params=Dict{String,Any}(),
     return HTTP.Request("POST", "/v1/mcp", headers, codeunits(JSON.json(body)))
 end
 
+function static_raw_request(body::AbstractString; session_id=nothing)
+    headers = [
+        "Content-Type" => "application/json",
+        "MCP-Protocol-Version" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
+    ]
+    session_id !== nothing && push!(headers, "MCP-Session-Id" => session_id)
+    return HTTP.Request("POST", "/v1/mcp", headers, Vector{UInt8}(codeunits(body)))
+end
+
 Base.@kwdef struct StaticEchoArgs
     message::String=""
 end
@@ -145,6 +154,13 @@ function (::StaticEchoHandler)(
     arguments::JSON.JSONText,
 )
     parsed = JSON.parse(arguments.value, StaticEchoArgs)
+    parsed.message == "argument-error" && throw(ArgumentError("invalid message"))
+    parsed.message == "internal-error" && error("unexpected failure")
+    parsed.message == "invalid-result" && return ModelContextProtocol.StaticMCPToolResult(
+        text="invalid",
+        structured_content=JSON.JSONText("[]"),
+    )
+    parsed.message == "plain" && return ModelContextProtocol.StaticMCPToolResult(text="plain")
     return ModelContextProtocol.StaticMCPToolResult(
         text=parsed.message,
         structured_content=JSON.JSONText(JSON.json((; echoed=parsed.message))),
@@ -193,6 +209,22 @@ end
     @test initialize_payload["result"]["serverInfo"]["name"] == "Static Test"
     @test initialize_payload["result"]["capabilities"]["tools"]["listChanged"] == false
 
+    initialize_notification = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request("{\"jsonrpc\":\"2.0\",\"method\":\"initialize\"}"),
+    )
+    @test initialize_notification.status == 202
+    @test length(server.sessions) == 1
+
+    invalid_initialize = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{}}}",
+        ),
+    )
+    @test JSON.parse(String(invalid_initialize.body))["error"]["code"] == -32602
+    @test length(server.sessions) == 1
+
     before_initialized = ModelContextProtocol.handle_static_jsonrpc_request(
         server,
         jsonrpc_http_request("tools/list"; session_id),
@@ -227,6 +259,15 @@ end
     @test called_payload["result"]["structuredContent"] == Dict("echoed" => "hello\n\"world\"")
     @test called_payload["result"]["content"][1]["text"] == "hello\n\"world\""
 
+    numeric_id = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request(
+            "{\"jsonrpc\":\"2.0\",\"id\":1.25e2,\"method\":\"ping\"}";
+            session_id,
+        ),
+    )
+    @test JSON.parse(String(numeric_id.body))["id"] == 125.0
+
     unknown = ModelContextProtocol.handle_static_jsonrpc_request(
         server,
         jsonrpc_http_request(
@@ -236,6 +277,80 @@ end
         ),
     )
     @test JSON.parse(String(unknown.body))["error"]["code"] == -32602
+
+    for body in (
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\\q\"}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1e,\"method\":\"ping\"}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\u0001\"}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"} trailing",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"\\uD800\"}",
+    )
+        invalid = ModelContextProtocol.handle_static_jsonrpc_request(
+            server,
+            static_raw_request(body; session_id),
+        )
+        @test invalid.status == 400
+        @test JSON.parse(String(invalid.body))["error"]["code"] == -32700
+    end
+
+    invalid_arguments = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request(
+            "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":[]}}";
+            session_id,
+        ),
+    )
+    @test JSON.parse(String(invalid_arguments.body))["error"]["code"] == -32602
+
+    for (message, expected_code) in (("argument-error", -32602), ("internal-error", -32603))
+        failed = ModelContextProtocol.handle_static_jsonrpc_request(
+            server,
+            jsonrpc_http_request(
+                "tools/call";
+                session_id,
+                params=Dict("name" => "echo", "arguments" => Dict("message" => message)),
+            ),
+        )
+        @test JSON.parse(String(failed.body))["error"]["code"] == expected_code
+    end
+
+    invalid_result = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        jsonrpc_http_request(
+            "tools/call";
+            session_id,
+            params=Dict("name" => "echo", "arguments" => Dict("message" => "invalid-result")),
+        ),
+    )
+    @test JSON.parse(String(invalid_result.body))["error"]["code"] == -32603
+
+    plain_result = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        jsonrpc_http_request(
+            "tools/call";
+            session_id,
+            params=Dict("name" => "echo", "arguments" => Dict("message" => "plain")),
+        ),
+    )
+    @test !haskey(JSON.parse(String(plain_result.body))["result"], "structuredContent")
+
+    call_notification = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"missing\"}}";
+            session_id,
+        ),
+    )
+    @test call_notification.status == 202
+
+    known_call_notification = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"message\":\"internal-error\"}}}";
+            session_id,
+        ),
+    )
+    @test known_call_notification.status == 202
 
     stream = ModelContextProtocol.handle_static_stream_request(
         server,

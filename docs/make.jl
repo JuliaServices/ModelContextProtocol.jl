@@ -19,6 +19,7 @@ makedocs(
     pages=[
         "Home" => "index.md",
         "Auth0 Federation Example" => "auth0.md",
+        "Trim-safe static server" => "static-server.md",
         "API" => "api.md",
     ],
     pagesonly=true,
