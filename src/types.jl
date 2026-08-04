@@ -72,6 +72,26 @@ Base.@kwdef mutable struct MCPSession
     event_sequence::Int=0
     pending_events::Vector{MCPEvent}=MCPEvent[]
     subscriptions::Set{String}=Set{String}()
+    client_info::Dict{String,Any}=Dict{String,Any}()
+    client_capabilities::Dict{String,Any}=Dict{String,Any}()
+end
+
+function MCPSession(
+    id::String,
+    initialized::Bool,
+    event_sequence::Int,
+    pending_events::Vector{MCPEvent},
+    subscriptions::Set{String},
+)
+    return MCPSession(
+        id,
+        initialized,
+        event_sequence,
+        pending_events,
+        subscriptions,
+        Dict{String,Any}(),
+        Dict{String,Any}(),
+    )
 end
 
 Base.@kwdef mutable struct InMemorySessionStore <: MCPSessionStore

@@ -57,6 +57,12 @@ http_server = serve_mcp_http(server; host="127.0.0.1", port=3010)
 wait(http_server.http)
 ```
 
+The package also provides a specialized, tools-only server with a concrete
+request graph for JuliaC `--trim=safe` builds. Its API is namespaced and is not
+exported. See the
+[trim-safe static server guide](https://juliaservices.github.io/ModelContextProtocol.jl/stable/static-server/)
+for the example and support limits.
+
 ## Minimal Client
 
 ```julia

@@ -28,6 +28,20 @@
 - `broadcast_server_event!`
 - `notify_resource_updated!`
 
+## Trim-safe Static Server
+
+These specialized names are not exported. Use them through the
+`ModelContextProtocol` namespace. See the [static server guide](static-server.md)
+for a complete example and the support limits.
+
+- `ModelContextProtocol.StaticMCPServer`
+- `ModelContextProtocol.StaticMCPTool`
+- `ModelContextProtocol.StaticMCPToolResult`
+- `ModelContextProtocol.StaticMCPRequestContext`
+- `ModelContextProtocol.handle_static_jsonrpc_request`
+- `ModelContextProtocol.handle_static_stream_request`
+- `ModelContextProtocol.handle_static_session_delete`
+
 ## MCP Apps (SEP-1865)
 
 Helpers for serving interactive HTML widgets that hosts render inline. See
@@ -40,6 +54,7 @@ for the full guide.
 - `MCPUIResource`
 - `ui_extension_capability`
 - `add_ui_extension_capability!`
+- `ModelContextProtocol.supports_mcp_apps_ui`
 - `ui_tool_meta`
 - `ui_resource_meta`
 - `ui_resource_contents`

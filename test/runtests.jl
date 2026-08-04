@@ -134,6 +134,15 @@ function jsonrpc_http_request(method::String; id="1", params=Dict{String,Any}(),
     return HTTP.Request("POST", "/v1/mcp", headers, codeunits(JSON.json(body)))
 end
 
+function static_raw_request(body::AbstractString; session_id=nothing)
+    headers = [
+        "Content-Type" => "application/json",
+        "MCP-Protocol-Version" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
+    ]
+    session_id !== nothing && push!(headers, "MCP-Session-Id" => session_id)
+    return HTTP.Request("POST", "/v1/mcp", headers, Vector{UInt8}(codeunits(body)))
+end
+
 Base.@kwdef struct StaticEchoArgs
     message::String=""
 end
@@ -145,6 +154,13 @@ function (::StaticEchoHandler)(
     arguments::JSON.JSONText,
 )
     parsed = JSON.parse(arguments.value, StaticEchoArgs)
+    parsed.message == "argument-error" && throw(ArgumentError("invalid message"))
+    parsed.message == "internal-error" && error("unexpected failure")
+    parsed.message == "invalid-result" && return ModelContextProtocol.StaticMCPToolResult(
+        text="invalid",
+        structured_content=JSON.JSONText("[]"),
+    )
+    parsed.message == "plain" && return ModelContextProtocol.StaticMCPToolResult(text="plain")
     return ModelContextProtocol.StaticMCPToolResult(
         text=parsed.message,
         structured_content=JSON.JSONText(JSON.json((; echoed=parsed.message))),
@@ -193,6 +209,22 @@ end
     @test initialize_payload["result"]["serverInfo"]["name"] == "Static Test"
     @test initialize_payload["result"]["capabilities"]["tools"]["listChanged"] == false
 
+    initialize_notification = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request("{\"jsonrpc\":\"2.0\",\"method\":\"initialize\"}"),
+    )
+    @test initialize_notification.status == 202
+    @test length(server.sessions) == 1
+
+    invalid_initialize = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{}}}",
+        ),
+    )
+    @test JSON.parse(String(invalid_initialize.body))["error"]["code"] == -32602
+    @test length(server.sessions) == 1
+
     before_initialized = ModelContextProtocol.handle_static_jsonrpc_request(
         server,
         jsonrpc_http_request("tools/list"; session_id),
@@ -227,6 +259,15 @@ end
     @test called_payload["result"]["structuredContent"] == Dict("echoed" => "hello\n\"world\"")
     @test called_payload["result"]["content"][1]["text"] == "hello\n\"world\""
 
+    numeric_id = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request(
+            "{\"jsonrpc\":\"2.0\",\"id\":1.25e2,\"method\":\"ping\"}";
+            session_id,
+        ),
+    )
+    @test JSON.parse(String(numeric_id.body))["id"] == 125.0
+
     unknown = ModelContextProtocol.handle_static_jsonrpc_request(
         server,
         jsonrpc_http_request(
@@ -236,6 +277,80 @@ end
         ),
     )
     @test JSON.parse(String(unknown.body))["error"]["code"] == -32602
+
+    for body in (
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\\q\"}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1e,\"method\":\"ping\"}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\u0001\"}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"} trailing",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"\\uD800\"}",
+    )
+        invalid = ModelContextProtocol.handle_static_jsonrpc_request(
+            server,
+            static_raw_request(body; session_id),
+        )
+        @test invalid.status == 400
+        @test JSON.parse(String(invalid.body))["error"]["code"] == -32700
+    end
+
+    invalid_arguments = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request(
+            "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":[]}}";
+            session_id,
+        ),
+    )
+    @test JSON.parse(String(invalid_arguments.body))["error"]["code"] == -32602
+
+    for (message, expected_code) in (("argument-error", -32602), ("internal-error", -32603))
+        failed = ModelContextProtocol.handle_static_jsonrpc_request(
+            server,
+            jsonrpc_http_request(
+                "tools/call";
+                session_id,
+                params=Dict("name" => "echo", "arguments" => Dict("message" => message)),
+            ),
+        )
+        @test JSON.parse(String(failed.body))["error"]["code"] == expected_code
+    end
+
+    invalid_result = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        jsonrpc_http_request(
+            "tools/call";
+            session_id,
+            params=Dict("name" => "echo", "arguments" => Dict("message" => "invalid-result")),
+        ),
+    )
+    @test JSON.parse(String(invalid_result.body))["error"]["code"] == -32603
+
+    plain_result = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        jsonrpc_http_request(
+            "tools/call";
+            session_id,
+            params=Dict("name" => "echo", "arguments" => Dict("message" => "plain")),
+        ),
+    )
+    @test !haskey(JSON.parse(String(plain_result.body))["result"], "structuredContent")
+
+    call_notification = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"missing\"}}";
+            session_id,
+        ),
+    )
+    @test call_notification.status == 202
+
+    known_call_notification = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"message\":\"internal-error\"}}}";
+            session_id,
+        ),
+    )
+    @test known_call_notification.status == 202
 
     stream = ModelContextProtocol.handle_static_stream_request(
         server,
@@ -292,7 +407,9 @@ stop_auth_stub_server(server) = close(server)
             id="init",
             params=Dict(
                 "protocolVersion" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
-                "capabilities" => Dict{String,Any}(),
+                "capabilities" => Dict(
+                    "sampling" => Dict{String,Any}(),
+                ),
                 "clientInfo" => Dict("name" => "store-test", "version" => "0.1.0"),
             ),
         ),
@@ -310,6 +427,13 @@ stop_auth_stub_server(server) = close(server)
     session = ModelContextProtocol.find_session(shared_store, session_id)
     @test session !== nothing
     @test session.initialized
+    @test session.client_info == Dict(
+        "name" => "store-test",
+        "version" => "0.1.0",
+    )
+    @test session.client_capabilities == Dict(
+        "sampling" => Dict{String,Any}(),
+    )
 
     ping_response = ModelContextProtocol.handle_jsonrpc_request(
         server_a,
@@ -588,6 +712,31 @@ end
         payload = JSON.parse(String(response.body))
         @test payload["error"]["code"] == -32002
         @test occursin("not initialized", payload["error"]["message"])
+
+        stale_session_id = client.session_id
+        ModelContextProtocol.delete_session!(http_server.server, stale_session_id)
+        stale_body = JSON.json(Dict(
+            "jsonrpc" => "2.0",
+            "id" => "stale-resource",
+            "method" => "resources/read",
+            "params" => Dict("uri" => "memory://example"),
+        ))
+        stale_response = HTTP.request(
+            "POST",
+            client.transport.url;
+            headers=[
+                "Content-Type" => "application/json",
+                "Accept" => "application/json, text/event-stream",
+                "MCP-Protocol-Version" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
+                "MCP-Session-Id" => stale_session_id,
+            ],
+            body=stale_body,
+            status_exception=false,
+        )
+        @test stale_response.status == 404
+        stale_payload = JSON.parse(String(stale_response.body))
+        @test stale_payload["error"]["code"] == -32001
+        @test occursin("Unknown MCP session", stale_payload["error"]["message"])
     finally
         stop_mcp_test_server(http_server)
     end
@@ -647,6 +796,119 @@ end
         @test respond("1999-01-01") == ModelContextProtocol.DEFAULT_PROTOCOL_VERSION
         no_params = ModelContextProtocol.initialize_response(server, session, Dict{String,Any}())
         @test no_params["protocolVersion"] == ModelContextProtocol.DEFAULT_PROTOCOL_VERSION
+        @test isempty(session.client_info)
+        @test isempty(session.client_capabilities)
+        malformed_params = ModelContextProtocol.initialize_response(
+            server,
+            session,
+            Dict{String,Any}(
+                "clientInfo" => "not-an-object",
+                "capabilities" => ["not-an-object"],
+            ),
+        )
+        @test malformed_params["protocolVersion"] == ModelContextProtocol.DEFAULT_PROTOCOL_VERSION
+        @test isempty(session.client_info)
+        @test isempty(session.client_capabilities)
+    end
+
+    @testset "bilateral MCP Apps capability" begin
+        capabilities = ui_extension_capability()
+        server = MCPServer(name="apps", version="1.0.0", capabilities=capabilities)
+        positional_session = ModelContextProtocol.MCPSession(
+            "positional",
+            false,
+            0,
+            ModelContextProtocol.MCPEvent[],
+            Set{String}(),
+        )
+        @test isempty(positional_session.client_info)
+        @test isempty(positional_session.client_capabilities)
+        session = ModelContextProtocol.MCPSession(
+            id="apps-client",
+            client_info=Dict("name" => "apps-host", "version" => "1.0.0"),
+            client_capabilities=capabilities,
+        )
+        @test ModelContextProtocol.supports_mcp_apps_ui(server, session)
+        @test !ModelContextProtocol.supports_mcp_apps_ui(
+            server,
+            session;
+            mime_type="text/html",
+        )
+        @test !ModelContextProtocol.supports_mcp_apps_ui(server, nothing)
+
+        server_only = ModelContextProtocol.MCPSession(id="server-only")
+        @test !ModelContextProtocol.supports_mcp_apps_ui(server, server_only)
+        client_only_server = MCPServer(name="client-only", version="1.0.0")
+        @test !ModelContextProtocol.supports_mcp_apps_ui(client_only_server, session)
+
+        context = MCPRequestContext(
+            server,
+            HTTP.Request("POST", "/v1/mcp"),
+            "tools/call",
+            1,
+            Dict{String,Any}(),
+            session,
+            nothing,
+        )
+        @test ModelContextProtocol.supports_mcp_apps_ui(context)
+
+        initialize_params = Dict{String,Any}(
+            "clientInfo" => Dict("name" => "copy-test"),
+            "capabilities" => ui_extension_capability(),
+        )
+        copied_session = ModelContextProtocol.MCPSession(id="copy-test")
+        ModelContextProtocol.initialize_response(server, copied_session, initialize_params)
+        push!(
+            initialize_params["capabilities"]["extensions"][MCP_APPS_EXTENSION_ID]["mimeTypes"],
+            "text/html",
+        )
+        initialize_params["clientInfo"]["name"] = "mutated"
+        @test copied_session.client_info["name"] == "copy-test"
+        @test copied_session.client_capabilities["extensions"][MCP_APPS_EXTENSION_ID]["mimeTypes"] ==
+              [MCP_APP_HTML_MIME_TYPE]
+
+        for malformed in Any[
+            Dict("extensions" => true),
+            Dict("extensions" => Dict(MCP_APPS_EXTENSION_ID => true)),
+            Dict(
+                "extensions" => Dict(
+                    MCP_APPS_EXTENSION_ID => Dict("mimeTypes" => "text/html"),
+                ),
+            ),
+            Dict(
+                "extensions" => Dict(
+                    MCP_APPS_EXTENSION_ID => Dict("mimeTypes" => ["text/html"]),
+                ),
+            ),
+        ]
+            malformed_session = ModelContextProtocol.MCPSession(
+                id="malformed",
+                client_capabilities=malformed,
+            )
+            @test !ModelContextProtocol.supports_mcp_apps_ui(server, malformed_session)
+        end
+
+        restored = ModelContextProtocol.session_from_dict(
+            ModelContextProtocol.session_to_dict(session),
+        )
+        @test restored.client_info == session.client_info
+        @test restored.client_capabilities == session.client_capabilities
+        @test ModelContextProtocol.supports_mcp_apps_ui(server, restored)
+
+        legacy = ModelContextProtocol.session_from_dict(Dict("id" => "legacy"))
+        @test isempty(legacy.client_info)
+        @test isempty(legacy.client_capabilities)
+        @test !ModelContextProtocol.supports_mcp_apps_ui(server, legacy)
+
+        malformed_persisted = ModelContextProtocol.session_from_dict(
+            Dict(
+                "id" => "malformed-persisted",
+                "clientInfo" => "not-an-object",
+                "clientCapabilities" => Dict(nothing => true),
+            ),
+        )
+        @test isempty(malformed_persisted.client_info)
+        @test isempty(malformed_persisted.client_capabilities)
     end
 
     @testset "mcp_app_html shell" begin

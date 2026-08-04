@@ -256,7 +256,19 @@ function session_to_dict(session::MCPSession)
             ) for event in session.pending_events
         ],
         "subscriptions" => collect(session.subscriptions),
+        "clientInfo" => deepcopy(session.client_info),
+        "clientCapabilities" => deepcopy(session.client_capabilities),
     )
+end
+
+function session_metadata_dict(data::AbstractDict, camel_key::String, snake_key::String)
+    value = get(data, camel_key, get(data, snake_key, nothing))
+    try
+        return deepcopy(to_json_dict(value))
+    catch e
+        e isa MethodError || e isa ArgumentError || rethrow()
+        return Dict{String,Any}()
+    end
 end
 
 function session_from_dict(data::AbstractDict)
@@ -272,12 +284,16 @@ function session_from_dict(data::AbstractDict)
         ) for event in raw_events
     ]
     subscriptions = Set(String.(get(data, "subscriptions", String[])))
+    client_info = session_metadata_dict(data, "clientInfo", "client_info")
+    client_capabilities = session_metadata_dict(data, "clientCapabilities", "client_capabilities")
     return MCPSession(
         id=id,
         initialized=initialized,
         event_sequence=event_sequence,
         pending_events=events,
         subscriptions=subscriptions,
+        client_info=client_info,
+        client_capabilities=client_capabilities,
     )
 end
 
@@ -981,7 +997,15 @@ function jsonrpc_success(server::MCPServer, session::Union{MCPSession,Nothing}, 
     return HTTP.Response(200, response_headers(server; session=session), JSON.json(body))
 end
 
-function jsonrpc_error(server::MCPServer, session::Union{MCPSession,Nothing}, id, code::Int, message::AbstractString; data=nothing, status::Int=200)
+function jsonrpc_error(
+    server::MCPServer,
+    session::Union{MCPSession,Nothing},
+    id,
+    code::Int,
+    message::AbstractString;
+    data=nothing,
+    status::Int=200,
+)
     error = Dict("code" => code, "message" => String(message))
     data === nothing || (error["data"] = data)
     body = Dict(
@@ -1312,6 +1336,8 @@ function negotiate_protocol_version(server::MCPServer, requested)
 end
 
 function initialize_response(server::MCPServer, session::MCPSession, params::Dict{String,Any})
+    session.client_info = session_metadata_dict(params, "clientInfo", "client_info")
+    session.client_capabilities = session_metadata_dict(params, "capabilities", "client_capabilities")
     result = Dict(
         "protocolVersion" => negotiate_protocol_version(server, get(params, "protocolVersion", nothing)),
         "capabilities" => manifest_capabilities(server),
@@ -1796,7 +1822,8 @@ function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
         catch err
             if err isa MCPError
                 code, message = classify_error(err)
-                response = jsonrpc_error(server, nothing, nothing, code, message)
+                status = err.code == :invalid_session ? 404 : 200
+                response = jsonrpc_error(server, nothing, nothing, code, message; status)
                 return response
             else
                 rethrow(err)
@@ -1865,7 +1892,8 @@ function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
     catch err
         if err isa MCPError
             code, message = classify_error(err)
-            response = jsonrpc_error(server, nothing, id, code, message)
+            status = err.code == :invalid_session ? 404 : 200
+            response = jsonrpc_error(server, nothing, id, code, message; status)
             return response
         else
             rethrow(err)
