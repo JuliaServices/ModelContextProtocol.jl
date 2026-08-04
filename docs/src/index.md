@@ -6,7 +6,11 @@ manifests, OAuth-protected resources, JSON-RPC request handling, tools, prompts,
 resources, completions, logging notifications, and lightweight client smoke
 tests.
 
-The package currently targets MCP protocol version `2025-11-25`.
+The package supports the stateful MCP `2025-11-25` protocol and the stateless
+MCP `2026-07-28` protocol over Streamable HTTP. Clients default to
+`2025-11-25` for compatibility. See [MCP 2026-07-28](protocol-2026.md) for
+modern client setup, capability checks, multi-round-trip results, custom
+headers, and subscriptions.
 
 For deployments that require a concrete request graph, see the
 [trim-safe static tools server](static-server.md). This API stays under the
@@ -96,6 +100,11 @@ initialize_client!(client)
 result = call_tool(client, "add"; arguments=Dict("numbers" => [1, 3, 4]))
 terminate_session!(client)
 ```
+
+For a stateless client, set
+`MCPClientConfig(protocol_version=ModelContextProtocol.PROTOCOL_VERSION_2026_07_28)`.
+The same `initialize_client!` call then performs `server/discover` instead of
+the legacy initialization handshake.
 
 ## OAuth
 

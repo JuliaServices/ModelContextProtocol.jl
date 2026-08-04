@@ -21,6 +21,10 @@ const JSONRPC_METHOD_NOTIFICATIONS_PROMPTS_LIST_CHANGED = "notifications/prompts
 const JSONRPC_METHOD_NOTIFICATIONS_RESOURCES_LIST_CHANGED = "notifications/resources/list_changed"
 const JSONRPC_METHOD_NOTIFICATIONS_RESOURCE_TEMPLATES_LIST_CHANGED = "notifications/resources/templates/list_changed"
 const JSONRPC_METHOD_NOTIFICATIONS_RESOURCES_UPDATED = "notifications/resources/updated"
+const JSONRPC_METHOD_SERVER_DISCOVER = "server/discover"
+const JSONRPC_METHOD_SUBSCRIPTIONS_LISTEN = "subscriptions/listen"
+const JSONRPC_METHOD_NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED = "notifications/subscriptions/acknowledged"
+const JSONRPC_METHOD_NOTIFICATIONS_PROGRESS = "notifications/progress"
 
 const JSONRPC_VERSION = "2.0"
 const JSONRPC_TIMEOUT = (connecttimeout=10, readtimeout=120)
@@ -70,18 +74,35 @@ function jsonrpc_call(
 )
     ensure_http_transport(client.transport)
     ensure_client_readiness(client, String(method), notification)
+    method_str = String(method)
     payload = Dict{String,Any}(
         "jsonrpc" => JSONRPC_VERSION,
-        "method" => String(method),
+        "method" => method_str,
     )
     normalized_params = normalize_params(params)
-    normalized_params === nothing || (payload["params"] = normalized_params)
+    if client_is_modern(client)
+        params_dict = normalized_params isa Dict{String,Any} ? normalized_params :
+            normalized_params === nothing ? Dict{String,Any}() : nothing
+        if params_dict !== nothing
+            payload["params"] = inject_modern_meta!(client, params_dict)
+            normalized_params = params_dict
+        elseif normalized_params !== nothing
+            payload["params"] = normalized_params
+        end
+    else
+        normalized_params === nothing || (payload["params"] = normalized_params)
+    end
     if !notification
         client.next_id[] += 1
         payload["id"] = string(client.next_id[])
     end
     body = JSON.json(payload)
     header_pairs = normalize_headers(headers)
+    if client_is_modern(client) && !notification
+        push!(header_pairs, normalize_pair("Mcp-Method", method_str))
+        name_value = normalized_params isa Dict{String,Any} ? mcp_name_body_value(method_str, normalized_params) : nothing
+        name_value === nothing || push!(header_pairs, normalize_pair("Mcp-Name", encode_mcp_name(name_value)))
+    end
     if timeout_ms !== nothing
         timeout_value = normalize_timeout_ms(timeout_ms)
         push!(header_pairs, normalize_pair("Mcp-Timeout-Ms", string(timeout_value)))
@@ -234,7 +255,27 @@ function ensure_http_transport(transport::MCPTransportDescriptor)
     transport.kind == :http || throw(mcp_error(:transport_unsupported, "Only HTTP transports are supported (got $(transport.kind))"))
 end
 
+# Every modern (2026-07-28+) request self-describes via _meta; there is no
+# initialize handshake, so readiness checks do not apply.
+function inject_modern_meta!(client::MCPClient, params::Dict{String,Any})
+    existing = get(params, "_meta", nothing)
+    meta = existing isa AbstractDict ? to_json_dict(existing) : Dict{String,Any}()
+    haskey(meta, META_PROTOCOL_VERSION) || (meta[META_PROTOCOL_VERSION] = client.protocol_version)
+    haskey(meta, META_CLIENT_CAPABILITIES) || (meta[META_CLIENT_CAPABILITIES] = client.capabilities)
+    if !haskey(meta, META_CLIENT_INFO) && !isempty(client.client_info)
+        meta[META_CLIENT_INFO] = client.client_info
+    end
+    params["_meta"] = meta
+    return params
+end
+
 function ensure_client_readiness(client::MCPClient, method::AbstractString, notification::Bool)
+    if client_is_modern(client)
+        method == JSONRPC_METHOD_NOTIFICATIONS_CANCELLED &&
+            throw(mcp_error(:unsupported_protocol_version, "Streamable HTTP cancellation in the 2026-07-28 protocol closes the response stream"))
+        method in LEGACY_ONLY_METHODS && throw(mcp_error(:unsupported_protocol_version, "$(method) is not part of the 2026-07-28 protocol"))
+        return
+    end
     if method == JSONRPC_METHOD_INITIALIZE
         return
     elseif method == JSONRPC_METHOD_NOTIFICATIONS_INITIALIZED

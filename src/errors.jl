@@ -11,6 +11,13 @@ struct MCPAuthenticationRequired <: Exception
     body::Union{String,Nothing}
 end
 
+struct MCPMissingRequiredClientCapability <: Exception
+    required::Dict{String,Any}
+end
+
+Base.showerror(io::IO, err::MCPMissingRequiredClientCapability) =
+    print(io, "Missing required client capabilities: ", join(sort!(collect(keys(err.required))), ", "))
+
 Base.showerror(io::IO, err::MCPAuthenticationRequired) = begin
     print(io, "MCPAuthenticationRequired(status=$(err.status))")
     isempty(err.challenges) || print(io, " challenges=$(err.challenges)")

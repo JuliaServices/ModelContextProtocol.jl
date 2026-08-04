@@ -97,3 +97,19 @@ for the full guide.
 - `start_event_listener!`
 - `stop_event_listener!`
 - `terminate_session!`
+
+## MCP 2026-07-28
+
+The modern low-level helpers stay under the package namespace to keep the
+export surface small. See the [MCP 2026-07-28 guide](protocol-2026.md).
+
+- `MCPInputRequired`
+- `ModelContextProtocol.PROTOCOL_VERSION_2026_07_28`
+- `ModelContextProtocol.discover_server_info!`
+- `ModelContextProtocol.is_input_required`
+- `ModelContextProtocol.input_responses`
+- `ModelContextProtocol.request_state`
+- `ModelContextProtocol.send_progress!`
+- `ModelContextProtocol.send_log!`
+- `ModelContextProtocol.listen_subscriptions!`
+- `ModelContextProtocol.close_subscription_listeners!`
