@@ -87,6 +87,40 @@ function add_ui_extension_capability!(capabilities::AbstractDict; mime_types::Ve
     return capabilities
 end
 
+function _advertises_mcp_apps_ui(capabilities, mime_type::String)
+    capabilities isa AbstractDict || return false
+    extensions = get(capabilities, "extensions", nothing)
+    extensions isa AbstractDict || return false
+    extension = get(extensions, MCP_APPS_EXTENSION_ID, nothing)
+    extension isa AbstractDict || return false
+    mime_types = get(extension, "mimeTypes", nothing)
+    return mime_type in collect_strings(mime_types)
+end
+
+"""
+    supports_mcp_apps_ui(server, session; mime_type=MCP_APP_HTML_MIME_TYPE) -> Bool
+    supports_mcp_apps_ui(context; mime_type=MCP_APP_HTML_MIME_TYPE) -> Bool
+
+Return whether the server and client both advertise the exact MCP Apps MIME type.
+"""
+function supports_mcp_apps_ui(
+    server::MCPServer,
+    session::Union{MCPSession,Nothing};
+    mime_type::AbstractString=MCP_APP_HTML_MIME_TYPE,
+)
+    session === nothing && return false
+    requested_mime_type = String(mime_type)
+    _advertises_mcp_apps_ui(manifest_capabilities(server), requested_mime_type) || return false
+    return _advertises_mcp_apps_ui(session.client_capabilities, requested_mime_type)
+end
+
+function supports_mcp_apps_ui(
+    context::MCPRequestContext;
+    mime_type::AbstractString=MCP_APP_HTML_MIME_TYPE,
+)
+    return supports_mcp_apps_ui(context.server, context.session; mime_type=mime_type)
+end
+
 """
     ui_tool_meta(resource_uri; visibility=["model", "app"], extra=nothing) -> Dict{String,Any}
 

@@ -176,7 +176,9 @@ stop_auth_stub_server(server) = close(server)
             id="init",
             params=Dict(
                 "protocolVersion" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
-                "capabilities" => Dict{String,Any}(),
+                "capabilities" => Dict(
+                    "sampling" => Dict{String,Any}(),
+                ),
                 "clientInfo" => Dict("name" => "store-test", "version" => "0.1.0"),
             ),
         ),
@@ -194,6 +196,13 @@ stop_auth_stub_server(server) = close(server)
     session = ModelContextProtocol.find_session(shared_store, session_id)
     @test session !== nothing
     @test session.initialized
+    @test session.client_info == Dict(
+        "name" => "store-test",
+        "version" => "0.1.0",
+    )
+    @test session.client_capabilities == Dict(
+        "sampling" => Dict{String,Any}(),
+    )
 
     ping_response = ModelContextProtocol.handle_jsonrpc_request(
         server_a,
@@ -556,6 +565,119 @@ end
         @test respond("1999-01-01") == ModelContextProtocol.DEFAULT_PROTOCOL_VERSION
         no_params = ModelContextProtocol.initialize_response(server, session, Dict{String,Any}())
         @test no_params["protocolVersion"] == ModelContextProtocol.DEFAULT_PROTOCOL_VERSION
+        @test isempty(session.client_info)
+        @test isempty(session.client_capabilities)
+        malformed_params = ModelContextProtocol.initialize_response(
+            server,
+            session,
+            Dict{String,Any}(
+                "clientInfo" => "not-an-object",
+                "capabilities" => ["not-an-object"],
+            ),
+        )
+        @test malformed_params["protocolVersion"] == ModelContextProtocol.DEFAULT_PROTOCOL_VERSION
+        @test isempty(session.client_info)
+        @test isempty(session.client_capabilities)
+    end
+
+    @testset "bilateral MCP Apps capability" begin
+        capabilities = ui_extension_capability()
+        server = MCPServer(name="apps", version="1.0.0", capabilities=capabilities)
+        positional_session = ModelContextProtocol.MCPSession(
+            "positional",
+            false,
+            0,
+            ModelContextProtocol.MCPEvent[],
+            Set{String}(),
+        )
+        @test isempty(positional_session.client_info)
+        @test isempty(positional_session.client_capabilities)
+        session = ModelContextProtocol.MCPSession(
+            id="apps-client",
+            client_info=Dict("name" => "apps-host", "version" => "1.0.0"),
+            client_capabilities=capabilities,
+        )
+        @test ModelContextProtocol.supports_mcp_apps_ui(server, session)
+        @test !ModelContextProtocol.supports_mcp_apps_ui(
+            server,
+            session;
+            mime_type="text/html",
+        )
+        @test !ModelContextProtocol.supports_mcp_apps_ui(server, nothing)
+
+        server_only = ModelContextProtocol.MCPSession(id="server-only")
+        @test !ModelContextProtocol.supports_mcp_apps_ui(server, server_only)
+        client_only_server = MCPServer(name="client-only", version="1.0.0")
+        @test !ModelContextProtocol.supports_mcp_apps_ui(client_only_server, session)
+
+        context = MCPRequestContext(
+            server,
+            HTTP.Request("POST", "/v1/mcp"),
+            "tools/call",
+            1,
+            Dict{String,Any}(),
+            session,
+            nothing,
+        )
+        @test ModelContextProtocol.supports_mcp_apps_ui(context)
+
+        initialize_params = Dict{String,Any}(
+            "clientInfo" => Dict("name" => "copy-test"),
+            "capabilities" => ui_extension_capability(),
+        )
+        copied_session = ModelContextProtocol.MCPSession(id="copy-test")
+        ModelContextProtocol.initialize_response(server, copied_session, initialize_params)
+        push!(
+            initialize_params["capabilities"]["extensions"][MCP_APPS_EXTENSION_ID]["mimeTypes"],
+            "text/html",
+        )
+        initialize_params["clientInfo"]["name"] = "mutated"
+        @test copied_session.client_info["name"] == "copy-test"
+        @test copied_session.client_capabilities["extensions"][MCP_APPS_EXTENSION_ID]["mimeTypes"] ==
+              [MCP_APP_HTML_MIME_TYPE]
+
+        for malformed in Any[
+            Dict("extensions" => true),
+            Dict("extensions" => Dict(MCP_APPS_EXTENSION_ID => true)),
+            Dict(
+                "extensions" => Dict(
+                    MCP_APPS_EXTENSION_ID => Dict("mimeTypes" => "text/html"),
+                ),
+            ),
+            Dict(
+                "extensions" => Dict(
+                    MCP_APPS_EXTENSION_ID => Dict("mimeTypes" => ["text/html"]),
+                ),
+            ),
+        ]
+            malformed_session = ModelContextProtocol.MCPSession(
+                id="malformed",
+                client_capabilities=malformed,
+            )
+            @test !ModelContextProtocol.supports_mcp_apps_ui(server, malformed_session)
+        end
+
+        restored = ModelContextProtocol.session_from_dict(
+            ModelContextProtocol.session_to_dict(session),
+        )
+        @test restored.client_info == session.client_info
+        @test restored.client_capabilities == session.client_capabilities
+        @test ModelContextProtocol.supports_mcp_apps_ui(server, restored)
+
+        legacy = ModelContextProtocol.session_from_dict(Dict("id" => "legacy"))
+        @test isempty(legacy.client_info)
+        @test isempty(legacy.client_capabilities)
+        @test !ModelContextProtocol.supports_mcp_apps_ui(server, legacy)
+
+        malformed_persisted = ModelContextProtocol.session_from_dict(
+            Dict(
+                "id" => "malformed-persisted",
+                "clientInfo" => "not-an-object",
+                "clientCapabilities" => Dict(nothing => true),
+            ),
+        )
+        @test isempty(malformed_persisted.client_info)
+        @test isempty(malformed_persisted.client_capabilities)
     end
 
     @testset "mcp_app_html shell" begin
