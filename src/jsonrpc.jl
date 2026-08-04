@@ -270,7 +270,12 @@ function inject_modern_meta!(client::MCPClient, params::Dict{String,Any})
 end
 
 function ensure_client_readiness(client::MCPClient, method::AbstractString, notification::Bool)
-    client_is_modern(client) && return
+    if client_is_modern(client)
+        method == JSONRPC_METHOD_NOTIFICATIONS_CANCELLED &&
+            throw(mcp_error(:unsupported_protocol_version, "Streamable HTTP cancellation in the 2026-07-28 protocol closes the response stream"))
+        method in LEGACY_ONLY_METHODS && throw(mcp_error(:unsupported_protocol_version, "$(method) is not part of the 2026-07-28 protocol"))
+        return
+    end
     if method == JSONRPC_METHOD_INITIALIZE
         return
     elseif method == JSONRPC_METHOD_NOTIFICATIONS_INITIALIZED

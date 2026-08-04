@@ -1139,7 +1139,7 @@ end
     end
 end
 
-function modern_http_request(method::String; id="1", params=Dict{String,Any}(), version=ModelContextProtocol.PROTOCOL_VERSION_2026_07_28, mcp_method=method, mcp_name=nothing, header_version=version, include_meta=true)
+function modern_http_request(method::String; id="1", params=Dict{String,Any}(), version=ModelContextProtocol.PROTOCOL_VERSION_2026_07_28, mcp_method=method, mcp_name=nothing, header_version=version, include_meta=true, extra_headers=Pair{String,String}[])
     body_params = Dict{String,Any}(params)
     if include_meta
         meta = get(body_params, "_meta", Dict{String,Any}())
@@ -1155,6 +1155,7 @@ function modern_http_request(method::String; id="1", params=Dict{String,Any}(), 
     header_version !== nothing && push!(headers, "MCP-Protocol-Version" => header_version)
     mcp_method !== nothing && push!(headers, "Mcp-Method" => mcp_method)
     mcp_name !== nothing && push!(headers, "Mcp-Name" => mcp_name)
+    append!(headers, extra_headers)
     body = Dict{String,Any}("jsonrpc" => "2.0", "method" => method, "params" => body_params)
     id !== nothing && (body["id"] = id)
     return HTTP.Request("POST", "/v1/mcp", headers, codeunits(JSON.json(body)))
@@ -1196,6 +1197,22 @@ end
         @test listed_payload["_meta"][ModelContextProtocol.META_SERVER_INFO]["version"] == "1.2.3"
         @test only(listed_payload["tools"])["name"] == "echo"
 
+        missing_meta = respond(modern_http_request("tools/list"; include_meta=false))
+        @test missing_meta.status == 400
+        @test JSON.parse(String(missing_meta.body))["error"]["code"] == -32602
+
+        missing_capabilities = respond(modern_http_request(
+            "tools/list";
+            params=Dict{String,Any}(
+                "_meta" => Dict(
+                    ModelContextProtocol.META_PROTOCOL_VERSION => ModelContextProtocol.PROTOCOL_VERSION_2026_07_28,
+                ),
+            ),
+            include_meta=false,
+        ))
+        @test missing_capabilities.status == 400
+        @test JSON.parse(String(missing_capabilities.body))["error"]["code"] == -32602
+
         called = respond(modern_http_request(
             "tools/call";
             params=Dict{String,Any}("name" => "echo", "arguments" => Dict("message" => "hi")),
@@ -1205,6 +1222,44 @@ end
         called_payload = JSON.parse(String(called.body))["result"]
         @test called_payload["resultType"] == "complete"
         @test called_payload["content"][1]["text"] == "hi"
+
+        protected_called = Ref(false)
+        register_tool!(
+            server;
+            name="sampling-tool",
+            required_client_capabilities=Dict(
+                "sampling" => Dict("tools" => Dict("enabled" => true)),
+            ),
+            handler=(::MCPRequestContext, ::Dict{String,Any}) -> begin
+                protected_called[] = true
+                Dict("content" => [Dict("type" => "text", "text" => "sampled")])
+            end,
+        )
+        rejected_capability = respond(modern_http_request(
+            "tools/call";
+            params=Dict{String,Any}("name" => "sampling-tool"),
+            mcp_name="sampling-tool",
+        ))
+        @test rejected_capability.status == 400
+        rejected_payload = JSON.parse(String(rejected_capability.body))
+        @test rejected_payload["error"]["code"] == -32021
+        @test haskey(rejected_payload["error"]["data"]["requiredCapabilities"], "sampling")
+        @test !protected_called[]
+
+        accepted_capability = respond(modern_http_request(
+            "tools/call";
+            params=Dict{String,Any}(
+                "name" => "sampling-tool",
+                "_meta" => Dict(
+                    ModelContextProtocol.META_CLIENT_CAPABILITIES => Dict(
+                        "sampling" => Dict("tools" => Dict("enabled" => true)),
+                    ),
+                ),
+            ),
+            mcp_name="sampling-tool",
+        ))
+        @test accepted_capability.status == 200
+        @test protected_called[]
 
         missing_method_header = respond(modern_http_request("tools/list"; mcp_method=nothing))
         @test missing_method_header.status == 400
@@ -1247,6 +1302,161 @@ end
             mcp_name=encoded_name,
         ))
         @test encoded.status == 200
+        @test_throws ArgumentError MCPServer(MCPServerConfig(name="bad-cache", version="1", cache_ttl_ms=-1))
+        @test_throws ArgumentError MCPServer(MCPServerConfig(name="bad-cache", version="1", cache_scope="shared"))
+    end
+
+    @testset "custom tool headers" begin
+        schema = Dict{String,Any}(
+            "type" => "object",
+            "properties" => Dict{String,Any}(
+                "region" => Dict("type" => "string", "x-mcp-header" => "Region"),
+                "priority" => Dict("type" => "integer", "x-mcp-header" => "Priority"),
+                "nested" => Dict(
+                    "type" => "object",
+                    "properties" => Dict(
+                        "enabled" => Dict("type" => "boolean", "x-mcp-header" => "Enabled"),
+                    ),
+                ),
+            ),
+        )
+        specs = ModelContextProtocol.mcp_header_specs(schema)
+        @test Set((s.name, Tuple(s.path), s.type) for s in specs) == Set([
+            ("Enabled", ("nested", "enabled"), "boolean"),
+            ("Priority", ("priority",), "integer"),
+            ("Region", ("region",), "string"),
+        ])
+
+        invalid_schemas = [
+            Dict("type" => "object", "properties" => Dict("x" => Dict("type" => "string", "x-mcp-header" => ""))),
+            Dict("type" => "object", "properties" => Dict("x" => Dict("type" => "number", "x-mcp-header" => "X"))),
+            Dict("type" => "object", "properties" => Dict(
+                "x" => Dict("type" => "string", "x-mcp-header" => "Same"),
+                "y" => Dict("type" => "string", "x-mcp-header" => "same"),
+            )),
+            Dict("type" => "object", "oneOf" => [Dict(
+                "properties" => Dict("x" => Dict("type" => "string", "x-mcp-header" => "X")),
+            )]),
+        ]
+        for invalid in invalid_schemas
+            @test_throws ArgumentError ModelContextProtocol.mcp_header_specs(invalid)
+        end
+        @test ModelContextProtocol.encode_mcp_name("us west 1") == "us west 1"
+        @test ModelContextProtocol.decode_mcp_name("=?base64?SGVsbG8=?=") == "Hello"
+        @test ModelContextProtocol.decode_mcp_name("=?base64?SGVsbG8?=") === nothing
+        @test ModelContextProtocol.encode_mcp_header_value(false, "boolean") == "false"
+        @test ModelContextProtocol.encode_mcp_header_value(9_007_199_254_740_991, "integer") == "9007199254740991"
+        @test_throws ArgumentError ModelContextProtocol.encode_mcp_header_value(big(9_007_199_254_740_992), "integer")
+
+        server = MCPServer(name="Header Server", version="0.1.0")
+        register_tool!(
+            server;
+            name="routed",
+            input_schema=schema,
+            handler=(::MCPRequestContext, args::Dict{String,Any}) -> Dict(
+                "structuredContent" => [args["region"], args["priority"]],
+            ),
+        )
+        valid = ModelContextProtocol.handle_jsonrpc_request(server, modern_http_request(
+            "tools/call";
+            params=Dict{String,Any}(
+                "name" => "routed",
+                "arguments" => Dict(
+                    "region" => "us west 1",
+                    "priority" => 4,
+                    "nested" => Dict("enabled" => true),
+                ),
+            ),
+            mcp_name="routed",
+            extra_headers=[
+                "Mcp-Param-Region" => "us west 1",
+                "Mcp-Param-Priority" => "4",
+                "Mcp-Param-Enabled" => "true",
+            ],
+        ))
+        @test valid.status == 200
+        @test JSON.parse(String(valid.body))["result"]["structuredContent"] == Any["us west 1", 4]
+
+        missing = ModelContextProtocol.handle_jsonrpc_request(server, modern_http_request(
+            "tools/call";
+            params=Dict{String,Any}("name" => "routed", "arguments" => Dict("region" => "west")),
+            mcp_name="routed",
+        ))
+        @test missing.status == 400
+        @test JSON.parse(String(missing.body))["error"]["code"] == -32020
+
+        mismatch = ModelContextProtocol.handle_jsonrpc_request(server, modern_http_request(
+            "tools/call";
+            params=Dict{String,Any}("name" => "routed", "arguments" => Dict("region" => "west")),
+            mcp_name="routed",
+            extra_headers=["Mcp-Param-Region" => "east"],
+        ))
+        @test mismatch.status == 400
+        @test JSON.parse(String(mismatch.body))["error"]["code"] == -32020
+    end
+
+    @testset "custom header client filtering" begin
+        received_headers = Dict{String,String}[]
+        router = HTTP.Router()
+        HTTP.register!(router, "POST", "/mcp", req -> begin
+            payload = JSON.parse(String(req.body))
+            method = payload["method"]
+            id = payload["id"]
+            result = if method == "tools/list"
+                Dict(
+                    "resultType" => "complete",
+                    "tools" => [
+                        Dict(
+                            "name" => "valid",
+                            "inputSchema" => Dict(
+                                "type" => "object",
+                                "properties" => Dict(
+                                    "region" => Dict("type" => "string", "x-mcp-header" => "Region"),
+                                ),
+                            ),
+                        ),
+                        Dict(
+                            "name" => "invalid",
+                            "inputSchema" => Dict(
+                                "type" => "object",
+                                "properties" => Dict(
+                                    "value" => Dict("type" => "string", "x-mcp-header" => ""),
+                                ),
+                            ),
+                        ),
+                    ],
+                )
+            else
+                push!(received_headers, Dict{String,String}(String(k) => String(v) for (k, v) in req.headers))
+                Dict("content" => [Dict("type" => "text", "text" => "ok")])
+            end
+            HTTP.Response(
+                200,
+                ["Content-Type" => "application/json"],
+                JSON.json(Dict("jsonrpc" => "2.0", "id" => id, "result" => result)),
+            )
+        end)
+        stub = HTTP.serve!(router, "127.0.0.1", 0; verbose=false)
+        try
+            port = ModelContextProtocol.bound_http_port(stub)
+            transport = MCPTransportDescriptor(kind=:http, url="http://127.0.0.1:$(port)/mcp")
+            discovery = MCPDiscovery(
+                manifest=Dict{String,Any}(),
+                transports=[transport],
+                default_transport=transport,
+            )
+            client = prepare_manual_client(
+                discovery;
+                config=MCPClientConfig(protocol_version=ModelContextProtocol.PROTOCOL_VERSION_2026_07_28),
+            )
+            listed = @test_logs (:warn, r"Ignoring tool with invalid x-mcp-header") list_tools(client)
+            @test [tool["name"] for tool in listed["tools"]] == ["valid"]
+            result = call_tool(client, "valid"; arguments=Dict("region" => "us-west1"))
+            @test result["content"][1]["text"] == "ok"
+            @test received_headers[end]["Mcp-Param-Region"] == "us-west1"
+        finally
+            close(stub)
+        end
     end
 
     @testset "MRTR input_required round trip" begin
@@ -1263,6 +1473,10 @@ end
                                 "method" => "elicitation/create",
                                 "params" => Dict{String,Any}("mode" => "form", "message" => "Confirm?"),
                             ),
+                            "sample" => Dict{String,Any}(
+                                "method" => "sampling/createMessage",
+                                "params" => Dict{String,Any}(),
+                            ),
                         ),
                         request_state="state-token",
                     )
@@ -1277,11 +1491,17 @@ end
 
         first_attempt = respond(modern_http_request(
             "tools/call";
-            params=Dict{String,Any}("name" => "confirm-op"),
+            params=Dict{String,Any}(
+                "name" => "confirm-op",
+                "_meta" => Dict{String,Any}(
+                    ModelContextProtocol.META_CLIENT_CAPABILITIES => Dict("elicitation" => Dict()),
+                ),
+            ),
             mcp_name="confirm-op",
         ))["result"]
         @test first_attempt["resultType"] == "input_required"
         @test haskey(first_attempt["inputRequests"], "approval")
+        @test !haskey(first_attempt["inputRequests"], "sample")
         @test first_attempt["requestState"] == "state-token"
 
         retry = respond(modern_http_request(
@@ -1291,11 +1511,42 @@ end
                 "name" => "confirm-op",
                 "inputResponses" => Dict{String,Any}("approval" => Dict{String,Any}("action" => "accept")),
                 "requestState" => "state-token",
+                "_meta" => Dict{String,Any}(
+                    ModelContextProtocol.META_CLIENT_CAPABILITIES => Dict("elicitation" => Dict()),
+                ),
             ),
             mcp_name="confirm-op",
         ))["result"]
         @test retry["resultType"] == "complete"
         @test retry["content"][1]["text"] == "approved:state-token"
+
+        register_prompt!(
+            server;
+            name="context-prompt",
+            handler=(context::MCPRequestContext, ::Dict{String,Any}) -> begin
+                ModelContextProtocol.input_responses(context) === nothing && return MCPInputRequired(
+                    input_requests=Dict(
+                        "context" => Dict(
+                            "method" => "elicitation/create",
+                            "params" => Dict("message" => "Context?"),
+                        ),
+                    ),
+                )
+                Dict("messages" => Any[])
+            end,
+        )
+        prompt_first = respond(modern_http_request(
+            "prompts/get";
+            params=Dict{String,Any}(
+                "name" => "context-prompt",
+                "_meta" => Dict{String,Any}(
+                    ModelContextProtocol.META_CLIENT_CAPABILITIES => Dict("elicitation" => Dict()),
+                ),
+            ),
+            mcp_name="context-prompt",
+        ))["result"]
+        @test prompt_first["resultType"] == "input_required"
+        @test haskey(prompt_first["inputRequests"], "context")
     end
 
     @testset "modern client end to end" begin
@@ -1305,10 +1556,24 @@ end
             http_server.server;
             name="noisy",
             handler=(context::MCPRequestContext, ::Dict{String,Any}) -> begin
-                send_progress!(context; progress=1, total=2, message="halfway")
-                send_log!(context, "info", "working")
+                ModelContextProtocol.send_progress!(context; progress=1, total=2, message="halfway")
+                ModelContextProtocol.send_log!(context, "info", "working")
                 Dict("content" => [Dict("type" => "text", "text" => "done")])
             end,
+        )
+        register_tool!(
+            http_server.server;
+            name="routed",
+            input_schema=Dict(
+                "type" => "object",
+                "properties" => Dict(
+                    "region" => Dict("type" => "string", "x-mcp-header" => "Region"),
+                    "priority" => Dict("type" => "integer", "x-mcp-header" => "Priority"),
+                ),
+            ),
+            handler=(::MCPRequestContext, ::Dict{String,Any}) -> Dict(
+                "content" => [Dict("type" => "text", "text" => "routed")],
+            ),
         )
         try
             discovery = discover_server(base)
@@ -1326,10 +1591,23 @@ end
             @test "echo" in [t["name"] for t in tools["tools"]]
 
             echo = call_tool(client, "echo"; arguments=Dict("message" => "modern hello"))
-            @test !is_input_required(echo)
+            @test !ModelContextProtocol.is_input_required(echo)
             @test echo["content"][1]["text"] == "modern hello"
             @test any(h -> get(h, "Mcp-Method", "") == "tools/call", state.headers)
             @test any(h -> get(h, "Mcp-Name", "") == "echo", state.headers)
+
+            routed = call_tool(
+                client,
+                "routed";
+                arguments=Dict("region" => "us west 1", "priority" => 42),
+            )
+            @test routed["content"][1]["text"] == "routed"
+            @test get(state.headers[end], "Mcp-Param-Region", nothing) == "us west 1"
+            @test get(state.headers[end], "Mcp-Param-Priority", nothing) == "42"
+            @test ModelContextProtocol.default_client_info()["version"] == string(pkgversion(ModelContextProtocol))
+            @test_throws MCPError ping(client)
+            @test_throws MCPError cancel_request(client, "request-1")
+            @test_throws MCPError open_event_stream(client)
 
             progress_events = Dict{String,Any}[]
             log_events = Dict{String,Any}[]
@@ -1372,7 +1650,7 @@ end
                 push!(list_changes, "tools")
                 nothing
             end)
-            listen = listen_subscriptions!(client; tools_list_changed=true)
+            listen = ModelContextProtocol.listen_subscriptions!(client; tools_list_changed=true)
             # HTTP.jl 2.x's server currently buffers SSE response bodies until the
             # stream closes (its own `sse_stream` do-block example exhibits this),
             # so mid-stream events only reach the client on graceful closure there.
@@ -1392,7 +1670,7 @@ end
             )
             http_streams_live && @test timedwait(() -> !isempty(list_changes), 5.0; pollint=0.05) == :ok
 
-            close_subscription_listeners!(http_server.server)
+            ModelContextProtocol.close_subscription_listeners!(http_server.server)
             @test timedwait(() -> istaskdone(listen.task), 5.0; pollint=0.05) == :ok
             # graceful closure delivers all opted-in events under both transports
             @test timedwait(() -> !isempty(acks) && !isempty(list_changes), 5.0; pollint=0.05) == :ok

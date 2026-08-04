@@ -75,6 +75,9 @@ function default_server_capabilities()
 end
 
 function MCPServer(config::MCPServerConfig)
+    config.cache_ttl_ms >= 0 || throw(ArgumentError("cache_ttl_ms must be non-negative"))
+    config.cache_scope in ("public", "private") ||
+        throw(ArgumentError("cache_scope must be either \"public\" or \"private\""))
     capabilities = isempty(config.capabilities) ? default_server_capabilities() : copy(config.capabilities)
     info = isempty(config.server_info) ? Dict{String,Any}() : to_string_dict(config.server_info)
     haskey(info, "name") || (info["name"] = config.name)
@@ -313,6 +316,143 @@ end
 normalize_dict_or_empty(value, label) = begin
     result = normalize_dict(value, label)
     result === nothing ? Dict{String,Any}() : result
+end
+
+function normalize_capabilities(value, label)
+    capabilities = normalize_dict_or_empty(value, label)
+    for (name, capability) in capabilities
+        capability isa AbstractDict ||
+            throw(ArgumentError("$(label).$(name) must be a dictionary"))
+        capabilities[name] = to_json_dict(capability)
+    end
+    return capabilities
+end
+
+const MCP_HEADER_ANNOTATION = "x-mcp-header"
+const MCP_SAFE_INTEGER_MAX = Int64(9_007_199_254_740_991)
+const JSON_SCHEMA_SINGLE_SCHEMA_KEYS = (
+    "additionalProperties",
+    "contains",
+    "contentSchema",
+    "else",
+    "if",
+    "items",
+    "not",
+    "propertyNames",
+    "then",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+)
+const JSON_SCHEMA_SCHEMA_ARRAY_KEYS = ("allOf", "anyOf", "oneOf", "prefixItems")
+const JSON_SCHEMA_SCHEMA_MAP_KEYS = ("\$defs", "definitions", "dependentSchemas", "patternProperties")
+
+function is_http_field_name(value::AbstractString)
+    isempty(value) && return false
+    for byte in codeunits(value)
+        valid = 0x30 <= byte <= 0x39 || 0x41 <= byte <= 0x5a || 0x61 <= byte <= 0x7a ||
+            byte in codeunits("!#\$%&'*+-.^_`|~")
+        valid || return false
+    end
+    return true
+end
+
+function collect_mcp_header_specs!(
+    specs::Vector{NamedTuple{(:name, :path, :type),Tuple{String,Vector{String},String}}},
+    seen::Set{String},
+    node,
+    path::Vector{String};
+    property_chain::Bool,
+    is_property::Bool,
+)
+    node isa AbstractDict || return specs
+    if haskey(node, MCP_HEADER_ANNOTATION)
+        property_chain && is_property ||
+            throw(ArgumentError("x-mcp-header is only valid on properties reached through properties keys"))
+        raw_name = node[MCP_HEADER_ANNOTATION]
+        raw_name isa AbstractString || throw(ArgumentError("x-mcp-header must be a string"))
+        name = String(raw_name)
+        is_http_field_name(name) || throw(ArgumentError("x-mcp-header '$(name)' is not a valid HTTP field-name token"))
+        key = lowercase(name)
+        key in seen && throw(ArgumentError("x-mcp-header '$(name)' is not case-insensitively unique"))
+        raw_type = get(node, "type", nothing)
+        raw_type isa AbstractString && raw_type in ("integer", "string", "boolean") ||
+            throw(ArgumentError("x-mcp-header '$(name)' requires type integer, string, or boolean"))
+        push!(seen, key)
+        push!(specs, (name=name, path=copy(path), type=String(raw_type)))
+    end
+
+    properties = get(node, "properties", nothing)
+    if properties isa AbstractDict
+        for (raw_name, child) in properties
+            child_path = [path; String(raw_name)]
+            collect_mcp_header_specs!(
+                specs,
+                seen,
+                child,
+                child_path;
+                property_chain=property_chain,
+                is_property=true,
+            )
+        end
+    end
+    for key in JSON_SCHEMA_SINGLE_SCHEMA_KEYS
+        child = get(node, key, nothing)
+        if child isa AbstractDict
+            collect_mcp_header_specs!(
+                specs,
+                seen,
+                child,
+                path;
+                property_chain=false,
+                is_property=false,
+            )
+        end
+    end
+    for key in JSON_SCHEMA_SCHEMA_ARRAY_KEYS
+        children = get(node, key, nothing)
+        children isa AbstractVector || continue
+        for child in children
+            child isa AbstractDict || continue
+            collect_mcp_header_specs!(
+                specs,
+                seen,
+                child,
+                path;
+                property_chain=false,
+                is_property=false,
+            )
+        end
+    end
+    for key in JSON_SCHEMA_SCHEMA_MAP_KEYS
+        children = get(node, key, nothing)
+        children isa AbstractDict || continue
+        for child in values(children)
+            if child isa AbstractDict
+                collect_mcp_header_specs!(
+                    specs,
+                    seen,
+                    child,
+                    path;
+                    property_chain=false,
+                    is_property=false,
+                )
+            end
+        end
+    end
+    return specs
+end
+
+function mcp_header_specs(schema)
+    schema isa AbstractDict || return NamedTuple{(:name, :path, :type),Tuple{String,Vector{String},String}}[]
+    specs = NamedTuple{(:name, :path, :type),Tuple{String,Vector{String},String}}[]
+    return collect_mcp_header_specs!(
+        specs,
+        Set{String}(),
+        schema,
+        String[];
+        property_chain=true,
+        is_property=false,
+    )
 end
 
 function parse_positive_int(value, label)
@@ -688,17 +828,23 @@ end
 function register_tool!(server::MCPServer, tool::MCPServerTool)
     name = String(tool.name)
     haskey(server.tools, name) && throw(ArgumentError("Tool $(name) already registered"))
+    input_schema = normalize_dict(tool.input_schema, "input_schema")
+    mcp_header_specs(input_schema)
     server.tools[name] = MCPServerTool(
         name=name,
         handler=tool.handler,
         title=maybe_string(tool.title),
         description=maybe_string(tool.description),
-        input_schema=normalize_dict(tool.input_schema, "input_schema"),
+        input_schema=input_schema,
         output_schema=normalize_dict(tool.output_schema, "output_schema"),
         execution=normalize_dict_or_empty(tool.execution, "execution"),
         icons=[normalize_dict_or_empty(icon, "icon") for icon in tool.icons],
         annotations=normalize_dict_or_empty(tool.annotations, "annotations"),
         meta=normalize_dict_or_empty(tool.meta, "_meta"),
+        required_client_capabilities=normalize_capabilities(
+            tool.required_client_capabilities,
+            "required_client_capabilities",
+        ),
     )
     ensure_capability!(server, "tools")
     notify_list_changed!(server, "tools")
@@ -717,6 +863,7 @@ function register_tool!(
     icons=Dict{String,Any}[],
     annotations=Dict{String,Any}(),
     meta=Dict{String,Any}(),
+    required_client_capabilities=Dict{String,Any}(),
     metadata=nothing,
 )
     annotation_data = normalize_dict_or_empty(annotations, "annotations")
@@ -735,6 +882,10 @@ function register_tool!(
         icons=[normalize_dict_or_empty(icon, "icon") for icon in icons],
         annotations=annotation_data,
         meta=normalize_dict_or_empty(meta, "_meta"),
+        required_client_capabilities=normalize_capabilities(
+            required_client_capabilities,
+            "required_client_capabilities",
+        ),
     )
     return register_tool!(server, tool)
 end
@@ -1110,6 +1261,14 @@ function json_object(value, label::String)
     return Dict{String,Any}(String(k) => v for (k, v) in parsed)
 end
 
+function json_value(value, label::String)
+    try
+        return JSON.parse(JSON.json(value; omit_null=true))
+    catch err
+        throw(mcp_error(:invalid_response, "$(label) must lower to a JSON value: $(sprint(showerror, err))"))
+    end
+end
+
 function normalize_content_item(item)
     if item isa MCPTextContent
         data = Dict{String,Any}("type" => "text", "text" => item.text)
@@ -1131,7 +1290,7 @@ function normalize_tool_result(result::MCPToolResult)
         normalized["content"] = normalize_content_items(result.content)
     end
     if result.structured_content !== nothing
-        normalized["structuredContent"] = json_object(result.structured_content, "Tool structuredContent")
+        normalized["structuredContent"] = json_value(result.structured_content, "Tool structuredContent")
     end
     if !haskey(normalized, "content") && !haskey(normalized, "structuredContent")
         throw(mcp_error(:invalid_response, "Tool handler must provide content or structuredContent"))
@@ -1153,7 +1312,7 @@ function normalize_tool_result(result)
         normalized["content"] = normalize_content_items(flatten_legacy_tool_outputs(result["outputs"]))
     end
     if haskey(result, "structuredContent")
-        normalized["structuredContent"] = json_object(result["structuredContent"], "Tool structuredContent")
+        normalized["structuredContent"] = json_value(result["structuredContent"], "Tool structuredContent")
     end
     if !haskey(normalized, "content") && !haskey(normalized, "structuredContent")
         throw(mcp_error(:invalid_response, "Tool handler must provide content or structuredContent"))
@@ -1183,11 +1342,18 @@ function call_tool(server::MCPServer, context::MCPRequestContext, params::Dict{S
     name = String(params["name"])
     tool = get(server.tools, name, nothing)
     tool === nothing && throw(mcp_error(:invalid_params, "Tool $(name) is not registered"))
+    if is_modern_protocol_version(context.protocol_version)
+        require_client_capabilities(context, tool.required_client_capabilities)
+    end
     args = arguments_dict(params)
     # invokelatest: handlers may be registered after the HTTP server started
     # serving, and connection tasks would otherwise run in an older world age
     result = Base.invokelatest(tool.handler, context, args)
-    result isa MCPInputRequired && return input_required_result(result)
+    if result isa MCPInputRequired
+        is_modern_protocol_version(context.protocol_version) ||
+            throw(mcp_error(:invalid_response, "MCPInputRequired requires protocol version $(PROTOCOL_VERSION_2026_07_28)"))
+        return result
+    end
     normalized = normalize_tool_result(result)
     if tool.output_schema !== nothing && !haskey(normalized, "structuredContent")
         annotations = get(normalized, "annotations", Dict{String,Any}())
@@ -1355,6 +1521,105 @@ function request_meta(params::Dict{String,Any})
     return to_json_dict(meta)
 end
 
+function validate_modern_meta(params::Dict{String,Any})
+    haskey(params, "_meta") || return nothing, "params._meta is required"
+    raw_meta = params["_meta"]
+    raw_meta isa AbstractDict || return nothing, "params._meta must be an object"
+    meta = to_json_dict(raw_meta)
+    protocol_version = get(meta, META_PROTOCOL_VERSION, nothing)
+    protocol_version isa AbstractString && !isempty(strip(String(protocol_version))) ||
+        return nothing, "params._meta.$(META_PROTOCOL_VERSION) must be a non-empty string"
+    capabilities = get(meta, META_CLIENT_CAPABILITIES, nothing)
+    capabilities isa AbstractDict ||
+        return nothing, "params._meta.$(META_CLIENT_CAPABILITIES) must be an object"
+    client_info = get(meta, META_CLIENT_INFO, nothing)
+    if client_info !== nothing
+        client_info isa AbstractDict ||
+            return nothing, "params._meta.$(META_CLIENT_INFO) must be an object"
+        name = get(client_info, "name", nothing)
+        version = get(client_info, "version", nothing)
+        name isa AbstractString ||
+            return nothing, "params._meta.$(META_CLIENT_INFO).name must be a string"
+        version isa AbstractString ||
+            return nothing, "params._meta.$(META_CLIENT_INFO).version must be a string"
+    end
+    return meta, nothing
+end
+
+function client_capabilities(context::MCPRequestContext)
+    context.params isa AbstractDict || return Dict{String,Any}()
+    meta = get(context.params, "_meta", nothing)
+    meta isa AbstractDict || return Dict{String,Any}()
+    capabilities = get(meta, META_CLIENT_CAPABILITIES, nothing)
+    capabilities isa AbstractDict || return Dict{String,Any}()
+    return to_json_dict(capabilities)
+end
+
+function require_client_capabilities(context::MCPRequestContext, required::AbstractDict)
+    isempty(required) && return nothing
+    declared = client_capabilities(context)
+    missing = Dict{String,Any}()
+    for (name, value) in required
+        key = String(name)
+        if !haskey(declared, key) || !capability_satisfies(declared[key], value)
+            missing[key] = value isa AbstractDict ? to_json_dict(value) : value
+        end
+    end
+    isempty(missing) || throw(MCPMissingRequiredClientCapability(missing))
+    return nothing
+end
+
+function capability_satisfies(declared, required)
+    if required isa AbstractDict
+        declared isa AbstractDict || return false
+        for (name, value) in required
+            key = String(name)
+            haskey(declared, key) && capability_satisfies(declared[key], value) || return false
+        end
+        return true
+    end
+    return declared == required
+end
+
+function input_request_capability(request)
+    request isa AbstractDict || return nothing
+    method = get(request, "method", nothing)
+    return if method == "sampling/createMessage"
+        "sampling"
+    elseif method == "roots/list"
+        "roots"
+    elseif method == "elicitation/create"
+        "elicitation"
+    else
+        nothing
+    end
+end
+
+function prepare_input_required(context::MCPRequestContext, input::MCPInputRequired)
+    declared = client_capabilities(context)
+    accepted = Dict{String,Any}()
+    missing = Dict{String,Any}()
+    for (name, request) in input.input_requests
+        capability = input_request_capability(request)
+        capability === nothing && throw(mcp_error(
+            :invalid_response,
+            "Input request $(name) uses an unsupported method",
+        ))
+        if haskey(declared, capability)
+            accepted[String(name)] = request
+        else
+            missing[capability] = Dict{String,Any}()
+        end
+    end
+    if isempty(accepted) && !isempty(missing)
+        throw(MCPMissingRequiredClientCapability(missing))
+    end
+    return MCPInputRequired(
+        input_requests=accepted,
+        request_state=input.request_state,
+    )
+end
+
 function supported_versions(server::MCPServer)
     versions = String[server.config.protocol_version]
     for version in server.config.supported_protocol_versions
@@ -1370,10 +1635,11 @@ const MCP_NAME_BASE64_PREFIX = "=?base64?"
 const MCP_NAME_BASE64_SUFFIX = "?="
 
 function is_header_safe_value(value::AbstractString)
-    isempty(value) && return false
-    for b in codeunits(value)
-        (0x21 <= b <= 0x7e) || return false
+    bytes = codeunits(value)
+    for b in bytes
+        (b == 0x09 || 0x20 <= b <= 0x7e) || return false
     end
+    !isempty(bytes) && (first(bytes) in (0x09, 0x20) || last(bytes) in (0x09, 0x20)) && return false
     startswith(value, MCP_NAME_BASE64_PREFIX) && endswith(value, MCP_NAME_BASE64_SUFFIX) && return false
     return true
 end
@@ -1381,17 +1647,51 @@ end
 encode_mcp_name(value::AbstractString) =
     is_header_safe_value(value) ? String(value) : string(MCP_NAME_BASE64_PREFIX, base64encode(String(value)), MCP_NAME_BASE64_SUFFIX)
 
+function encode_mcp_header_value(value, type::AbstractString)
+    text = if type == "string"
+        value isa AbstractString || throw(ArgumentError("x-mcp-header string argument must be a string"))
+        String(value)
+    elseif type == "integer"
+        value isa Integer && !(value isa Bool) || throw(ArgumentError("x-mcp-header integer argument must be an integer"))
+        abs(BigInt(value)) <= MCP_SAFE_INTEGER_MAX || throw(ArgumentError("x-mcp-header integer argument is outside the safe integer range"))
+        string(value)
+    elseif type == "boolean"
+        value isa Bool || throw(ArgumentError("x-mcp-header boolean argument must be a boolean"))
+        value ? "true" : "false"
+    else
+        throw(ArgumentError("Unsupported x-mcp-header type $(type)"))
+    end
+    return encode_mcp_name(text)
+end
+
 function decode_mcp_name(value::AbstractString)
     text = String(value)
     if startswith(text, MCP_NAME_BASE64_PREFIX) && endswith(text, MCP_NAME_BASE64_SUFFIX)
         encoded = text[length(MCP_NAME_BASE64_PREFIX)+1:end-length(MCP_NAME_BASE64_SUFFIX)]
         return try
-            String(base64decode(encoded))
+            decoded = base64decode(encoded)
+            base64encode(decoded) == encoded || return nothing
+            String(decoded)
         catch
             nothing
         end
     end
     return text
+end
+
+
+function value_at_path(arguments::AbstractDict, path::Vector{String})
+    current = arguments
+    for (index, name) in enumerate(path)
+        haskey(current, name) || return (false, nothing)
+        value = current[name]
+        if index == length(path)
+            return (value !== nothing, value)
+        end
+        value isa AbstractDict || return (false, nothing)
+        current = value
+    end
+    return (false, nothing)
 end
 
 function mcp_name_body_value(method::AbstractString, params::Dict{String,Any})
@@ -1425,6 +1725,54 @@ function validate_modern_headers(server::MCPServer, req::HTTP.Request, method::A
         decoded = decode_mcp_name(String(header_name))
         if decoded === nothing || decoded != expected_name
             return jsonrpc_error(server, nothing, id, -32020, "Header mismatch: Mcp-Name header value does not match body value"; status=400)
+        end
+    end
+    if method == JSONRPC_METHOD_TOOLS_CALL
+        tool_name = get(params, "name", nothing)
+        tool = tool_name isa AbstractString ? get(server.tools, String(tool_name), nothing) : nothing
+        if tool !== nothing
+            arguments = get(params, "arguments", Dict{String,Any}())
+            arguments isa AbstractDict || (arguments = Dict{String,Any}())
+            for spec in mcp_header_specs(tool.input_schema)
+                present, value = value_at_path(arguments, spec.path)
+                raw_header = http_header_value(req.headers, "Mcp-Param-$(spec.name)")
+                if !present
+                    raw_header === nothing || return jsonrpc_error(
+                        server,
+                        nothing,
+                        id,
+                        -32020,
+                        "Header mismatch: Mcp-Param-$(spec.name) is present but its argument is absent";
+                        status=400,
+                    )
+                    continue
+                end
+                expected = try
+                    encode_mcp_header_value(value, spec.type)
+                catch err
+                    return jsonrpc_error(server, nothing, id, -32020, "Header mismatch: $(sprint(showerror, err))"; status=400)
+                end
+                raw_header === nothing && return jsonrpc_error(
+                    server,
+                    nothing,
+                    id,
+                    -32020,
+                    "Header mismatch: Mcp-Param-$(spec.name) is required";
+                    status=400,
+                )
+                decoded = decode_mcp_name(String(raw_header))
+                expected_decoded = decode_mcp_name(expected)
+                if decoded === nothing || decoded != expected_decoded
+                    return jsonrpc_error(
+                        server,
+                        nothing,
+                        id,
+                        -32020,
+                        "Header mismatch: Mcp-Param-$(spec.name) does not match its argument";
+                        status=400,
+                    )
+                end
+            end
         end
     end
     return nothing
@@ -1623,11 +1971,21 @@ function handle_subscriptions_listen(server::MCPServer, context::MCPRequestConte
     return build_sse_response(headers) do stream
         try
             write(stream, HTTP.SSEEvent(JSON.json(ack)))
-            for envelope in listener.channel
-                write(stream, HTTP.SSEEvent(JSON.json(envelope)))
+            while isopen(stream)
+                if isready(listener.channel)
+                    envelope = take!(listener.channel)
+                    write(stream, HTTP.SSEEvent(JSON.json(envelope)))
+                elseif !isopen(listener.channel)
+                    break
+                else
+                    sleep(0.01)
+                end
             end
             # channel closed by the server: signal graceful closure
-            write(stream, HTTP.SSEEvent(JSON.json(closing)))
+            isopen(stream) && write(stream, HTTP.SSEEvent(JSON.json(closing)))
+        catch err
+            # Client disconnects are normal for long-lived listen streams.
+            err isa Base.IOError || rethrow()
         finally
             unregister_listener!(server, listener)
         end
@@ -1710,16 +2068,35 @@ function handle_modern_request(server::MCPServer, req::HTTP.Request, method::Str
         end
         return HTTP.Response(202, response_headers(server; content_type=nothing, protocol_version=protocol_version))
     end
+    status = 200
     envelope = try
-        result = decorate_modern_result!(server, method, dispatch_modern_jsonrpc(server, context, params))
+        result = dispatch_modern_jsonrpc(server, context, params)
+        if result isa MCPInputRequired
+            method in (JSONRPC_METHOD_TOOLS_CALL, JSONRPC_METHOD_PROMPTS_GET, JSONRPC_METHOD_RESOURCES_READ) ||
+                throw(mcp_error(:invalid_response, "$(method) cannot return MCPInputRequired"))
+            result = input_required_result(prepare_input_required(context, result))
+        end
+        result = decorate_modern_result!(server, method, result)
         Dict{String,Any}("jsonrpc" => JSONRPC_VERSION, "id" => id, "result" => result === nothing ? Dict{String,Any}("resultType" => "complete") : result)
     catch err
-        code, message = classify_error(err)
-        if code == -32002 && err isa MCPError && err.code == :resource_not_found
-            code = -32602  # 2026-07-28 aligns resource-not-found with JSON-RPC Invalid params
+        code, message, data = if err isa MCPMissingRequiredClientCapability
+            status = 400
+            -32021, "Missing required client capability", Dict(
+                "requiredCapabilities" => err.required,
+            )
+        else
+            classified_code, classified_message = classify_error(err)
+            if classified_code == -32002 && err isa MCPError && err.code == :resource_not_found
+                classified_code = -32602  # 2026-07-28 aligns resource-not-found with JSON-RPC Invalid params
+            end
+            classified_code, classified_message, nothing
         end
         error_body = Dict{String,Any}("code" => code, "message" => message)
+        data === nothing || (error_body["data"] = data)
         Dict{String,Any}("jsonrpc" => JSONRPC_VERSION, "id" => id, "error" => error_body)
+    end
+    if status != 200
+        return HTTP.Response(status, response_headers(server; protocol_version=protocol_version), JSON.json(envelope))
     end
     if isempty(notifications)
         status = haskey(envelope, "error") && envelope["error"]["code"] == -32601 ? 404 : 200
@@ -1865,6 +2242,19 @@ function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
     meta_version = meta_version_raw isa AbstractString ? String(strip(meta_version_raw)) : nothing
     header_version_raw = http_header_value(req.headers, "MCP-Protocol-Version")
     header_version = header_version_raw === nothing ? "" : String(strip(String(header_version_raw)))
+    modern_request = (!isempty(header_version) && is_modern_protocol_version(header_version)) ||
+                     (meta_version !== nothing && is_modern_protocol_version(meta_version))
+    if modern_request
+        validated_meta, meta_error = validate_modern_meta(params)
+        if meta_error !== nothing
+            return jsonrpc_error(server, nothing, id, -32602, meta_error; status=400)
+        end
+        meta = validated_meta
+        meta_version = String(strip(String(meta[META_PROTOCOL_VERSION])))
+        if isempty(header_version)
+            return jsonrpc_error(server, nothing, id, -32020, "Header mismatch: MCP-Protocol-Version header is required"; status=400)
+        end
+    end
     if meta_version !== nothing && !isempty(header_version) && meta_version != header_version
         return jsonrpc_error(server, nothing, id, -32020, "Header mismatch: MCP-Protocol-Version header '$(header_version)' does not match _meta protocolVersion '$(meta_version)'"; status=400)
     end
@@ -1946,7 +2336,7 @@ function handle_stream_request(server::MCPServer, req::HTTP.Request)
     session = find_session(server, session_id)
     if session === nothing
         response = HTTP.Response(404, response_headers(server), JSON.json(Dict("error" => "Unknown session")))
-            return response
+        return response
     end
     ensure_session_initialized!(session, "event-stream")
     last_event = http_header_value(req.headers, "Last-Event-ID")

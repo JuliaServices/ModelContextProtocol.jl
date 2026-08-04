@@ -36,6 +36,7 @@ function prepare_manual_client(
         Dict{String,Function}(),
         nothing,
         nothing,
+        Dict{String,Dict{String,Any}}(),
     )
 end
 
@@ -57,11 +58,38 @@ end
 
 default_client_info() = Dict(
     "name" => "ModelContextProtocol.jl",
-    "version" => string(Base.VERSION),
+    "version" => string(pkgversion(@__MODULE__)),
 )
 
-list_tools(client::MCPClient; cursor=nothing, limit=nothing, headers=nothing, timeout_ms=nothing) =
-    list_entities(client, JSONRPC_METHOD_TOOLS_LIST; cursor=cursor, limit=limit, headers=headers, timeout_ms=timeout_ms)
+function list_tools(client::MCPClient; cursor=nothing, limit=nothing, headers=nothing, timeout_ms=nothing)
+    result = list_entities(client, JSONRPC_METHOD_TOOLS_LIST; cursor=cursor, limit=limit, headers=headers, timeout_ms=timeout_ms)
+    client_is_modern(client) || return result
+    result isa AbstractDict || return result
+    tools = get(result, "tools", nothing)
+    tools isa AbstractVector || return result
+    valid_tools = Any[]
+    for raw_tool in tools
+        raw_tool isa AbstractDict || continue
+        tool = to_json_dict(raw_tool)
+        name = get(tool, "name", nothing)
+        name isa AbstractString || continue
+        schema = get(tool, "inputSchema", Dict{String,Any}("type" => "object"))
+        schema isa AbstractDict || continue
+        schema_dict = to_json_dict(schema)
+        try
+            mcp_header_specs(schema_dict)
+        catch err
+            @warn "Ignoring tool with invalid x-mcp-header annotation" tool=String(name) reason=sprint(showerror, err)
+            delete!(client.tool_schemas, String(name))
+            continue
+        end
+        client.tool_schemas[String(name)] = deepcopy(schema_dict)
+        push!(valid_tools, tool)
+    end
+    filtered = to_json_dict(result)
+    filtered["tools"] = valid_tools
+    return filtered
+end
 
 list_prompts(client::MCPClient; cursor=nothing, limit=nothing, headers=nothing, timeout_ms=nothing) =
     list_entities(client, JSONRPC_METHOD_PROMPTS_LIST; cursor=cursor, limit=limit, headers=headers, timeout_ms=timeout_ms)
@@ -89,12 +117,51 @@ apply_mrtr_params!(params::Dict{String,Any}, input_responses, request_state) = b
     params
 end
 
+function custom_tool_headers(client::MCPClient, name::String, arguments)
+    client_is_modern(client) || return HeaderPair[]
+    if !haskey(client.tool_schemas, name)
+        cursor = nothing
+        seen_cursors = Set{String}()
+        while true
+            result = list_tools(client; cursor)
+            haskey(client.tool_schemas, name) && break
+            result isa AbstractDict || break
+            next_cursor = get(result, "nextCursor", nothing)
+            next_cursor isa AbstractString || break
+            cursor = String(next_cursor)
+            cursor in seen_cursors && break
+            push!(seen_cursors, cursor)
+        end
+    end
+    schema = get(client.tool_schemas, name, nothing)
+    schema === nothing && return HeaderPair[]
+    args = if arguments === nothing
+        Dict{String,Any}()
+    elseif arguments isa AbstractDict || arguments isa NamedTuple
+        parsed = JSON.parse(JSON.json(arguments))
+        parsed isa AbstractDict || throw(ArgumentError("tool arguments must lower to a JSON object"))
+        to_json_dict(parsed)
+    else
+        throw(ArgumentError("tool arguments must be a dictionary or named tuple"))
+    end
+    headers = HeaderPair[]
+    for spec in mcp_header_specs(schema)
+        present, value = value_at_path(args, spec.path)
+        present || continue
+        push!(headers, normalize_pair("Mcp-Param-$(spec.name)", encode_mcp_header_value(value, spec.type)))
+    end
+    return headers
+end
+
 function call_tool(client::MCPClient, name::AbstractString; arguments=nothing, headers=nothing, timeout_ms=nothing, input_responses=nothing, request_state=nothing, meta=nothing)
-    params = Dict{String,Any}("name" => String(name))
+    tool_name = String(name)
+    params = Dict{String,Any}("name" => tool_name)
     arguments !== nothing && (params["arguments"] = arguments)
     meta !== nothing && (params["_meta"] = to_string_dict(meta))
     apply_mrtr_params!(params, input_responses, request_state)
-    return jsonrpc_call(client, JSONRPC_METHOD_TOOLS_CALL; params=params, headers=headers, timeout_ms=timeout_ms)
+    request_headers = normalize_headers(headers)
+    append!(request_headers, custom_tool_headers(client, tool_name, arguments))
+    return jsonrpc_call(client, JSONRPC_METHOD_TOOLS_CALL; params=params, headers=request_headers, timeout_ms=timeout_ms)
 end
 
 function get_prompt(client::MCPClient, name::AbstractString; arguments=nothing, headers=nothing, timeout_ms=nothing, input_responses=nothing, request_state=nothing)
@@ -274,6 +341,7 @@ function cancel_request(client::MCPClient, request_id; reason=nothing, headers=n
 end
 
 function open_event_stream(client::MCPClient; headers=nothing, timeout=nothing)
+    client_is_modern(client) && throw(mcp_error(:unsupported_protocol_version, "The 2026-07-28 protocol uses subscriptions/listen instead of a standalone event stream"))
     client.initialized || throw(mcp_error(:not_initialized, "Client must be initialized before opening an event stream"))
     header_pairs = normalize_headers(headers)
     request_headers = build_request_headers(client, header_pairs; content_type=nothing, accept="text/event-stream")
@@ -353,6 +421,7 @@ function to_notification_payload(params)
 end
 
 function notify_handlers!(client::MCPClient, method::String, params)
+    method == JSONRPC_METHOD_NOTIFICATIONS_TOOLS_LIST_CHANGED && empty!(client.tool_schemas)
     handlers = get(client.notification_handlers, method, nothing)
     handlers === nothing && return
     for handler in handlers
@@ -515,6 +584,7 @@ function event_listener_loop(client::MCPClient, poll_interval::Real, headers)
 end
 
 function start_event_listener!(client::MCPClient; poll_interval::Real=1.0, headers=nothing)
+    client_is_modern(client) && throw(mcp_error(:unsupported_protocol_version, "The 2026-07-28 protocol uses listen_subscriptions! instead of the legacy event listener"))
     client.initialized || throw(mcp_error(:not_initialized, "Client must be initialized before starting event listener"))
     stop_event_listener!(client)
     task = @async begin
@@ -545,6 +615,14 @@ function stop_event_listener!(client::MCPClient)
 end
 
 function terminate_session!(client::MCPClient; headers=nothing, timeout=nothing)
+    if client_is_modern(client)
+        stop_event_listener!(client)
+        client.session = nothing
+        client.session_id = nothing
+        client.initialized = false
+        empty!(client.tool_schemas)
+        return nothing
+    end
     ensure_http_transport(client.transport)
     client.session_id === nothing && return nothing
     header_pairs = normalize_headers(headers)

@@ -66,6 +66,52 @@ Base.@kwdef struct MCPServerConfig
     verbose::Bool=false
 end
 
+# Preserve the positional constructor from 1.0.0 after adding modern cache
+# configuration fields. New code should use keyword construction.
+function MCPServerConfig(
+    name,
+    version,
+    description,
+    description_for_model,
+    instructions,
+    instructions_url,
+    protocol_version,
+    supported_protocol_versions,
+    missing_protocol_header,
+    allowed_origins,
+    transport_path,
+    manifest_paths,
+    capabilities,
+    server_info,
+    manifest,
+    transport_metadata,
+    session_store,
+    verbose,
+)
+    return MCPServerConfig(
+        name,
+        version,
+        description,
+        description_for_model,
+        instructions,
+        instructions_url,
+        protocol_version,
+        supported_protocol_versions,
+        missing_protocol_header,
+        60_000,
+        "private",
+        allowed_origins,
+        transport_path,
+        manifest_paths,
+        capabilities,
+        server_info,
+        manifest,
+        transport_metadata,
+        session_store,
+        verbose,
+    )
+end
+
 Base.@kwdef mutable struct MCPSession
     id::String
     initialized::Bool=false
@@ -110,7 +156,12 @@ Base.@kwdef struct MCPServerTool
     icons::Vector{Dict{String,Any}}=Dict{String,Any}[]
     annotations::Dict{String,Any}=Dict{String,Any}()
     meta::Dict{String,Any}=Dict{String,Any}()
+    required_client_capabilities::Dict{String,Any}=Dict{String,Any}()
 end
+
+# Preserve the positional constructor from 1.0.0.
+MCPServerTool(name, handler, title, description, input_schema, output_schema, execution, icons, annotations, meta) =
+    MCPServerTool(name, handler, title, description, input_schema, output_schema, execution, icons, annotations, meta, Dict{String,Any}())
 
 Base.@kwdef struct MCPTextContent
     text::String
@@ -118,8 +169,14 @@ Base.@kwdef struct MCPTextContent
     meta::Dict{String,Any}=Dict{String,Any}()
 end
 
-# MRTR (2026-07-28): handlers return this to request additional client input;
-# the client retries the original request with inputResponses/requestState.
+"""
+    MCPInputRequired(; input_requests=Dict(), request_state=nothing)
+
+Return this from a `2026-07-28` tool, prompt, or resource handler when the
+request needs a client sampling, roots, or elicitation operation. The client
+retries the original request with `inputResponses` and the optional opaque
+`requestState` value.
+"""
 Base.@kwdef struct MCPInputRequired
     input_requests::Dict{String,Any}=Dict{String,Any}()
     request_state::Union{String,Nothing}=nothing
@@ -220,7 +277,16 @@ mutable struct MCPClient
     request_handlers::Dict{String,Function}
     event_task::Union{Task,Nothing}
     last_event_id::Union{String,Nothing}
+    tool_schemas::Dict{String,Dict{String,Any}}
 end
+
+# Preserve the public positional client constructors that predate modern
+# request metadata and the internal tool-schema cache.
+MCPClient(manifest, transport, protocol_version, http, headers, timeout, verbose, auth_token, session, session_id, initialized, next_id, notification_handlers, request_handlers, event_task, last_event_id) =
+    MCPClient(manifest, transport, protocol_version, http, headers, timeout, verbose, Dict{String,Any}(), Dict{String,Any}(), auth_token, session, session_id, initialized, next_id, notification_handlers, request_handlers, event_task, last_event_id, Dict{String,Dict{String,Any}}())
+
+MCPClient(manifest, transport, protocol_version, http, headers, timeout, verbose, capabilities, client_info, auth_token, session, session_id, initialized, next_id, notification_handlers, request_handlers, event_task, last_event_id) =
+    MCPClient(manifest, transport, protocol_version, http, headers, timeout, verbose, capabilities, client_info, auth_token, session, session_id, initialized, next_id, notification_handlers, request_handlers, event_task, last_event_id, Dict{String,Dict{String,Any}}())
 
 # A live subscriptions/listen stream (2026-07-28): notifications matching the
 # opted-in filter are pushed onto the channel by the server broadcast helpers.
@@ -253,3 +319,7 @@ mutable struct MCPServer
     listeners::Vector{MCPSubscriptionListener}
     listeners_lock::ReentrantLock
 end
+
+# Preserve the positional server constructor from 1.0.0.
+MCPServer(config, transport_path, capabilities, server_info, tools, prompts, resources, resource_templates, sessions, session_store, request_hook, cancellation_handler, logging_handler, logging_level, missing_protocol_header_behavior, completion_handler) =
+    MCPServer(config, transport_path, capabilities, server_info, tools, prompts, resources, resource_templates, sessions, session_store, request_hook, cancellation_handler, logging_handler, logging_level, missing_protocol_header_behavior, completion_handler, MCPSubscriptionListener[], ReentrantLock())

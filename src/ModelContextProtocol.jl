@@ -40,9 +40,7 @@ export register_request_handler!, clear_request_handlers!
 export start_event_listener!, stop_event_listener!
 export terminate_session!
 export enqueue_server_event!, broadcast_server_event!, notify_resource_updated!
-export PROTOCOL_VERSION_2026_07_28, MCPInputRequired
-export input_responses, request_state, send_progress!, send_log!
-export close_subscription_listeners!, discover_server_info!, listen_subscriptions!, is_input_required
+export MCPInputRequired
 export MCP_APPS_EXTENSION_ID, MCP_APP_HTML_MIME_TYPE, MCP_APPS_UI_PROTOCOL_VERSION
 export MCPUIResource, ui_extension_capability, add_ui_extension_capability!
 export ui_tool_meta, ui_resource_meta, ui_resource_contents, embedded_ui_resource
