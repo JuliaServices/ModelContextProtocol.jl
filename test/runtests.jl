@@ -134,6 +134,237 @@ function jsonrpc_http_request(method::String; id="1", params=Dict{String,Any}(),
     return HTTP.Request("POST", "/v1/mcp", headers, codeunits(JSON.json(body)))
 end
 
+function static_raw_request(body::AbstractString; session_id=nothing)
+    headers = [
+        "Content-Type" => "application/json",
+        "MCP-Protocol-Version" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
+    ]
+    session_id !== nothing && push!(headers, "MCP-Session-Id" => session_id)
+    return HTTP.Request("POST", "/v1/mcp", headers, Vector{UInt8}(codeunits(body)))
+end
+
+Base.@kwdef struct StaticEchoArgs
+    message::String=""
+end
+
+struct StaticEchoHandler end
+
+function (::StaticEchoHandler)(
+    ::ModelContextProtocol.StaticMCPRequestContext,
+    arguments::JSON.JSONText,
+)
+    parsed = JSON.parse(arguments.value, StaticEchoArgs)
+    parsed.message == "argument-error" && throw(ArgumentError("invalid message"))
+    parsed.message == "internal-error" && error("unexpected failure")
+    parsed.message == "invalid-result" && return ModelContextProtocol.StaticMCPToolResult(
+        text="invalid",
+        structured_content=JSON.JSONText("[]"),
+    )
+    parsed.message == "plain" && return ModelContextProtocol.StaticMCPToolResult(text="plain")
+    return ModelContextProtocol.StaticMCPToolResult(
+        text=parsed.message,
+        structured_content=JSON.JSONText(JSON.json((; echoed=parsed.message))),
+    )
+end
+
+function static_test_server()
+    tool = ModelContextProtocol.StaticMCPTool(
+        name="echo",
+        title="Echo",
+        description="Return the supplied message.",
+        input_schema=JSON.JSONText(
+            "{\"type\":\"object\",\"properties\":{\"message\":{\"type\":\"string\"}},\"required\":[\"message\"]}",
+        ),
+        annotations=JSON.JSONText("{\"readOnlyHint\":true}"),
+        handler=StaticEchoHandler(),
+    )
+    return ModelContextProtocol.StaticMCPServer(
+        [tool];
+        name="Static Test",
+        version="0.1.0",
+        description="Static MCP test server.",
+        instructions="Use the echo tool.",
+    )
+end
+
+@testset "Static tools server" begin
+    server = static_test_server()
+    initialize = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        jsonrpc_http_request(
+            "initialize";
+            id=1,
+            params=Dict(
+                "protocolVersion" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
+                "capabilities" => Dict{String,Any}(),
+                "clientInfo" => Dict("name" => "static-test", "version" => "0.1.0"),
+            ),
+        ),
+    )
+    @test initialize.status == 200
+    session_id = HTTP.header(initialize, "MCP-Session-Id")
+    @test !isempty(session_id)
+    initialize_payload = JSON.parse(String(initialize.body))
+    @test initialize_payload["id"] == 1
+    @test initialize_payload["result"]["serverInfo"]["name"] == "Static Test"
+    @test initialize_payload["result"]["capabilities"]["tools"]["listChanged"] == false
+
+    initialize_notification = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request("{\"jsonrpc\":\"2.0\",\"method\":\"initialize\"}"),
+    )
+    @test initialize_notification.status == 202
+    @test length(server.sessions) == 1
+
+    invalid_initialize = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{}}}",
+        ),
+    )
+    @test JSON.parse(String(invalid_initialize.body))["error"]["code"] == -32602
+    @test length(server.sessions) == 1
+
+    before_initialized = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        jsonrpc_http_request("tools/list"; session_id),
+    )
+    @test before_initialized.status == 400
+
+    initialized = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        jsonrpc_http_request("notifications/initialized"; id=nothing, session_id),
+    )
+    @test initialized.status == 202
+
+    listed = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        jsonrpc_http_request("tools/list"; session_id),
+    )
+    @test listed.status == 200
+    listed_payload = JSON.parse(String(listed.body))
+    @test only(listed_payload["result"]["tools"])["name"] == "echo"
+    @test only(listed_payload["result"]["tools"])["inputSchema"]["required"] == ["message"]
+
+    called = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        jsonrpc_http_request(
+            "tools/call";
+            session_id,
+            params=Dict("name" => "echo", "arguments" => Dict("message" => "hello\n\"world\"")),
+        ),
+    )
+    @test called.status == 200
+    called_payload = JSON.parse(String(called.body))
+    @test called_payload["result"]["structuredContent"] == Dict("echoed" => "hello\n\"world\"")
+    @test called_payload["result"]["content"][1]["text"] == "hello\n\"world\""
+
+    numeric_id = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request(
+            "{\"jsonrpc\":\"2.0\",\"id\":1.25e2,\"method\":\"ping\"}";
+            session_id,
+        ),
+    )
+    @test JSON.parse(String(numeric_id.body))["id"] == 125.0
+
+    unknown = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        jsonrpc_http_request(
+            "tools/call";
+            session_id,
+            params=Dict("name" => "missing", "arguments" => Dict{String,Any}()),
+        ),
+    )
+    @test JSON.parse(String(unknown.body))["error"]["code"] == -32602
+
+    for body in (
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\\q\"}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1e,\"method\":\"ping\"}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\u0001\"}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"} trailing",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"\\uD800\"}",
+    )
+        invalid = ModelContextProtocol.handle_static_jsonrpc_request(
+            server,
+            static_raw_request(body; session_id),
+        )
+        @test invalid.status == 400
+        @test JSON.parse(String(invalid.body))["error"]["code"] == -32700
+    end
+
+    invalid_arguments = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request(
+            "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":[]}}";
+            session_id,
+        ),
+    )
+    @test JSON.parse(String(invalid_arguments.body))["error"]["code"] == -32602
+
+    for (message, expected_code) in (("argument-error", -32602), ("internal-error", -32603))
+        failed = ModelContextProtocol.handle_static_jsonrpc_request(
+            server,
+            jsonrpc_http_request(
+                "tools/call";
+                session_id,
+                params=Dict("name" => "echo", "arguments" => Dict("message" => message)),
+            ),
+        )
+        @test JSON.parse(String(failed.body))["error"]["code"] == expected_code
+    end
+
+    invalid_result = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        jsonrpc_http_request(
+            "tools/call";
+            session_id,
+            params=Dict("name" => "echo", "arguments" => Dict("message" => "invalid-result")),
+        ),
+    )
+    @test JSON.parse(String(invalid_result.body))["error"]["code"] == -32603
+
+    plain_result = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        jsonrpc_http_request(
+            "tools/call";
+            session_id,
+            params=Dict("name" => "echo", "arguments" => Dict("message" => "plain")),
+        ),
+    )
+    @test !haskey(JSON.parse(String(plain_result.body))["result"], "structuredContent")
+
+    call_notification = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"missing\"}}";
+            session_id,
+        ),
+    )
+    @test call_notification.status == 202
+
+    known_call_notification = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"message\":\"internal-error\"}}}";
+            session_id,
+        ),
+    )
+    @test known_call_notification.status == 202
+
+    stream = ModelContextProtocol.handle_static_stream_request(
+        server,
+        HTTP.Request("GET", "/v1/mcp"),
+    )
+    @test stream.status == 405
+
+    deleted = ModelContextProtocol.handle_static_session_delete(
+        server,
+        HTTP.Request("DELETE", "/v1/mcp", ["MCP-Session-Id" => session_id]),
+    )
+    @test deleted.status == 204
+end
+
 function stub_protected_resource(base::String)
     return JSON.json(Dict(
         "resource" => string(base, "/resource"),
@@ -788,3 +1019,124 @@ end
         end
     end
 end
+
+@testset "Spec compliance fixes" begin
+    @testset "deterministic list ordering and error codes" begin
+        server = MCPServer(name="Order Server", version="0.1.0")
+        for name in ("zeta", "alpha", "mid")
+            register_tool!(
+                server;
+                name=name,
+                handler=(::MCPRequestContext, ::Dict{String,Any}) -> Dict("content" => [Dict("type" => "text", "text" => name)]),
+            )
+        end
+        for name in ("z_prompt", "a_prompt")
+            register_prompt!(
+                server;
+                name=name,
+                handler=(::MCPRequestContext, ::Dict{String,Any}) -> Dict("messages" => Any[]),
+            )
+        end
+        for uri in ("memory://z", "memory://a")
+            register_resource!(
+                server;
+                uri=uri,
+                handler=(::MCPRequestContext, ::Dict{String,Any}) -> Dict("contents" => Any[]),
+            )
+        end
+
+        init = ModelContextProtocol.handle_jsonrpc_request(
+            server,
+            jsonrpc_http_request(
+                "initialize";
+                id="init",
+                params=Dict(
+                    "protocolVersion" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
+                    "capabilities" => Dict{String,Any}(),
+                ),
+            ),
+        )
+        session_id = HTTP.header(init, "MCP-Session-Id")
+        ModelContextProtocol.handle_jsonrpc_request(
+            server,
+            jsonrpc_http_request("notifications/initialized"; id=nothing, session_id),
+        )
+        respond(method; params=Dict{String,Any}()) = JSON.parse(String(ModelContextProtocol.handle_jsonrpc_request(
+            server,
+            jsonrpc_http_request(method; params, session_id),
+        ).body))
+
+        listed = respond("tools/list")
+        @test [t["name"] for t in listed["result"]["tools"]] == ["alpha", "mid", "zeta"]
+        prompts = respond("prompts/list")
+        @test [p["name"] for p in prompts["result"]["prompts"]] == ["a_prompt", "z_prompt"]
+        resources = respond("resources/list")
+        @test [r["uri"] for r in resources["result"]["resources"]] == ["memory://a", "memory://z"]
+
+        unknown_tool = respond("tools/call"; params=Dict{String,Any}("name" => "missing"))
+        @test unknown_tool["error"]["code"] == -32602
+        unknown_prompt = respond("prompts/get"; params=Dict{String,Any}("name" => "missing"))
+        @test unknown_prompt["error"]["code"] == -32602
+        unknown_resource = respond("resources/read"; params=Dict{String,Any}("uri" => "memory://missing"))
+        @test unknown_resource["error"]["code"] == -32002
+    end
+
+    @testset "streamed POST responses" begin
+        router = HTTP.Router()
+        HTTP.register!(router, "POST", "/mcp", req -> begin
+            payload = JSON.parse(String(req.body))
+            method = get(payload, "method", "")
+            id = get(payload, "id", nothing)
+            if method == "initialize"
+                body = JSON.json(Dict(
+                    "jsonrpc" => "2.0",
+                    "id" => id,
+                    "result" => Dict(
+                        "protocolVersion" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
+                        "capabilities" => Dict{String,Any}(),
+                        "serverInfo" => Dict("name" => "Streamed Stub", "version" => "0.1.0"),
+                    ),
+                ))
+                return HTTP.Response(200, ["Content-Type" => "application/json", "MCP-Session-Id" => "streamed-session"], body)
+            elseif id === nothing
+                return HTTP.Response(202)
+            else
+                notification = JSON.json(Dict(
+                    "jsonrpc" => "2.0",
+                    "method" => "notifications/message",
+                    "params" => Dict("level" => "info", "data" => "stream-note"),
+                ))
+                response = JSON.json(Dict(
+                    "jsonrpc" => "2.0",
+                    "id" => id,
+                    "result" => Dict("tools" => [Dict("name" => "streamed")]),
+                ))
+                body = string(
+                    "event: message\ndata: ", notification, "\n\n",
+                    "data: ", response, "\n\n",
+                )
+                return HTTP.Response(200, ["Content-Type" => "text/event-stream"], body)
+            end
+        end)
+        stub = HTTP.serve!(router, "127.0.0.1", 0; verbose=false)
+        try
+            port = ModelContextProtocol.bound_http_port(stub)
+            transport = ModelContextProtocol.MCPTransportDescriptor(kind=:http, url="http://127.0.0.1:$(port)/mcp")
+            discovery = ModelContextProtocol.MCPDiscovery(manifest=Dict{String,Any}(), transports=[transport], default_transport=transport)
+            client = prepare_manual_client(discovery)
+            initialize_client!(client)
+            streamed_notes = String[]
+            register_notification_handler!(client, "notifications/message", (__, _, params) -> begin
+                push!(streamed_notes, String(get(params, "data", "")))
+                nothing
+            end)
+            tools = list_tools(client)
+            @test [t["name"] for t in tools["tools"]] == ["streamed"]
+            @test streamed_notes == ["stream-note"]
+        finally
+            close(stub)
+        end
+    end
+end
+
+include("trim_compile_tests.jl")

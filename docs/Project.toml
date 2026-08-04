@@ -1,5 +1,6 @@
 [deps]
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+ModelContextProtocol = "a630a0b0-4325-47f6-86f8-c7db38e4394e"
 
 [compat]
 Documenter = "1"

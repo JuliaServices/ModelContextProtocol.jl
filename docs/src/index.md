@@ -8,6 +8,11 @@ tests.
 
 The package currently targets MCP protocol version `2025-11-25`.
 
+For deployments that require a concrete request graph, see the
+[trim-safe static tools server](static-server.md). This API stays under the
+`ModelContextProtocol` namespace because it is a specialized alternative to
+the general server.
+
 ## Installation
 
 This JuliaServices package is currently unregistered. The General registry has
