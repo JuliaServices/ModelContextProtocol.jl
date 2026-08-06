@@ -21,7 +21,7 @@ ModelContextProtocolOAuthExt = ["OAuth"]
 [compat]
 HTTP = "1.11, 2"
 JSON = "1"
-OAuth = "2, 3"
+OAuth = "2, 3, 4"
 julia = "1.10"
 
 [extras]
