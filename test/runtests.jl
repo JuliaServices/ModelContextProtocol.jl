@@ -38,6 +38,17 @@ end
     @test params.params == Dict("realm" => "", "error" => "invalid_token")
 end
 
+@testset "Authentication parameter case" begin
+    challenges = ModelContextProtocol.extract_auth_challenges(
+        ModelContextProtocol.build_headers([
+            "WWW-Authenticate" => "Bearer RESOURCE_METADATA=\"https://example.test/Mixed\", SCOPE=\"OpenID Profile\", ReAlM=\"MiXeD\"",
+        ]))
+    @test length(challenges) == 1
+    @test challenges[1].resource_metadata == "https://example.test/Mixed"
+    @test challenges[1].scopes == ["OpenID", "Profile"]
+    @test challenges[1].challenge.params["realm"] == "MiXeD"
+end
+
 mutable struct StubState
     headers::Vector{Dict{String,String}}
     cancellations::Vector{Dict{String,Any}}

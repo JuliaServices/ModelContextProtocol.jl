@@ -219,7 +219,7 @@ function parse_www_authenticate(header::AbstractString)
                 idx = Base.nextind(header, idx)
                 idx = skip_spaces(header, idx, stop)
                 value, idx = read_value(header, idx, stop)
-                params[String(key)] = value
+                params[lowercase(key)] = value
                 seen_param = true
             else
                 if seen_param || token !== nothing
