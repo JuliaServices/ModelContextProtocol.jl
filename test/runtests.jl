@@ -5,6 +5,22 @@ using OAuth
 using Sockets
 using ModelContextProtocol
 
+@testset "Authentication parameter whitespace" begin
+    for whitespace in (" ", "\t", " \t "), quoted in (false, true)
+        metadata = "https://example.com/meta"
+        value = quoted ? string('"', metadata, '"') : metadata
+        header = "Bearer realm=\"api\", resource_metadata$(whitespace)=$(whitespace)$(value), scope$(whitespace)=\"openid profile\", Basic realm=\"other\""
+        challenges = ModelContextProtocol.extract_auth_challenges(
+            ModelContextProtocol.build_headers(["WWW-Authenticate" => header]))
+        @test length(challenges) == 2
+        @test challenges[1].challenge.scheme == "Bearer"
+        @test challenges[1].resource_metadata == metadata
+        @test challenges[1].scopes == ["openid", "profile"]
+        @test challenges[2].challenge.scheme == "Basic"
+        @test challenges[2].challenge.params["realm"] == "other"
+    end
+end
+
 mutable struct StubState
     headers::Vector{Dict{String,String}}
     cancellations::Vector{Dict{String,Any}}
@@ -378,7 +394,7 @@ function start_auth_stub_server()
     HTTP.register!(router, "GET", "/.well-known/auth-required.json", req -> begin
         host = HTTP.header(req, "Host")
         base = string("http://", host)
-        header = "Bearer resource_metadata=\"$(base)/.well-known/protected-resource\" scope=\"openid profile\""
+        header = "Bearer realm=\"api\", resource_metadata = \"$(base)/.well-known/protected-resource\", scope = \"openid profile\""
         HTTP.Response(401, ["WWW-Authenticate" => header], "")
     end)
     HTTP.register!(router, "GET", "/.well-known/protected-resource", req -> begin
