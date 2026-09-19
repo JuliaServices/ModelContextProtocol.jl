@@ -66,11 +66,7 @@ function perform_manifest_request(url::String, headers::Vector{HeaderPair}; http
     end
     response = http.request("GET", url; headers=request_headers, status_exception=false, transport_timeout_kwargs(DISCOVERY_TIMEOUT)...)
     if verbose
-        body_text = try
-            String(response.body)
-        catch err
-            string("(unavailable: ", sprint(showerror, err), ")")
-        end
+        body_text = client_response_body_text(response; streaming=false)
         header_pairs = headers_to_pairs(response.headers)
         printable_response = HTTP.Response(response.status, header_pairs, body_text)
         println("MCP discovery HTTP response:")

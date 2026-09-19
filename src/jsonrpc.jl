@@ -31,7 +31,7 @@ const JSONRPC_TIMEOUT = (connecttimeout=10, readtimeout=120)
 
 function client_request_body_text(body)
     body === nothing && return ""
-    return body isa AbstractString ? String(body) : String(body)
+    return body isa AbstractVector{UInt8} ? String(copy(body)) : String(body)
 end
 
 function client_response_body_text(response::HTTP.Response; streaming::Bool)
@@ -39,7 +39,7 @@ function client_response_body_text(response::HTTP.Response; streaming::Bool)
         return "(streaming body not logged)"
     end
     try
-        return String(response.body)
+        return client_request_body_text(response.body)
     catch err
         return string("(unavailable: ", sprint(showerror, err), ")")
     end

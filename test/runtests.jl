@@ -480,6 +480,36 @@ stop_auth_stub_server(server) = close(server)
     @test ModelContextProtocol.find_session(shared_store, session_id) === nothing
 end
 
+@testset "verbose logging preserves message bodies" begin
+    text = "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{}}"
+    for wrap in (identity, x -> @view(x[:]), x -> codeunits(String(x)))
+        body = wrap(collect(codeunits(text)))
+        expected = collect(body)
+        @test ModelContextProtocol.client_request_body_text(body) == text
+        @test body == expected
+        response = HTTP.Response(200, [], body)
+        @test ModelContextProtocol.client_response_body_text(response; streaming=false) == text
+        @test response.body == expected
+    end
+    @test ModelContextProtocol.client_request_body_text(nothing) == ""
+    @test ModelContextProtocol.client_request_body_text(text) == text
+    _state, http_server = start_mcp_test_server()
+    try
+        redirect_stdout(devnull) do
+            discovery = discover_server(base_url(http_server); verbose=true)
+            client = prepare_manual_client(discovery; config=MCPClientConfig(verbose=true))
+            init = initialize_client!(client)
+            @test init["serverInfo"]["name"] == "Stub MCP Server"
+            @test client.initialized
+            @test isempty(ping(client))
+            @test !isempty(list_tools(client))
+            terminate_session!(client)
+        end
+    finally
+        stop_mcp_test_server(http_server)
+    end
+end
+
 @testset "MCP client over HTTP" begin
     state, http_server = start_mcp_test_server()
     base = base_url(http_server)
