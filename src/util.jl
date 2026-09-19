@@ -197,10 +197,25 @@ function parse_www_authenticate(header::AbstractString)
                 end
             end
             key_start = idx
-            key, idx = read_token(header, idx, stop)
+            key, after_key = read_token(header, idx, stop)
             isempty(key) && break
-            idx = skip_spaces(header, idx, stop)
+            idx = skip_spaces(header, after_key, stop)
             if idx <= stop && header[idx] == '='
+                # A token68 can end in padding, while auth-param needs a value.
+                if !seen_param && token === nothing && idx == after_key
+                    padding_end = idx
+                    while padding_end <= stop && header[padding_end] == '='
+                        padding_end = Base.nextind(header, padding_end)
+                    end
+                    next = skip_spaces(header, padding_end, stop)
+                    if (next > stop || header[next] == ',') &&
+                            all(c -> 'A' <= c <= 'Z' || 'a' <= c <= 'z' ||
+                                '0' <= c <= '9' || c in ('-', '.', '_', '~', '+', '/'), key)
+                        token = String(SubString(header, key_start, Base.prevind(header, padding_end)))
+                        idx = next
+                        break
+                    end
+                end
                 idx = Base.nextind(header, idx)
                 idx = skip_spaces(header, idx, stop)
                 value, idx = read_value(header, idx, stop)
