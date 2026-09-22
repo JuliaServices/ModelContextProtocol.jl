@@ -5,8 +5,6 @@ using OAuth
 using Sockets
 using ModelContextProtocol
 
-include("response_ids.jl")
-
 @testset "Authentication parameter whitespace" begin
     for whitespace in (" ", "\t", " \t "), quoted in (false, true)
         metadata = "https://example.com/meta"
