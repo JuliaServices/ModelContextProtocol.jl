@@ -106,6 +106,10 @@ For a stateless client, set
 The same `initialize_client!` call then performs `server/discover` instead of
 the legacy initialization handshake.
 
+The client rejects result responses whose JSON-RPC ID does not match the
+request. A rejected initialization response does not establish a session or
+send an initialized notification.
+
 ## OAuth
 
 For OAuth-protected MCP servers, use `OAuth.jl` to acquire a token and attach it

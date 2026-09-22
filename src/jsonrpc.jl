@@ -108,18 +108,20 @@ function jsonrpc_call(
         push!(header_pairs, normalize_pair("Mcp-Timeout-Ms", string(timeout_value)))
     end
     response = submit_jsonrpc_request(client, body; headers=header_pairs, timeout=timeout)
-    if String(method) == JSONRPC_METHOD_INITIALIZE
-        session_header = http_header_value(response.headers, "MCP-Session-Id")
-        if session_header !== nothing && !isempty(strip(String(session_header)))
-            client.session_id = String(session_header)
-        end
-    end
     notification && return nothing
     isempty(response.body) && throw(mcp_error(:jsonrpc_error, "JSON-RPC response from $(client.transport.url) was empty"))
     if is_event_stream_response(response)
         data = extract_streamed_jsonrpc_response(client, response, payload["id"])
     else
         data = parse_jsonrpc_response(response.body)
+        get(data, "id", nothing) == payload["id"] ||
+            throw(mcp_error(:jsonrpc_error, "JSON-RPC response did not match request $(payload["id"])"))
+    end
+    if method_str == JSONRPC_METHOD_INITIALIZE
+        session_header = http_header_value(response.headers, "MCP-Session-Id")
+        if session_header !== nothing && !isempty(strip(String(session_header)))
+            client.session_id = String(session_header)
+        end
     end
     return get(data, "result", nothing)
 end
