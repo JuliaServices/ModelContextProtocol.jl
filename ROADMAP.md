@@ -32,8 +32,6 @@ The repository tests these areas:
 - OAuth 2 and OAuth 3 compatibility.
 - Stateful and stateless HTTP client/server integration.
 - Strict JSON-RPC parsing and notification side-effect rules.
-- Client result response IDs must match the request before results or session
-  state are accepted.
 - MCP Apps resource and tool metadata.
 - Official MCP conformance scenarios for stateless metadata, capability
   checks, standard request headers, and `x-mcp-header` behavior.
