@@ -72,6 +72,9 @@ function jsonrpc_call(
     timeout=nothing,
     timeout_ms=nothing,
 )
+    if client.transport.kind == :stdio
+        return stdio_jsonrpc_call(client, method; params, notification, headers, timeout, timeout_ms)
+    end
     ensure_http_transport(client.transport)
     ensure_client_readiness(client, String(method), notification)
     method_str = String(method)
@@ -273,7 +276,7 @@ end
 
 function ensure_client_readiness(client::MCPClient, method::AbstractString, notification::Bool)
     if client_is_modern(client)
-        method == JSONRPC_METHOD_NOTIFICATIONS_CANCELLED &&
+        method == JSONRPC_METHOD_NOTIFICATIONS_CANCELLED && client.transport.kind == :http &&
             throw(mcp_error(:unsupported_protocol_version, "Streamable HTTP cancellation in the 2026-07-28 protocol closes the response stream"))
         method in LEGACY_ONLY_METHODS && throw(mcp_error(:unsupported_protocol_version, "$(method) is not part of the 2026-07-28 protocol"))
         return
@@ -281,7 +284,8 @@ function ensure_client_readiness(client::MCPClient, method::AbstractString, noti
     if method == JSONRPC_METHOD_INITIALIZE
         return
     elseif method == JSONRPC_METHOD_NOTIFICATIONS_INITIALIZED
-        client.session_id === nothing && throw(mcp_error(:session_required, "Cannot send notifications/initialized before establishing a session"))
+        ready = client.transport.kind == :stdio ? client.session !== nothing : client.session_id !== nothing
+        ready || throw(mcp_error(:session_required, "Cannot send notifications/initialized before establishing a session"))
         return
     end
     client.initialized || throw(mcp_error(:not_initialized, "Client must complete initialization before calling $(method)"))

@@ -1757,4 +1757,5 @@ end
         end
     end
 end
+include("stdio.jl")
 include("trim_compile_tests.jl")
