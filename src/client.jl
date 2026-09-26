@@ -117,8 +117,8 @@ apply_mrtr_params!(params::Dict{String,Any}, input_responses, request_state) = b
     params
 end
 
-function custom_tool_headers(client::MCPClient, name::String, arguments)
-    client_is_modern(client) || return HeaderPair[]
+function prepare_tool_arguments(client::MCPClient, name::String, arguments)
+    client_is_modern(client) || return arguments, HeaderPair[]
     if !haskey(client.tool_schemas, name)
         cursor = nothing
         seen_cursors = Set{String}()
@@ -134,12 +134,16 @@ function custom_tool_headers(client::MCPClient, name::String, arguments)
         end
     end
     schema = get(client.tool_schemas, name, nothing)
-    schema === nothing && return HeaderPair[]
+    schema === nothing && return arguments, HeaderPair[]
+    request_arguments = arguments
     args = if arguments === nothing
         Dict{String,Any}()
     elseif arguments isa AbstractDict || arguments isa NamedTuple
-        parsed = JSON.parse(JSON.json(arguments))
+        encoded = JSON.json(arguments)
+        parsed = JSON.parse(encoded)
         parsed isa AbstractDict || throw(ArgumentError("tool arguments must lower to a JSON object"))
+        # Use the same lowered values for custom headers and the request body.
+        request_arguments = JSON.JSONText(encoded)
         to_json_dict(parsed)
     else
         throw(ArgumentError("tool arguments must be a dictionary or named tuple"))
@@ -150,17 +154,18 @@ function custom_tool_headers(client::MCPClient, name::String, arguments)
         present || continue
         push!(headers, normalize_pair("Mcp-Param-$(spec.name)", encode_mcp_header_value(value, spec.type)))
     end
-    return headers
+    return request_arguments, headers
 end
 
 function call_tool(client::MCPClient, name::AbstractString; arguments=nothing, headers=nothing, timeout_ms=nothing, input_responses=nothing, request_state=nothing, meta=nothing)
     tool_name = String(name)
     params = Dict{String,Any}("name" => tool_name)
-    arguments !== nothing && (params["arguments"] = arguments)
     meta !== nothing && (params["_meta"] = to_string_dict(meta))
     apply_mrtr_params!(params, input_responses, request_state)
     request_headers = normalize_headers(headers)
-    append!(request_headers, custom_tool_headers(client, tool_name, arguments))
+    request_arguments, tool_headers = prepare_tool_arguments(client, tool_name, arguments)
+    arguments !== nothing && (params["arguments"] = request_arguments)
+    append!(request_headers, tool_headers)
     return jsonrpc_call(client, JSONRPC_METHOD_TOOLS_CALL; params=params, headers=request_headers, timeout_ms=timeout_ms)
 end
 
