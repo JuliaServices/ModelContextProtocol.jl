@@ -37,6 +37,8 @@ The repository tests these areas:
 - MCP Apps resource and tool metadata.
 - Official MCP conformance scenarios for stateless metadata, capability
   checks, standard request headers, and `x-mcp-header` behavior.
+- Modern tool calls use the same serialized arguments for custom headers and
+  the request body, including custom JSON lowering and duplicate object keys.
 - JuliaC trim compilation for the static server.
 - Documenter build and doctests.
 
