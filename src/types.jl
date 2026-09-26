@@ -258,6 +258,31 @@ Base.@kwdef struct MCPAuthenticationChallenge
     scopes::Vector{String}
 end
 
+struct StdioWrite
+    body::String
+    done::Channel{Any}
+    deadline::Float64
+end
+
+mutable struct StdioConnection
+    process::Base.Process
+    lock::ReentrantLock
+    changed::Threads.Condition
+    pending::Dict{String,Channel{Any}}
+    outgoing::Channel{StdioWrite}
+    events::Channel{JSONDict}
+    queued_writes::Int
+    queued_events::Int
+    failure::Union{Nothing,Exception}
+    reader::Union{Nothing,Task}
+    writer::Union{Nothing,Task}
+    callbacks::Union{Nothing,Task}
+    input_closer::Union{Nothing,Task}
+    shutdown::Union{Nothing,Task}
+    max_message_bytes::Int
+    max_pending_messages::Int
+end
+
 mutable struct MCPClient
     manifest::JSONDict
     transport::MCPTransportDescriptor
@@ -278,15 +303,19 @@ mutable struct MCPClient
     event_task::Union{Task,Nothing}
     last_event_id::Union{String,Nothing}
     tool_schemas::Dict{String,Dict{String,Any}}
+    stdio::Union{Nothing,StdioConnection}
 end
 
 # Preserve the public positional client constructors that predate modern
-# request metadata and the internal tool-schema cache.
+# request metadata, the internal tool-schema cache, and stdio ownership.
 MCPClient(manifest, transport, protocol_version, http, headers, timeout, verbose, auth_token, session, session_id, initialized, next_id, notification_handlers, request_handlers, event_task, last_event_id) =
     MCPClient(manifest, transport, protocol_version, http, headers, timeout, verbose, Dict{String,Any}(), Dict{String,Any}(), auth_token, session, session_id, initialized, next_id, notification_handlers, request_handlers, event_task, last_event_id, Dict{String,Dict{String,Any}}())
 
 MCPClient(manifest, transport, protocol_version, http, headers, timeout, verbose, capabilities, client_info, auth_token, session, session_id, initialized, next_id, notification_handlers, request_handlers, event_task, last_event_id) =
     MCPClient(manifest, transport, protocol_version, http, headers, timeout, verbose, capabilities, client_info, auth_token, session, session_id, initialized, next_id, notification_handlers, request_handlers, event_task, last_event_id, Dict{String,Dict{String,Any}}())
+
+MCPClient(manifest, transport, protocol_version, http, headers, timeout, verbose, capabilities, client_info, auth_token, session, session_id, initialized, next_id, notification_handlers, request_handlers, event_task, last_event_id, tool_schemas) =
+    MCPClient(manifest, transport, protocol_version, http, headers, timeout, verbose, capabilities, client_info, auth_token, session, session_id, initialized, next_id, notification_handlers, request_handlers, event_task, last_event_id, tool_schemas, nothing)
 
 # A live subscriptions/listen stream (2026-07-28): notifications matching the
 # opted-in filter are pushed onto the channel by the server broadcast helpers.

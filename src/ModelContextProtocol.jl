@@ -14,6 +14,7 @@ include("jsonrpc.jl")
 include("server.jl")
 include("static_server.jl")
 include("client.jl")
+include("stdio.jl")
 include("apps.jl")
 
 export MCPError, MCPAuthenticationRequired

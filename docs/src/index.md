@@ -1,16 +1,19 @@
 # ModelContextProtocol.jl
 
 `ModelContextProtocol.jl` provides Julia server and client utilities for the
-Model Context Protocol (MCP). It focuses on Streamable HTTP servers, discovery
-manifests, OAuth-protected resources, JSON-RPC request handling, tools, prompts,
-resources, completions, logging notifications, and lightweight client smoke
-tests.
+Model Context Protocol (MCP). It supports Streamable HTTP servers and clients,
+local subprocess clients, discovery manifests, OAuth-protected resources,
+JSON-RPC request handling, tools, prompts, resources, completions, and logging
+notifications.
 
 The package supports the stateful MCP `2025-11-25` protocol and the stateless
 MCP `2026-07-28` protocol over Streamable HTTP. Clients default to
 `2025-11-25` for compatibility. See [MCP 2026-07-28](protocol-2026.md) for
 modern client setup, capability checks, multi-round-trip results, custom
 headers, and subscriptions.
+
+For a server launched as a local command, see the [stdio client guide](stdio.md).
+The same initialization, list, and call APIs work with an owned child process.
 
 For deployments that require a concrete request graph, see the
 [trim-safe static tools server](static-server.md). This API stays under the
