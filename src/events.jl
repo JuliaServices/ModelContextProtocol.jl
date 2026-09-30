@@ -509,7 +509,7 @@ function request_event_webhook(url, address::IPAddr, headers, body, timeout)
     curl = Downloads.Curl
     addresses = curl.curl_slist_append(C_NULL, "::$(connect_host):$(uri.port)")
     addresses == C_NULL && throw(callback_failure("connection_refused"))
-    downloader = Downloads.Downloader()
+    downloader = Downloads.Downloader(; grace=0)
     downloader.easy_hook = function (easy, _info)
         for (option, value) in (
             (curl.CURLOPT_CONNECT_TO, addresses), (curl.CURLOPT_FOLLOWLOCATION, 0),

@@ -738,6 +738,12 @@ end
             @test EventsMCP.verify_event_webhook(EVENT_SECRET, only(received).headers, only(received).body; now=fixture.now[])
             @test only(EventsMCP.emit_event!(fixture.server, "comment.created", event_data())).accepted
             @test length(received) == 2
+            # Each delivery closes its connection instead of idling in a connection cache.
+            if !Sys.iswindows() && Sys.which("lsof") !== nothing
+                connected() = !isempty(readlines(ignorestatus(
+                    `lsof -nP -a -p $(getpid()) -iTCP:$(port) -sTCP:ESTABLISHED -t`)))
+                @test timedwait(() -> !connected(), 5) == :ok
+            end
             wrong_host = event_params(url="https://wrong.test:$(port)/hook")
             _, rejected = event_request(fixture.server, "events/subscribe", wrong_host)
             @test rejected["error"]["code"] == -32015
