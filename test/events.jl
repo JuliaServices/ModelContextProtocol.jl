@@ -833,6 +833,25 @@ end
             foreach(_ -> put!(turns, nothing), urls)
         end
     end
+
+    # A request that waited for that turn rechecks access before it saves.
+    while isready(turns)
+        take!(turns)
+    end
+    allowed = Ref(true)
+    guarded = (_owner, _name, arguments) -> arguments === nothing || arguments["resource"] == "shared" || allowed[]
+    fixture = event_fixture(request=holding, authorize=guarded)
+    holder[] = fixture
+    first_request = @async event_request(fixture.server, "events/subscribe", event_params())
+    @test timedwait(() -> isready(held), 10) == :ok
+    take!(held)
+    waiting = @async event_request(fixture.server, "events/subscribe", event_params(arguments=Dict("resource" => "alpha")))
+    foreach(_ -> yield(), 1:20)
+    allowed[] = false
+    put!(turns, nothing)
+    @test timedwait(() -> istaskdone(first_request) && istaskdone(waiting), 10) == :ok
+    @test fetch(waiting)[2]["error"]["code"] == -32012
+    @test only(event_records(fixture)).arguments["resource"] == "shared"
 end
 
 @testset "Seeded subscription state-machine fuzz" begin

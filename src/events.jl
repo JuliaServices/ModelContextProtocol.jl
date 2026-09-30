@@ -668,6 +668,7 @@ function subscribe_event(server::MCPServer, context::MCPRequestContext, params::
     # that share a receiver host. The cooldown key ignores host spelling: DNS
     # names ignore case and a trailing dot, and IPv6 literals have many forms.
     cooldown = (principal, occursin(':', uri.host) ? string(parse(IPv6, uri.host)) : lowercase(rstrip(uri.host, '.')))
+    waited = false
     verifying = @lock events.lock begin
         # Check quotas before any callback traffic. A live subscription from
         # this principal to this URL shows the endpoint already consented.
@@ -679,6 +680,7 @@ function subscribe_event(server::MCPServer, context::MCPRequestContext, params::
             check_event_quota(events, records, principal, id)
             consented = any(record -> record.principal == principal && record.url == uri.url, records)
             (consented || !(principal in events.verifying)) && break
+            waited = true
             wait(events.lock)
         end
         if !consented
@@ -695,9 +697,10 @@ function subscribe_event(server::MCPServer, context::MCPRequestContext, params::
         if verifying
             verify_event_callback(events, uri, id, secret)
             verified = true
-            # Access can change while the endpoint answers.
-            event_authorized(events, principal, name, arguments) || throw(event_error(-32012, "Forbidden"))
         end
+        # Access can change while this request waits or the endpoint answers.
+        (verifying || waited) && !event_authorized(events, principal, name, arguments) &&
+            throw(event_error(-32012, "Forbidden"))
         return @lock events.lock begin
             records = live_event_subscriptions!(events)
             check_event_quota(events, records, principal, id)
