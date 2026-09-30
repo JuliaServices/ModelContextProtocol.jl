@@ -989,8 +989,12 @@ end
     try
         port = EventsMCP.bound_http_port(http)
         url = "https://callback.test:$(port)/hook"
-        withenv("JULIA_SSL_CA_ROOTS_PATH" => authority, "https_proxy" => "http://127.0.0.1:1",
-            "HTTPS_PROXY" => "http://127.0.0.1:1") do
+        # Windows environment names ignore case. Setting both spellings there
+        # makes withenv restore one of them afterwards, leaving a dead proxy
+        # for later tests and subprocesses.
+        proxy = "http://127.0.0.1:1"
+        proxies = Sys.iswindows() ? ("HTTPS_PROXY" => proxy,) : ("https_proxy" => proxy, "HTTPS_PROXY" => proxy)
+        withenv("JULIA_SSL_CA_ROOTS_PATH" => authority, proxies...) do
             fixture = event_fixture(request=EventsMCP.request_event_webhook, allow_private_addresses=true)
             fixture.addresses[] = IPAddr[ip"127.0.0.1"]
             _, subscribed = event_request(fixture.server, "events/subscribe", event_params(url=url))
