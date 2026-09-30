@@ -230,6 +230,11 @@ end
     @test finite["result"]["refreshBefore"] == EventsMCP.event_iso8601(fixture.now[] + 10)
     _, clamped = event_request(fixture.server, "events/subscribe", event_params(ttl_ms=big(10)^30))
     @test clamped["result"]["refreshBefore"] == EventsMCP.event_iso8601(fixture.now[] + 10)
+    # TTL values are clamped, never rejected.
+    for ttl in (0, -1)
+        _, short = event_request(fixture.server, "events/subscribe", event_params(ttl_ms=ttl))
+        @test short["result"]["refreshBefore"] == EventsMCP.event_iso8601(fixture.now[] + 0.001)
+    end
     _, defaulted = event_request(fixture.server, "events/subscribe", event_params())
     @test only(event_records(fixture)).expires_at == fixture.now[] + 5
     mktempdir() do directory
@@ -390,7 +395,7 @@ end
         ("name", Any[nothing, true, 12, [], Dict(), "", repeat("x", 257)]),
         ("arguments", Any[nothing, 42, [], "text", Dict(), Dict("resource" => 1), Dict("resource" => "shared", "extra" => true)]),
         ("delivery", Any[nothing, true, [], "webhook", Dict(), Dict("mode" => "webhook")]),
-        ("ttlMs", Any[false, true, 0, -1, 1.5, "1000", [], Dict()]),
+        ("ttlMs", Any[false, true, 1.5, "1000", [], Dict()]),
     )
     for _ in 1:2000
         params = event_params()

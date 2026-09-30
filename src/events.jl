@@ -654,14 +654,14 @@ end
 event_iso8601(timestamp) = Dates.format(Dates.unix2datetime(timestamp), dateformat"yyyy-mm-ddTHH:MM:SS.sss") * "Z"
 
 # Omitted ttlMs gets the default. null asks for no expiry, which is never
-# granted, so it gets the longest finite lifetime. Longer requests are clamped.
+# granted, so it gets the longest finite lifetime. The draft has no rejection
+# path for TTL values, so other integers are clamped to 1 ms through the cap.
 function event_ttl_ms(events::MCPEvents, params)
     haskey(params, "ttlMs") || return events.default_ttl_ms
     ttl = params["ttlMs"]
     ttl === nothing && return events.max_ttl_ms
-    ttl isa Integer && !(ttl isa Bool) && ttl > 0 ||
-        throw(mcp_error(:invalid_params, "ttlMs must be a positive integer or null"))
-    return ttl > events.max_ttl_ms ? events.max_ttl_ms : Int(ttl)
+    ttl isa Integer && !(ttl isa Bool) || throw(mcp_error(:invalid_params, "ttlMs must be an integer or null"))
+    return Int(clamp(ttl, 1, events.max_ttl_ms))
 end
 
 function subscribe_event(server::MCPServer, context::MCPRequestContext, params::JSONDict)
