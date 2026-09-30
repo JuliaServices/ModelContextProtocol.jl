@@ -96,6 +96,19 @@ function write_event_store(store::FileEventSubscriptionStore, records)
         # Use the same libuv operation directly, failing without a fallback.
         result = ccall(:jl_fs_rename, Int32, (Cstring, Cstring), temporary, store.path)
         result < 0 && Base.uv_error("rename event subscription store", result)
+        # Persist the rename itself. Best effort: some filesystems cannot sync a
+        # directory, and the complete new file is already in place.
+        if !Sys.iswindows()
+            try
+                directory = Base.Filesystem.open(dirname(store.path), Base.Filesystem.JL_O_RDONLY)
+                try
+                    ccall(:fsync, Cint, (Cint,), fd(directory))
+                finally
+                    close(directory)
+                end
+            catch
+            end
+        end
     finally
         isopen(io) && close(io)
         isfile(temporary) && rm(temporary)
