@@ -75,6 +75,7 @@ function subscription_record(subscription::MCPWebhookSubscription)
         "expiresAt" => subscription.expires_at,
         "previousSecret" => subscription.previous_secret,
         "previousSecretUntil" => subscription.previous_secret_until,
+        "instance" => subscription.instance,
     )
 end
 
@@ -207,9 +208,10 @@ function FileEventSubscriptionStore(path::AbstractString)
             previous_until isa Real && !(previous_until isa Bool) && isfinite(previous_until) || error("Invalid rotation expiry")
             previous_secret = get(record, "previousSecret", nothing)
             previous_secret === nothing || event_webhook_key(previous_secret)
+            instance = event_string(record["instance"], "instance")
             store.state.records[id] = MCPWebhookSubscription(
                 id, principal, name, arguments, url, secret, Float64(expires_at),
-                previous_secret, Float64(previous_until),
+                previous_secret, Float64(previous_until), instance,
             )
         end
     catch
@@ -692,6 +694,7 @@ function subscribe_event(server::MCPServer, context::MCPRequestContext, params::
             id, principal, name, deepcopy(arguments), uri.url, String(secret), expires_at,
             previous === nothing ? nothing : rotated ? previous.secret : previous.previous_secret,
             previous === nothing ? 0.0 : rotated ? now + events.rotation_grace : previous.previous_secret_until,
+            previous === nothing ? string(uuid4()) : previous.instance,
         ))
         JSONDict("id" => id, "refreshBefore" => event_iso8601(expires_at), "cursor" => nothing, "truncated" => false)
     end
@@ -719,6 +722,17 @@ function dispatch_events(server, context, params)
         unsubscribe_event(server, context, params)
 end
 
+# The access check ran without the lock. Delete only if the record is
+# unchanged, so a refresh made after access was restored survives.
+function remove_revoked_subscription!(events::MCPEvents, checked::MCPWebhookSubscription)
+    @lock events.lock begin
+        current = get_event_subscription(events.store, checked.id)
+        current !== nothing && subscription_record(current) == subscription_record(checked) &&
+            delete_event_subscription!(events.store, checked.id)
+    end
+    return nothing
+end
+
 function deliver_event!(events, subscription, body, event_id)
     status = nothing
     reason = nothing
@@ -728,8 +742,9 @@ function deliver_event!(events, subscription, body, event_id)
         # and secret rotation take effect between retries.
         current = @lock events.lock begin
             record = get_event_subscription(events.store, subscription.id)
-            if record === nothing
+            if record === nothing || record.instance != subscription.instance
                 reason = "unsubscribed"
+                record = nothing
             elseif record.expires_at <= events.clock()
                 delete_event_subscription!(events.store, record.id)
                 reason = "expired"
@@ -755,7 +770,7 @@ function deliver_event!(events, subscription, body, event_id)
                 reason = status >= 500 ? "http_5xx" : "http_4xx"
                 stop = status in (410, 413)
             else
-                @lock events.lock delete_event_subscription!(events.store, current.id)
+                remove_revoked_subscription!(events, current)
                 reason = "forbidden"
                 stop = true
             end
@@ -807,7 +822,7 @@ function emit_event!(server::MCPServer, name::AbstractString, data; event_id=str
     batches = Dict{String,Vector{Tuple{MCPWebhookSubscription,String}}}()
     for subscription in subscriptions
         if !event_authorized(events, subscription.principal, event_name, subscription.arguments)
-            @lock events.lock delete_event_subscription!(events.store, subscription.id)
+            remove_revoked_subscription!(events, subscription)
             continue
         end
         Base.invokelatest(definition.matches, subscription.principal, deepcopy(subscription.arguments), deepcopy(payload)) === true || continue

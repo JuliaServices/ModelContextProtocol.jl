@@ -524,7 +524,7 @@ end
     original = only(event_records(fixture))
     changed = EventsMCP.MCPWebhookSubscription(original.id, original.principal, original.name,
         original.arguments, original.url, original.secret, original.expires_at + 60,
-        original.previous_secret, original.previous_secret_until)
+        original.previous_secret, original.previous_secret_until, original.instance)
     mktempdir() do directory
         # Renaming a file over a directory must fail, even when tests run as root.
         broken = EventsMCP.FileEventSubscriptionStore(directory, fixture.server.events.store)
@@ -596,6 +596,55 @@ end
     receipt = only(EventsMCP.emit_event!(expired.server, "comment.created", event_data()))
     @test !receipt.accepted && receipt.reason == "timeout"
     @test isempty(event_deliveries(expired))
+
+    # A retry never reaches a subscription created after its event, even when
+    # the new subscription has the same key.
+    resubscribed = Ref{Any}(nothing)
+    recreate = function (_delay)
+        event_request(holder[].server, "events/unsubscribe", event_params())
+        resubscribed[] = event_request(holder[].server, "events/subscribe", event_params())[2]
+    end
+    recreated = event_fixture(wait=recreate)
+    holder[] = recreated
+    event_request(recreated.server, "events/subscribe", event_params())
+    push!(recreated.statuses, 500)
+    receipt = only(EventsMCP.emit_event!(recreated.server, "comment.created", event_data()))
+    @test haskey(resubscribed[], "result")
+    @test !receipt.accepted && receipt.attempts == 1 && receipt.reason == "unsubscribed"
+    @test length(event_deliveries(recreated)) == 1
+    @test length(event_records(recreated)) == 1
+
+    # A revocation check that finishes after access was restored and the
+    # subscription refreshed must not delete the refreshed subscription.
+    revoked = Ref(false)
+    armed = Ref(false)
+    entered = Channel{Nothing}(1)
+    release = Channel{Nothing}(1)
+    slow_authorize = function (_owner, _name, _arguments)
+        allowed = !revoked[]
+        if armed[]
+            armed[] = false
+            put!(entered, nothing)
+            take!(release)
+        end
+        return allowed
+    end
+    stale = event_fixture(authorize=slow_authorize)
+    event_request(stale.server, "events/subscribe", event_params())
+    revoked[] = true
+    armed[] = true
+    emission = @async EventsMCP.emit_event!(stale.server, "comment.created", event_data())
+    try
+        @test timedwait(() -> isready(entered), 10) == :ok
+        revoked[] = false
+        _, refreshed = event_request(stale.server, "events/subscribe", event_params(ttl_ms=600_000))
+        @test haskey(refreshed, "result")
+    finally
+        isready(entered) && take!(entered)
+        put!(release, nothing)
+    end
+    @test timedwait(() -> istaskdone(emission), 10) == :ok
+    @test length(event_records(stale)) == 1
 end
 
 @testset "One principal cannot stall or block another" begin

@@ -56,6 +56,9 @@ struct MCPWebhookSubscription
     expires_at::Float64
     previous_secret::Union{String,Nothing}
     previous_secret_until::Float64
+    # Random per creation. A refresh keeps it; subscribing again after the
+    # record was removed gets a new one, so older retries stop.
+    instance::String
 end
 
 struct MCPServerEvent
