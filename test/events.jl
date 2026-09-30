@@ -890,7 +890,9 @@ end
     # Public test-only key: the certificate trusts callback.test, so success
     # proves CONNECT_TO kept the original hostname for TLS verification.
     received = NamedTuple[]
+    stalled = Channel{Nothing}(1)
     handler = function (request)
+        request.target == "/slow" && (take!(stalled); return HTTP.Response(202))
         body = String(copy(request.body))
         parsed = JSON.parse(body)
         push!(received, (; target=String(request.target), headers=copy(request.headers), body, parsed))
@@ -939,6 +941,19 @@ end
             end
             @test EventsMCP.http_header_value(last(received).headers, "Authorization") === nothing
             @test length(received) == 3
+            # A deadline under a millisecond still times out rather than meaning no limit.
+            slow = @async try
+                EventsMCP.request_event_webhook("https://callback.test:$(port)/slow", ip"127.0.0.1",
+                    ["Content-Type" => "application/json"], "{}", 0.0001)
+            catch err
+                err
+            end
+            try
+                @test timedwait(() -> istaskdone(slow), 5) == :ok
+                @test istaskdone(slow) && fetch(slow) isa EventsMCP.MCPEventError
+            finally
+                put!(stalled, nothing)
+            end
             wrong_host = event_params(url="https://wrong.test:$(port)/hook")
             _, rejected = event_request(fixture.server, "events/subscribe", wrong_host)
             @test rejected["error"]["code"] == -32015

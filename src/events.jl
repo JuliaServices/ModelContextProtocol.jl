@@ -531,9 +531,10 @@ function request_event_webhook(url, address::IPAddr, headers, body, timeout)
     end
     output = IOBuffer(; maxsize=8192)
     try
+        # libcurl rounds to whole milliseconds and treats zero as no limit.
         response = Downloads.request(
             url; method="POST", input=IOBuffer(body), output=output,
-            headers=headers, timeout=timeout, downloader=downloader, throw=false,
+            headers=headers, timeout=max(timeout, 0.001), downloader=downloader, throw=false,
         )
         if response isa Downloads.RequestError
             reason = response.code == 28 ? "timeout" : response.code in (35, 51, 58, 60, 77, 83, 90, 91) ? "tls_error" : "connection_refused"
