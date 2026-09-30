@@ -3,6 +3,7 @@ const MCP_EVENT_ARGUMENT_LIMIT = 16 * 1024
 const MCP_EVENT_METHODS = ("events/list", "events/subscribe", "events/unsubscribe")
 
 function redact_event_request_body(body::String)
+    isempty(body) && return body
     payload = try
         JSON.parse(body)
     catch
@@ -639,6 +640,17 @@ end
 
 event_iso8601(timestamp) = Dates.format(Dates.unix2datetime(timestamp), dateformat"yyyy-mm-ddTHH:MM:SS.sss") * "Z"
 
+# Omitted ttlMs gets the default. null asks for no expiry, which is never
+# granted, so it gets the longest finite lifetime. Longer requests are clamped.
+function event_ttl_ms(events::MCPEvents, params)
+    haskey(params, "ttlMs") || return events.default_ttl_ms
+    ttl = params["ttlMs"]
+    ttl === nothing && return events.max_ttl_ms
+    ttl isa Integer && !(ttl isa Bool) && ttl > 0 ||
+        throw(mcp_error(:invalid_params, "ttlMs must be a positive integer or null"))
+    return ttl > events.max_ttl_ms ? events.max_ttl_ms : Int(ttl)
+end
+
 function subscribe_event(server::MCPServer, context::MCPRequestContext, params::JSONDict)
     events = require_events(server)
     principal, name, arguments, delivery, uri = event_subscription_params(events, context, params; subscribing=true)
@@ -649,12 +661,9 @@ function subscribe_event(server::MCPServer, context::MCPRequestContext, params::
     event_authorized(events, principal, name, arguments) || throw(event_error(-32012, "Forbidden"))
     secret = get(delivery, "secret", nothing)
     event_webhook_key(secret)
-    cursor = get(params, "cursor", nothing)
-    cursor === nothing || event_string(cursor, "cursor")
-    cursor === nothing || throw(event_error(-32014, "Unsupported"; feature="cursor"))
-    haskey(params, "maxAgeMs") && event_integer(params["maxAgeMs"], "maxAgeMs")
-    ttl_value = get(params, "ttlMs", nothing)
-    ttl_ms = ttl_value === nothing ? events.default_ttl_ms : min(event_integer(ttl_value, "ttlMs"; minimum=1), events.max_ttl_ms)
+    # Emit-only events cannot replay, so maxAgeMs, which only bounds replay, is ignored.
+    get(params, "cursor", nothing) === nothing || throw(event_error(-32014, "Unsupported"; feature="cursor"))
+    ttl_ms = event_ttl_ms(events, params)
     id = event_subscription_id(principal, uri.url, name, arguments)
     # Check quotas before sending any callback traffic. A live subscription
     # from this principal to this URL shows the endpoint already consented.
@@ -701,9 +710,6 @@ function unsubscribe_event(server::MCPServer, context::MCPRequestContext, params
 end
 
 function dispatch_events(server, context, params)
-    context.id === nothing && throw(mcp_error(:invalid_request, "Event methods require a request ID"))
-    context.id isa AbstractString || (context.id isa Integer && !(context.id isa Bool)) ||
-        throw(mcp_error(:invalid_request, "Invalid event request ID"))
     return context.method == "events/list" ? list_events(server, context, params) :
         context.method == "events/subscribe" ? subscribe_event(server, context, params) :
         unsubscribe_event(server, context, params)

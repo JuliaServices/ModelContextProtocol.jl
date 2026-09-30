@@ -223,8 +223,12 @@ end
     fixture.now[] += 11
     @test !only(EventsMCP.emit_event!(fixture.server, "comment.created", event_data())).accepted
     @test isempty(event_records(fixture))
+    # null asks for no expiry; the longest finite lifetime is granted instead.
     _, finite = event_request(fixture.server, "events/subscribe", event_params(ttl_ms=nothing))
-    @test finite["result"]["refreshBefore"] !== nothing
+    @test finite["result"]["refreshBefore"] == EventsMCP.event_iso8601(fixture.now[] + 10)
+    _, clamped = event_request(fixture.server, "events/subscribe", event_params(ttl_ms=big(10)^30))
+    @test clamped["result"]["refreshBefore"] == EventsMCP.event_iso8601(fixture.now[] + 10)
+    _, defaulted = event_request(fixture.server, "events/subscribe", event_params())
     @test only(event_records(fixture)).expires_at == fixture.now[] + 5
     mktempdir() do directory
         path = joinpath(directory, "subscriptions.json")
@@ -384,7 +388,6 @@ end
         ("arguments", Any[nothing, 42, [], "text", Dict(), Dict("resource" => 1), Dict("resource" => "shared", "extra" => true)]),
         ("delivery", Any[nothing, true, [], "webhook", Dict(), Dict("mode" => "webhook")]),
         ("ttlMs", Any[false, true, 0, -1, 1.5, "1000", [], Dict()]),
-        ("maxAgeMs", Any[nothing, false, -1, 0.5, "100", [], Dict()]),
     )
     for _ in 1:2000
         params = event_params()
@@ -458,6 +461,13 @@ end
     @test_throws ArgumentError EventsMCP.emit_event!(fixture.server, "comment.created", Dict("text" => "missing resource"))
     event_request(fixture.server, "events/subscribe", event_params())
     @test_throws ArgumentError EventsMCP.emit_event!(fixture.server, "comment.created", event_data(text=repeat("x", 262_144)))
+    # maxAgeMs only bounds replay, which emit-only events never do.
+    for max_age in (nothing, 300_000, "100")
+        params = event_params()
+        params["maxAgeMs"] = max_age
+        _, ignored = event_request(fixture.server, "events/subscribe", params)
+        @test haskey(ignored, "result")
+    end
 end
 
 @testset "Authorization, filtering, and persistence failure boundaries" begin
@@ -741,6 +751,7 @@ end
         @test bytes == expected
     end
     @test !occursin(EVENT_SECRET, EventsMCP.redact_event_request_body(body[1:end-1]))
+    @test EventsMCP.redact_event_request_body("") == ""
     fixture = event_fixture()
     malformed = HTTP.Request("POST", "/v1/mcp",
         ["Content-Type" => "application/json", "Accept" => "application/json, text/event-stream",
