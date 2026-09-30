@@ -14,9 +14,12 @@ function event_fixture(; store=EventsMCP.InMemoryEventSubscriptionStore(), kwarg
     verification = Ref{Any}(:echo)
     sender = function (url, address, headers, body, timeout)
         parsed = JSON.parse(body)
-        @test EventsMCP.verify_event_webhook(EVENT_SECRET, headers, body; now=now[]) ||
-            EventsMCP.verify_event_webhook("whsec_" * base64encode(fill(UInt8(42), 32)), headers, body; now=now[])
         push!(calls, (; url, address, headers=copy(headers), body, parsed, timeout))
+        # Reject bad signatures like a real receiver. Deliveries run on worker
+        # tasks, where a @test here would not reach the enclosing testset.
+        EventsMCP.verify_event_webhook(EVENT_SECRET, headers, body; now=now[]) ||
+            EventsMCP.verify_event_webhook("whsec_" * base64encode(fill(UInt8(42), 32)), headers, body; now=now[]) ||
+            return (status=401, body="")
         if get(parsed, "type", nothing) == "verification"
             verification[] isa Exception && throw(verification[])
             verification[] === :echo && return (status=200, body=JSON.json(Dict("challenge" => parsed["challenge"])))
@@ -490,10 +493,15 @@ end
     @test Set(call.parsed["data"]["text"] for call in event_deliveries(fixture)) == Set(["visible to alpha", "visible to beta"])
     @test all(record -> record.arguments["resource"] == "shared", event_records(fixture))
 
+    broken = Ref("")
     EventsMCP.register_event!(fixture.server; name="broken-transform",
         input_schema=definition.input_schema, payload_schema=definition.payload_schema,
-        matches=(_...) -> true, transform=(_...) -> Dict("resource" => "shared"))
-    event_request(fixture.server, "events/subscribe", event_params(name="broken-transform"))
+        matches=(_...) -> true, transform=(owner, _args, data) -> owner == broken[] ? Dict("resource" => "shared") : data)
+    for owner in ("alpha", "beta")
+        event_request(fixture.server, "events/subscribe", event_params(name="broken-transform"); owner=owner)
+    end
+    # Break the subscriber that sorts last, so a partial emission would be visible.
+    broken[] = last(sort(filter(record -> record.name == "broken-transform", event_records(fixture)); by=record -> record.id)).principal
     calls_before = length(fixture.calls)
     @test_throws ArgumentError EventsMCP.emit_event!(fixture.server, "broken-transform", event_data())
     @test length(fixture.calls) == calls_before
@@ -577,7 +585,7 @@ end
     @test isempty(event_deliveries(expired))
 end
 
-@testset "Verification and locks do not cross principals" begin
+@testset "One principal cannot stall or block another" begin
     # Hosted clients use one receiver host for every user, so one principal's
     # failed or repeated verifications must not block another principal.
     fixture = event_fixture(max_subscriptions=3, max_subscriptions_per_principal=3)
@@ -651,6 +659,29 @@ end
         put!(release, nothing)
     end
     @test timedwait(() -> istaskdone(delivery), 10) == :ok
+
+    # A stalled endpoint delays only its owner's deliveries in the same emission.
+    # Its subscription sorts first, so one-at-a-time delivery would stall alpha too.
+    shared = Dict("resource" => "shared")
+    alpha_id = EventsMCP.event_subscription_id("alpha", EVENT_URL, "comment.created", shared)
+    stalled = first(url for url in ("https://mallory.example/hooks/$(index)" for index in 1:100)
+        if EventsMCP.event_subscription_id("mallory", url, "comment.created", shared) < alpha_id)
+    fixture = event_fixture(request=slow)
+    holder[] = fixture
+    fixture.owners["mallory"] = true
+    event_request(fixture.server, "events/subscribe", event_params(url=stalled); owner="mallory")
+    event_request(fixture.server, "events/subscribe", event_params(); owner="alpha")
+    delivery = @async EventsMCP.emit_event!(fixture.server, "comment.created", event_data())
+    try
+        @test timedwait(() -> isready(entered), 10) == :ok
+        @test timedwait(() -> any(call -> call.url == EVENT_URL, event_deliveries(fixture)), 10) == :ok
+        @test !istaskdone(delivery)
+    finally
+        isready(entered) && take!(entered)
+        put!(release, nothing)
+    end
+    @test timedwait(() -> istaskdone(delivery), 10) == :ok
+    @test length(fetch(delivery)) == 2 && all(receipt -> receipt.accepted, fetch(delivery))
 end
 
 @testset "Seeded subscription state-machine fuzz" begin

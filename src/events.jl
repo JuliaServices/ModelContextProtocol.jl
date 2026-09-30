@@ -777,21 +777,24 @@ retry. One event ID and exact body are preserved; each attempt is signed anew.
 
 Return delivery receipts (subscription_id, accepted, attempts, status, reason).
 The caller owns queuing and recovery of failed or interrupted emissions.
-No replay is advertised; cursor is always null. Delivery is sequential, with no
-background task or unbounded queue.
+No replay is advertised; cursor is always null. Every body is built and
+validated before any is sent. Each owner's subscriptions are delivered in
+order, and different owners concurrently, so a slow endpoint delays only its
+owner. The call returns after every delivery finishes.
 """
 function emit_event!(server::MCPServer, name::AbstractString, data; event_id=string(uuid4()), timestamp=time())
     events = require_events(server)
     event_name = event_string(name, "name"; max_bytes=256)
     id = event_header_id(event_id)
     timestamp isa Real && !(timestamp isa Bool) && isfinite(timestamp) || throw(ArgumentError("timestamp must be finite Unix seconds"))
+    occurred_at = event_iso8601(timestamp)
     definition = @lock events.lock get(events.definitions, event_name, nothing)
     definition === nothing && throw(ArgumentError("Unknown event name"))
     payload = event_object(data, "data")
     JSONSchema.isvalid(definition.payload_validator, payload) || throw(ArgumentError("Data does not match the event payloadSchema"))
     subscriptions = filter(subscription -> subscription.name == event_name, event_subscriptions(events.store))
     sort!(subscriptions; by=subscription -> subscription.id)
-    receipts = NamedTuple[]
+    batches = Dict{String,Vector{Tuple{MCPWebhookSubscription,String}}}()
     for subscription in subscriptions
         if !event_authorized(events, subscription.principal, event_name, subscription.arguments)
             @lock events.lock delete_event_subscription!(events.store, subscription.id)
@@ -801,13 +804,25 @@ function emit_event!(server::MCPServer, name::AbstractString, data; event_id=str
         transformed = event_object(Base.invokelatest(definition.transform, subscription.principal, deepcopy(subscription.arguments), deepcopy(payload)), "transformed data")
         JSONSchema.isvalid(definition.payload_validator, transformed) || throw(ArgumentError("Transformed data does not match the event payloadSchema"))
         body = JSON.json(JSONDict(
-            "eventId" => id, "name" => event_name, "timestamp" => event_iso8601(timestamp),
+            "eventId" => id, "name" => event_name, "timestamp" => occurred_at,
             "data" => transformed, "cursor" => nothing,
         ))
         ncodeunits(body) <= MCP_EVENT_BODY_LIMIT || throw(ArgumentError("Event body exceeds 256 KiB"))
-        push!(receipts, deliver_event!(events, subscription, body, id))
+        push!(get!(() -> Tuple{MCPWebhookSubscription,String}[], batches, subscription.principal), (subscription, body))
     end
-    return receipts
+    owners = collect(values(batches))
+    receipts = Vector{Vector{NamedTuple}}(undef, length(owners))
+    queue = Channel{Int}(length(owners))
+    foreach(index -> put!(queue, index), eachindex(owners))
+    close(queue)
+    # ponytail: fixed pool of delivery tasks; make it configurable if a
+    # deployment needs more parallel callbacks per emission.
+    @sync for _ in 1:min(16, length(owners))
+        @async for index in queue
+            receipts[index] = NamedTuple[deliver_event!(events, subscription, body, id) for (subscription, body) in owners[index]]
+        end
+    end
+    return sort!(reduce(vcat, receipts; init=NamedTuple[]); by=receipt -> receipt.subscription_id)
 end
 
 """List discoverable event definitions over a client's MCP 2026-07-28 endpoint."""
