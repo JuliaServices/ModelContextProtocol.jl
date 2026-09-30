@@ -1093,6 +1093,13 @@ function manifest_capabilities(server::MCPServer)
     return capabilities
 end
 
+# MCP Events are defined only for 2026-07-28 and later protocol versions.
+function version_capabilities(server::MCPServer, version::AbstractString)
+    capabilities = manifest_capabilities(server)
+    is_modern_protocol_version(version) || pop!(capabilities, "events", nothing)
+    return capabilities
+end
+
 function default_manifest(config::MCPServerConfig, server::MCPServer)
     transport = Dict{String,Any}(
         "type" => "http",
@@ -1109,7 +1116,7 @@ function default_manifest(config::MCPServerConfig, server::MCPServer)
     entry = Dict{String,Any}(
         "protocol" => "https://modelcontextprotocol.io/$(config.protocol_version)",
         "transport" => transport,
-        "capabilities" => manifest_capabilities(server),
+        "capabilities" => version_capabilities(server, config.protocol_version),
         "default" => true,
     )
     manifest = Dict{String,Any}(
@@ -1504,9 +1511,10 @@ end
 function initialize_response(server::MCPServer, session::MCPSession, params::Dict{String,Any})
     session.client_info = session_metadata_dict(params, "clientInfo", "client_info")
     session.client_capabilities = session_metadata_dict(params, "capabilities", "client_capabilities")
+    version = negotiate_protocol_version(server, get(params, "protocolVersion", nothing))
     result = Dict(
-        "protocolVersion" => negotiate_protocol_version(server, get(params, "protocolVersion", nothing)),
-        "capabilities" => manifest_capabilities(server),
+        "protocolVersion" => version,
+        "capabilities" => version_capabilities(server, version),
         "serverInfo" => server.server_info,
     )
     server.config.instructions !== nothing && (result["instructions"] = String(server.config.instructions))
@@ -2028,12 +2036,17 @@ function dispatch_modern_jsonrpc(server::MCPServer, context::MCPRequestContext, 
     elseif method == JSONRPC_METHOD_NOTIFICATIONS_CANCELLED
         handle_cancellation_notification(server, context, params)
         return nothing
+    elseif method in MCP_EVENT_METHODS
+        return dispatch_events(server, context, params)
     else
         throw(mcp_error(:method_not_found, "Unsupported MCP method $(method)"))
     end
 end
 
 function handle_modern_request(server::MCPServer, req::HTTP.Request, method::String, id, params::Dict{String,Any}, meta::Dict{String,Any}, protocol_version::String, timeout_ms)
+    if method in MCP_EVENT_METHODS && id === nothing
+        return jsonrpc_error(server, nothing, nothing, -32600, "Event methods require a request ID"; status=400)
+    end
     if id !== nothing
         header_error = validate_modern_headers(server, req, method, params, id)
         header_error !== nothing && return header_error
@@ -2084,6 +2097,8 @@ function handle_modern_request(server::MCPServer, req::HTTP.Request, method::Str
             -32021, "Missing required client capability", Dict(
                 "requiredCapabilities" => err.required,
             )
+        elseif err isa MCPEventError
+            err.code, err.message, err.data
         else
             classified_code, classified_message = classify_error(err)
             if classified_code == -32002 && err isa MCPError && err.code == :resource_not_found
@@ -2187,12 +2202,17 @@ function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
     header_error !== nothing && return header_error
     payload = try
         JSON.parse(body)
-    catch err
-        response = jsonrpc_error(server, nothing, nothing, -32700, "Failed to parse JSON-RPC body: $(sprint(showerror, err))")
+    catch
+        # Parser diagnostics can include request bytes, including signing keys.
+        response = jsonrpc_error(server, nothing, nothing, -32700, "Failed to parse JSON-RPC body")
         return response
     end
     payload isa AbstractDict || return jsonrpc_error(server, nothing, nothing, -32600, "JSON-RPC payload must be an object")
     id = get(payload, "id", nothing)
+    id === nothing || id isa AbstractString || (id isa Integer && !(id isa Bool)) ||
+        return jsonrpc_error(server, nothing, nothing, -32600, "JSON-RPC request ID must be a string or integer"; status=400)
+    get(payload, "jsonrpc", nothing) == JSONRPC_VERSION ||
+        return jsonrpc_error(server, nothing, id, -32600, "JSON-RPC version must be 2.0")
     if !haskey(payload, "method") && id !== nothing && (haskey(payload, "result") || haskey(payload, "error"))
         session = try
             ensure_session_for_request(server, req, "JSON-RPC response")
@@ -2222,7 +2242,13 @@ function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
     method_value = get(payload, "method", nothing)
     method_value isa AbstractString || return jsonrpc_error(server, nothing, id, -32600, "JSON-RPC method must be a string")
     method = String(method_value)
-    params = params_dict(get(payload, "params", Dict{String,Any}()))
+    params = try
+        params_dict(get(payload, "params", Dict{String,Any}()))
+    catch err
+        err isa MCPError || rethrow()
+        code, message = classify_error(err)
+        return jsonrpc_error(server, nothing, id, code, message)
+    end
     timeout_ms = try
         parse_timeout_header(req)
     catch err
@@ -2435,7 +2461,17 @@ end
 
 function handle_verbose_logging(f, verbose)
     function (req::HTTP.Request)
-        verbose && @info req
+        if verbose
+            body = req.body
+            printable_body = if body isa AbstractString || body isa AbstractVector{UInt8} ||
+                (isdefined(HTTP, :BytesBody) && body isa HTTP.BytesBody)
+                redact_event_request_body(client_request_body_text(body))
+            else
+                "(unbuffered body not logged)"
+            end
+            printable = HTTP.Request(request_method_string(req), request_target_string(req), headers_to_pairs(req.headers), printable_body)
+            @info printable
+        end
         resp = f(req)
         verbose && @info resp
         return resp

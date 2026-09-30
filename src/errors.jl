@@ -15,6 +15,15 @@ struct MCPMissingRequiredClientCapability <: Exception
     required::Dict{String,Any}
 end
 
+"A protocol error with structured data and a safe, server-generated message."
+struct MCPEventError <: Exception
+    code::Int
+    message::String
+    data::JSONDict
+end
+
+Base.showerror(io::IO, err::MCPEventError) = print(io, err.message)
+
 Base.showerror(io::IO, err::MCPMissingRequiredClientCapability) =
     print(io, "Missing required client capabilities: ", join(sort!(collect(keys(err.required))), ", "))
 

@@ -12,6 +12,9 @@ MCP `2026-07-28` protocol over Streamable HTTP. Clients default to
 modern client setup, capability checks, multi-round-trip results, custom
 headers, and subscriptions.
 
+See [MCP Events](events.md) for authenticated webhook subscriptions, signed
+callbacks, persistence, and client helpers.
+
 For deployments that require a concrete request graph, see the
 [trim-safe static tools server](static-server.md). This API stays under the
 `ModelContextProtocol` namespace because it is a specialized alternative to

@@ -1,8 +1,13 @@
 module ModelContextProtocol
 
 using Base64
+using Dates
+using Downloads
 using HTTP
 using JSON
+import JSONSchema
+using Random
+using SHA
 using UUIDs
 
 include("types.jl")
@@ -14,6 +19,7 @@ include("jsonrpc.jl")
 include("server.jl")
 include("static_server.jl")
 include("client.jl")
+include("events.jl")
 include("apps.jl")
 
 export MCPError, MCPAuthenticationRequired
