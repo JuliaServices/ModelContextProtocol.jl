@@ -258,7 +258,7 @@ function enable_events!(server::MCPServer;
         Int(default_ttl_ms), Int(max_ttl_ms), Int(max_subscriptions), Int(max_subscriptions_per_principal),
         Float64(verification_cooldown), Float64(rotation_grace), Float64(timeout),
         Int(max_attempts), Float64(retry_delay), allow_private_addresses,
-        Dict{Tuple{String,String},Float64}(), Dict{Tuple{String,String},Int}(), Threads.Condition(),
+        Set{String}(), Dict{Tuple{String,String},Float64}(), Dict{Tuple{String,String},Int}(), Threads.Condition(),
     )
     ensure_capability!(server, "events")
     return server
@@ -571,52 +571,24 @@ function post_event_webhook(events::MCPEvents, url, headers, body; deadline=even
     return response
 end
 
-function verify_event_callback!(events::MCPEvents, principal, uri, id, secret)
-    # Rate limits are per principal so one caller cannot block callbacks that
-    # share a host, such as a hosted client's receiver. Each principal runs one
-    # verification per host at a time, and a failure starts a cooldown. Key on
-    # the destination however it is spelled: DNS names ignore case and a
-    # trailing dot, and an IPv6 literal has many textual forms.
-    key = (principal, occursin(':', uri.host) ? string(parse(IPv6, uri.host)) : lowercase(rstrip(uri.host, '.')))
-    @lock events.lock begin
-        while get(events.verifications, key, 0.0) == Inf
-            wait(events.lock)
-        end
-        now = events.clock()
-        filter!(entry -> last(entry) > now, events.verifications)
-        haskey(events.verifications, key) &&
-            throw(event_error(-32013, "ResourceExhausted"; limit="callbackVerification"))
-        events.verifications[key] = Inf
+# Send a signed challenge and require the endpoint to echo it.
+function verify_event_callback(events::MCPEvents, uri, id, secret)
+    started = events.clock()
+    challenge = base64encode(rand(RandomDevice(), UInt8, 32))
+    body = JSON.json(JSONDict("type" => "verification", "challenge" => challenge))
+    headers = event_webhook_headers("msg_verification_" * string(uuid4()), id, body, (secret,); signed_at=started)
+    response = post_event_webhook(events, uri.url, headers, body)
+    response.status in 200:299 ||
+        throw(callback_failure(response.status >= 500 ? "http_5xx" : "http_4xx"))
+    received = try
+        ncodeunits(response.body) <= 8192 || throw(ArgumentError("Oversized verification response"))
+        parsed = JSON.parse(response.body)
+        parsed isa AbstractDict ? get(parsed, "challenge", nothing) : nothing
+    catch
+        nothing
     end
-    verified = false
-    try
-        started = events.clock()
-        challenge = base64encode(rand(RandomDevice(), UInt8, 32))
-        body = JSON.json(JSONDict("type" => "verification", "challenge" => challenge))
-        headers = event_webhook_headers("msg_verification_" * string(uuid4()), id, body, (secret,); signed_at=started)
-        response = post_event_webhook(events, uri.url, headers, body)
-        response.status in 200:299 ||
-            throw(callback_failure(response.status >= 500 ? "http_5xx" : "http_4xx"))
-        received = try
-            ncodeunits(response.body) <= 8192 || throw(ArgumentError("Oversized verification response"))
-            parsed = JSON.parse(response.body)
-            parsed isa AbstractDict ? get(parsed, "challenge", nothing) : nothing
-        catch
-            nothing
-        end
-        received isa AbstractString && events.clock() - started <= events.timeout &&
-            constant_time_equal(received, challenge) || throw(callback_failure("challenge_failed"))
-        verified = true
-    finally
-        @lock events.lock begin
-            if verified
-                delete!(events.verifications, key)
-            else
-                events.verifications[key] = events.clock() + events.verification_cooldown
-            end
-            notify(events.lock)
-        end
-    end
+    received isa AbstractString && events.clock() - started <= events.timeout &&
+        constant_time_equal(received, challenge) || throw(callback_failure("challenge_failed"))
     return nothing
 end
 
@@ -679,32 +651,63 @@ function subscribe_event(server::MCPServer, context::MCPRequestContext, params::
     get(params, "cursor", nothing) === nothing || throw(event_error(-32014, "Unsupported"; feature="cursor"))
     ttl_ms = event_ttl_ms(events, params)
     id = event_subscription_id(principal, uri.url, name, arguments)
-    # Check quotas before sending any callback traffic. A live subscription
-    # from this principal to this URL shows the endpoint already consented.
-    verified = @lock events.lock begin
-        records = live_event_subscriptions!(events)
-        check_event_quota(events, records, principal, id)
-        any(record -> record.principal == principal && record.url == uri.url, records)
+    # Verification is limited per principal, so one caller cannot block others
+    # that share a receiver host. The cooldown key ignores host spelling: DNS
+    # names ignore case and a trailing dot, and IPv6 literals have many forms.
+    cooldown = (principal, occursin(':', uri.host) ? string(parse(IPv6, uri.host)) : lowercase(rstrip(uri.host, '.')))
+    verifying = @lock events.lock begin
+        # Check quotas before any callback traffic. A live subscription from
+        # this principal to this URL shows the endpoint already consented.
+        # Otherwise wait for this principal's running verification, which
+        # holds its turn until its subscription is saved.
+        consented = false
+        while true
+            records = live_event_subscriptions!(events)
+            check_event_quota(events, records, principal, id)
+            consented = any(record -> record.principal == principal && record.url == uri.url, records)
+            (consented || !(principal in events.verifying)) && break
+            wait(events.lock)
+        end
+        if !consented
+            now = events.clock()
+            filter!(entry -> last(entry) > now, events.cooldowns)
+            haskey(events.cooldowns, cooldown) &&
+                throw(event_error(-32013, "ResourceExhausted"; limit="callbackVerification"))
+            push!(events.verifying, principal)
+        end
+        !consented
     end
-    if !verified
-        verify_event_callback!(events, principal, uri, id, secret)
-        # Access can change while the endpoint answers.
-        event_authorized(events, principal, name, arguments) || throw(event_error(-32012, "Forbidden"))
-    end
-    return @lock events.lock begin
-        records = live_event_subscriptions!(events)
-        check_event_quota(events, records, principal, id)
-        previous = get_event_subscription(events.store, id)
-        now = events.clock()
-        rotated = previous !== nothing && previous.secret != secret
-        expires_at = now + ttl_ms / 1000
-        save_event_subscription!(events.store, MCPWebhookSubscription(
-            id, principal, name, deepcopy(arguments), uri.url, String(secret), expires_at,
-            previous === nothing ? nothing : rotated ? previous.secret : previous.previous_secret,
-            previous === nothing ? 0.0 : rotated ? now + events.rotation_grace : previous.previous_secret_until,
-            previous === nothing ? string(uuid4()) : previous.instance,
-        ))
-        JSONDict("id" => id, "refreshBefore" => event_iso8601(expires_at), "cursor" => nothing, "truncated" => false)
+    verified = false
+    try
+        if verifying
+            verify_event_callback(events, uri, id, secret)
+            verified = true
+            # Access can change while the endpoint answers.
+            event_authorized(events, principal, name, arguments) || throw(event_error(-32012, "Forbidden"))
+        end
+        return @lock events.lock begin
+            records = live_event_subscriptions!(events)
+            check_event_quota(events, records, principal, id)
+            previous = get_event_subscription(events.store, id)
+            now = events.clock()
+            rotated = previous !== nothing && previous.secret != secret
+            expires_at = now + ttl_ms / 1000
+            save_event_subscription!(events.store, MCPWebhookSubscription(
+                id, principal, name, deepcopy(arguments), uri.url, String(secret), expires_at,
+                previous === nothing ? nothing : rotated ? previous.secret : previous.previous_secret,
+                previous === nothing ? 0.0 : rotated ? now + events.rotation_grace : previous.previous_secret_until,
+                previous === nothing ? string(uuid4()) : previous.instance,
+            ))
+            JSONDict("id" => id, "refreshBefore" => event_iso8601(expires_at), "cursor" => nothing, "truncated" => false)
+        end
+    finally
+        if verifying
+            @lock events.lock begin
+                delete!(events.verifying, principal)
+                verified || (events.cooldowns[cooldown] = events.clock() + events.verification_cooldown)
+                notify(events.lock)
+            end
+        end
     end
 end
 

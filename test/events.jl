@@ -798,6 +798,41 @@ end
     end
     @test timedwait(() -> istaskdone(delivery), 10) == :ok
     @test length(fetch(delivery)) == 2 && all(receipt -> receipt.accepted, fetch(delivery))
+
+    # A principal verifies one callback at a time and keeps its turn until the
+    # subscription is saved. Requests beyond its quota send no challenge, and a
+    # waiting request for the same URL reuses the consent just established.
+    held = Channel{Nothing}(16)
+    turns = Channel{Nothing}(16)
+    challenges = Ref(0)
+    holding = function (args...)
+        challenges[] += 1
+        put!(held, nothing)
+        take!(turns)
+        holder[].sender(args...)
+    end
+    for (limit, urls) in ((1, ["https://host$(index).example/hook" for index in 1:4]), (10, [EVENT_URL, EVENT_URL]))
+        fixture = event_fixture(request=holding, max_subscriptions_per_principal=limit)
+        holder[] = fixture
+        challenges[] = 0
+        requests = [@async event_request(fixture.server, "events/subscribe",
+            event_params(url=url, arguments=Dict("resource" => index == 1 ? "shared" : "alpha")))
+            for (index, url) in enumerate(urls)]
+        try
+            @test timedwait(() -> isready(held), 10) == :ok
+            take!(held)
+            foreach(_ -> yield(), 1:20)
+            @test challenges[] == 1
+            put!(turns, nothing)
+            @test timedwait(() -> all(istaskdone, requests), 10) == :ok
+            results = [fetch(task)[2] for task in requests]
+            @test count(result -> haskey(result, "result"), results) == min(limit, length(urls))
+            @test all(result -> haskey(result, "result") || result["error"]["code"] == -32013, results)
+            @test challenges[] == 1
+        finally
+            foreach(_ -> put!(turns, nothing), urls)
+        end
+    end
 end
 
 @testset "Seeded subscription state-machine fuzz" begin

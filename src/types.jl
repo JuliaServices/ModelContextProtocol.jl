@@ -92,12 +92,14 @@ struct MCPEvents
     max_attempts::Int
     retry_delay::Float64
     allow_private_addresses::Bool
-    # (principal, callback host) => when the next verification may start; Inf while one runs.
-    verifications::Dict{Tuple{String,String},Float64}
+    # Principals with a callback verification in progress; each runs one at a time.
+    verifying::Set{String}
+    # (principal, callback host) => end of the cooldown after a failed verification.
+    cooldowns::Dict{Tuple{String,String},Float64}
     # (subscription ID, instance) => delivery attempts in progress, so unsubscribe can wait for them.
     sending::Dict{Tuple{String,String},Int}
-    # Guards definitions, store writes, and both maps. Never held across network I/O
-    # or application hooks; notified when a verification or delivery attempt ends.
+    # Guards definitions, store writes, and the fields above. Never held across network
+    # I/O or application hooks; notified when a verification or delivery attempt ends.
     lock::Threads.Condition
 end
 

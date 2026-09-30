@@ -141,9 +141,11 @@ Before accepting a subscription, the server sends a signed challenge and
 requires the endpoint to echo it in a `2xx` JSON response. A live subscription
 from the same subject to the same URL counts as verified, so refreshes, key
 rotation, and new filters send no challenge. Each subject runs one verification
-per callback host at a time, and a failure starts a short cooldown for that
-subject and host. Other subjects are unaffected, which matters when many users
-share a hosted receiver. Subscription quotas bound state growth.
+at a time; its other subscribe calls wait, then reuse a verification that just
+succeeded or fail on quota without sending one. A failure starts a short
+cooldown for that subject and callback host, however the host is spelled.
+Other subjects are unaffected, which matters when many users share a hosted
+receiver. Subscription quotas bound state growth.
 
 The default HTTPS sender validates every resolved address before each connection
 and pins the selected address with libcurl's `CONNECT_TO`. The original hostname
