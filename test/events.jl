@@ -659,6 +659,20 @@ end
     _, throttled = event_request(fixture.server, "events/subscribe",
         event_params(url="https://receiver.example/hooks/other"); owner="mallory")
     @test throttled["error"]["data"]["limit"] == "callbackVerification"
+    # Respelling the host does not get around the cooldown.
+    posts = length(fixture.calls)
+    for host in ("Receiver.example", "receiver.example.", "RECEIVER.EXAMPLE.")
+        _, respelled = event_request(fixture.server, "events/subscribe",
+            event_params(url="https://$(host)/hooks/bogus"); owner="mallory")
+        @test respelled["error"]["data"]["limit"] == "callbackVerification"
+    end
+    _, failed = event_request(fixture.server, "events/subscribe",
+        event_params(url="https://[2001:4860:4860::8888]/hooks/bogus"); owner="mallory")
+    @test failed["error"]["code"] == -32015
+    _, respelled = event_request(fixture.server, "events/subscribe",
+        event_params(url="https://[2001:4860:4860:0:0:0:0:8888]/hooks/bogus"); owner="mallory")
+    @test respelled["error"]["data"]["limit"] == "callbackVerification"
+    @test length(fixture.calls) == posts + 1
     fixture.verification[] = :echo
     _, subscribed = event_request(fixture.server, "events/subscribe", event_params())
     @test haskey(subscribed, "result")

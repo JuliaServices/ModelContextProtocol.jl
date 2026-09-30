@@ -568,8 +568,10 @@ end
 function verify_event_callback!(events::MCPEvents, principal, uri, id, secret)
     # Rate limits are per principal so one caller cannot block callbacks that
     # share a host, such as a hosted client's receiver. Each principal runs one
-    # verification per host at a time, and a failure starts a cooldown.
-    key = (principal, uri.host)
+    # verification per host at a time, and a failure starts a cooldown. Key on
+    # the destination however it is spelled: DNS names ignore case and a
+    # trailing dot, and an IPv6 literal has many textual forms.
+    key = (principal, occursin(':', uri.host) ? string(parse(IPv6, uri.host)) : lowercase(rstrip(uri.host, '.')))
     @lock events.lock begin
         while get(events.verifications, key, 0.0) == Inf
             wait(events.lock)
