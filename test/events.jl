@@ -852,6 +852,24 @@ end
     @test timedwait(() -> istaskdone(first_request) && istaskdone(waiting), 10) == :ok
     @test fetch(waiting)[2]["error"]["code"] == -32012
     @test only(event_records(fixture)).arguments["resource"] == "shared"
+
+    # So does one that only waited for a slow store.
+    allowed[] = true
+    fixture = event_fixture(authorize=guarded)
+    event_request(fixture.server, "events/subscribe", event_params())
+    store = fixture.server.events.store
+    lock(store.lock)
+    blocked = @async event_request(fixture.server, "events/subscribe", event_params(arguments=Dict("resource" => "alpha")))
+    try
+        foreach(_ -> yield(), 1:20)
+        @test !istaskdone(blocked)
+        allowed[] = false
+    finally
+        unlock(store.lock)
+    end
+    @test timedwait(() -> istaskdone(blocked), 10) == :ok
+    @test fetch(blocked)[2]["error"]["code"] == -32012
+    @test only(event_records(fixture)).arguments["resource"] == "shared"
 end
 
 @testset "Seeded subscription state-machine fuzz" begin
