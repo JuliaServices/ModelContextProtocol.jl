@@ -88,6 +88,10 @@ function write_event_store(store::FileEventSubscriptionStore, records)
     try
         chmod(temporary, 0o600)
         write(io, JSON.json(document))
+        flush(io)
+        # Put the bytes on disk before the rename, so a crash leaves the old
+        # or the new file rather than an empty one that fails to load.
+        Sys.iswindows() || systemerror(:fsync, ccall(:fsync, Cint, (Cint,), fd(io)) != 0)
         close(io)
         # Julia < 1.12's rename helper can fall back to a non-atomic copy.
         # Use the same libuv operation directly, failing without a fallback.
