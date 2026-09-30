@@ -82,9 +82,7 @@ function write_event_store(store::FileEventSubscriptionStore, records)
     document = JSONDict("version" => 1, "subscriptions" => [
         subscription_record(records[id]) for id in sort!(collect(keys(records)))
     ])
-    directory = dirname(store.path)
-    isdir(directory) || throw(ArgumentError("Subscription store directory must already exist"))
-    temporary, io = mktemp(directory; cleanup=false)
+    temporary, io = mktemp(dirname(store.path); cleanup=false)
     try
         chmod(temporary, 0o600)
         write(io, JSON.json(document))
@@ -182,6 +180,8 @@ end
 
 function FileEventSubscriptionStore(path::AbstractString)
     store = FileEventSubscriptionStore(abspath(path), InMemoryEventSubscriptionStore())
+    # Fail at startup, not on a client's first subscribe.
+    isdir(dirname(store.path)) || throw(ArgumentError("Subscription store directory must already exist"))
     isfile(store.path) || return store
     # Refuse to load a file whose secrets are readable by other Unix users.
     Sys.iswindows() || (filemode(store.path) & 0o077 == 0) ||

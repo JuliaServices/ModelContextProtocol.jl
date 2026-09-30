@@ -248,6 +248,7 @@ end
         @test readdir(directory) == ["subscriptions.json"]
         write(path, "{}")
         @test_throws ArgumentError EventsMCP.FileEventSubscriptionStore(path)
+        @test_throws ArgumentError EventsMCP.FileEventSubscriptionStore(joinpath(directory, "missing", "subscriptions.json"))
     end
 end
 
