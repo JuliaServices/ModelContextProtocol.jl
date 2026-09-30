@@ -556,8 +556,9 @@ function post_event_webhook(events::MCPEvents, url, headers, body; deadline=even
     isempty(addresses) && throw(callback_failure("connection_refused"))
     all(address -> address isa IPAddr && (events.allow_private_addresses || public_event_address(address)), addresses) ||
         throw(mcp_error(:invalid_params, "Callback destination is not a public address"))
+    # Transports cannot enforce a deadline finer than a millisecond.
     remaining = deadline - events.clock()
-    remaining > 0 || throw(callback_failure("timeout"))
+    remaining >= 0.001 || throw(callback_failure("timeout"))
     response = try
         Base.invokelatest(events.request, uri.url, first(addresses), headers, body, remaining)
     catch err

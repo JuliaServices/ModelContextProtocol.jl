@@ -601,6 +601,12 @@ end
     receipt = only(EventsMCP.emit_event!(expired.server, "comment.created", event_data()))
     @test !receipt.accepted && receipt.reason == "timeout"
     @test isempty(event_deliveries(expired))
+    # Under a millisecond left counts as no time left, whatever the transport.
+    nearly = event_fixture()
+    event_request(nearly.server, "events/subscribe", event_params(ttl_ms=1))
+    nearly.now[] += 0.0005
+    @test !only(EventsMCP.emit_event!(nearly.server, "comment.created", event_data())).accepted
+    @test isempty(event_deliveries(nearly))
 
     # A retry never reaches a subscription created after its event, even when
     # the new subscription has the same key.
