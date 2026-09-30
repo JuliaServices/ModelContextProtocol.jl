@@ -59,6 +59,9 @@ struct MCPWebhookSubscription
     # Random per creation. A refresh keeps it; subscribing again after the
     # record was removed gets a new one, so older retries stop.
     instance::String
+    # Random per save, so a check made outside the lock can tell whether the
+    # record changed since it was read.
+    revision::String
 end
 
 struct MCPServerEvent

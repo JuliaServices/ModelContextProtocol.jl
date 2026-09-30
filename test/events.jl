@@ -529,7 +529,7 @@ end
     original = only(event_records(fixture))
     changed = EventsMCP.MCPWebhookSubscription(original.id, original.principal, original.name,
         original.arguments, original.url, original.secret, original.expires_at + 60,
-        original.previous_secret, original.previous_secret_until, original.instance)
+        original.previous_secret, original.previous_secret_until, original.instance, original.revision)
     mktempdir() do directory
         # Renaming a file over a directory must fail, even when tests run as root.
         broken = EventsMCP.FileEventSubscriptionStore(directory, fixture.server.events.store)
@@ -677,7 +677,8 @@ end
     try
         @test timedwait(() -> isready(entered), 10) == :ok
         revoked[] = false
-        _, refreshed = event_request(stale.server, "events/subscribe", event_params(ttl_ms=600_000))
+        # Same clock, TTL, and secret: every field but the revision is unchanged.
+        _, refreshed = event_request(stale.server, "events/subscribe", event_params())
         @test haskey(refreshed, "result")
     finally
         isready(entered) && take!(entered)
