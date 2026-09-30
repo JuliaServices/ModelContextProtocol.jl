@@ -503,7 +503,7 @@ end
     original = only(event_records(fixture))
     changed = EventsMCP.MCPWebhookSubscription(original.id, original.principal, original.name,
         original.arguments, original.url, original.secret, original.expires_at + 60,
-        original.previous_secret, original.previous_secret_until, original.lock)
+        original.previous_secret, original.previous_secret_until)
     mktempdir() do directory
         # Renaming a file over a directory must fail, even when tests run as root.
         broken = EventsMCP.FileEventSubscriptionStore(directory, fixture.server.events.store)
@@ -542,8 +542,9 @@ end
     end
     try
         take!(started)
+        # The record is removed at once, but unsubscribe returns only after the POST in flight.
+        @test timedwait(() -> isempty(event_records(fixture)), 10) == :ok
         @test !istaskdone(stopped)
-        @test length(event_records(fixture)) == 1
     finally
         put!(release, nothing)
     end
@@ -574,6 +575,82 @@ end
     receipt = only(EventsMCP.emit_event!(expired.server, "comment.created", event_data()))
     @test !receipt.accepted && receipt.reason == "timeout"
     @test isempty(event_deliveries(expired))
+end
+
+@testset "Verification and locks do not cross principals" begin
+    # Hosted clients use one receiver host for every user, so one principal's
+    # failed or repeated verifications must not block another principal.
+    fixture = event_fixture(max_subscriptions=3, max_subscriptions_per_principal=3)
+    fixture.owners["mallory"] = true
+    fixture.verification[] = (status=404, body="")
+    _, failed = event_request(fixture.server, "events/subscribe",
+        event_params(url="https://receiver.example/hooks/bogus"); owner="mallory")
+    @test failed["error"]["code"] == -32015
+    _, throttled = event_request(fixture.server, "events/subscribe",
+        event_params(url="https://receiver.example/hooks/other"); owner="mallory")
+    @test throttled["error"]["data"]["limit"] == "callbackVerification"
+    fixture.verification[] = :echo
+    _, subscribed = event_request(fixture.server, "events/subscribe", event_params())
+    @test haskey(subscribed, "result")
+    for index in 1:3
+        fixture.now[] += 10
+        url = "https://mallory.example/hooks/$(index)"
+        event_request(fixture.server, "events/subscribe", event_params(url=url); owner="mallory")
+        event_request(fixture.server, "events/unsubscribe", event_params(url=url); owner="mallory")
+    end
+    _, other = event_request(fixture.server, "events/subscribe", event_params(); owner="beta")
+    @test haskey(other, "result")
+
+    # A live subscription to the same URL counts as consent for refreshes and
+    # new filters; the challenge returns only after every subscription ends.
+    verifications() = count(call -> haskey(call.parsed, "type"), fixture.calls)
+    before = verifications()
+    fixture.now[] += 600
+    _, refreshed = event_request(fixture.server, "events/subscribe", event_params(ttl_ms=1_800_000))
+    @test haskey(refreshed, "result")
+    _, filtered = event_request(fixture.server, "events/subscribe",
+        event_params(arguments=Dict("resource" => "alpha")))
+    @test haskey(filtered, "result")
+    @test verifications() == before
+    for arguments in (Dict("resource" => "shared"), Dict("resource" => "alpha"))
+        event_request(fixture.server, "events/unsubscribe", event_params(arguments=arguments))
+    end
+    event_request(fixture.server, "events/subscribe", event_params())
+    @test verifications() == before + 1
+
+    # A slow delivery, and its owner's unsubscribe, must not stall other principals.
+    entered = Channel{Nothing}(1)
+    release = Channel{Nothing}(1)
+    holder = Ref{Any}(nothing)
+    slow = function (url, address, headers, body, timeout)
+        if !haskey(JSON.parse(body), "type") && occursin("mallory", url)
+            put!(entered, nothing)
+            take!(release)
+        end
+        holder[].sender(url, address, headers, body, timeout)
+    end
+    fixture = event_fixture(request=slow)
+    holder[] = fixture
+    fixture.owners["mallory"] = true
+    mallory = event_params(url="https://mallory.example/hooks/slow")
+    event_request(fixture.server, "events/subscribe", mallory; owner="mallory")
+    delivery = @async EventsMCP.emit_event!(fixture.server, "comment.created", event_data())
+    try
+        @test timedwait(() -> isready(entered), 10) == :ok
+        stopping = @async event_request(fixture.server, "events/unsubscribe", mallory; owner="mallory")
+        @test timedwait(() -> isempty(event_records(fixture)), 10) == :ok
+        others = @async begin
+            event_request(fixture.server, "events/list"; owner="beta")
+            event_request(fixture.server, "events/subscribe", event_params(); owner="beta")
+        end
+        @test timedwait(() -> istaskdone(others), 10) == :ok
+        @test istaskdone(others) && haskey(fetch(others)[2], "result")
+        @test !istaskdone(stopping)
+    finally
+        isready(entered) && take!(entered)
+        put!(release, nothing)
+    end
+    @test timedwait(() -> istaskdone(delivery), 10) == :ok
 end
 
 @testset "Seeded subscription state-machine fuzz" begin

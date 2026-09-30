@@ -56,7 +56,6 @@ struct MCPWebhookSubscription
     expires_at::Float64
     previous_secret::Union{String,Nothing}
     previous_secret_until::Float64
-    lock::ReentrantLock
 end
 
 struct MCPServerEvent
@@ -84,17 +83,19 @@ struct MCPEvents
     max_ttl_ms::Int
     max_subscriptions::Int
     max_subscriptions_per_principal::Int
-    verification_ttl::Float64
     verification_cooldown::Float64
     rotation_grace::Float64
     timeout::Float64
     max_attempts::Int
     retry_delay::Float64
     allow_private_addresses::Bool
-    verified::Dict{Tuple{String,String},Float64}
-    verification_attempts::Dict{String,Float64}
-    verification_lock::ReentrantLock
-    lock::ReentrantLock
+    # (principal, callback host) => when the next verification may start; Inf while one runs.
+    verifications::Dict{Tuple{String,String},Float64}
+    # Subscription ID => delivery attempts in progress, so unsubscribe can wait for them.
+    sending::Dict{String,Int}
+    # Guards definitions, store writes, and both maps. Never held across network I/O
+    # or application hooks; notified when a verification or delivery attempt ends.
+    lock::Threads.Condition
 end
 
 Base.@kwdef struct MCPServerConfig

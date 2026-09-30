@@ -26,8 +26,8 @@ Process-local webhook subscriptions. Use FileEventSubscriptionStore or an
 application-backed MCPEventSubscriptionStore for subscriptions that must survive
 restarts. Store implementations provide get_event_subscription,
 event_subscriptions, save_event_subscription!, and delete_event_subscription!.
-Collection reads return snapshots; records and their filters must not be mutated.
-Replacements preserve the record's per-process lock, and writes must be atomic.
+Collection reads return snapshots; records and their filters must not be mutated,
+and writes must be atomic.
 """
 mutable struct InMemoryEventSubscriptionStore <: MCPEventSubscriptionStore
     records::Dict{String,MCPWebhookSubscription}
@@ -101,6 +101,7 @@ end
 
 function update_event_store!(store::FileEventSubscriptionStore, id::String, subscription)
     @lock store.state.lock begin
+        subscription === nothing && !haskey(store.state.records, id) && return nothing
         updated = copy(store.state.records)
         subscription === nothing ? pop!(updated, id, nothing) : (updated[id] = subscription)
         write_event_store(store, updated)
@@ -203,7 +204,7 @@ function FileEventSubscriptionStore(path::AbstractString)
             previous_secret === nothing || event_webhook_key(previous_secret)
             store.state.records[id] = MCPWebhookSubscription(
                 id, principal, name, arguments, url, secret, Float64(expires_at),
-                previous_secret, Float64(previous_until), ReentrantLock(),
+                previous_secret, Float64(previous_until),
             )
         end
     catch
@@ -233,8 +234,7 @@ function enable_events!(server::MCPServer;
     clock::Function=time, wait::Function=sleep,
     default_ttl_ms::Integer=1_800_000, max_ttl_ms::Integer=86_400_000,
     max_subscriptions::Integer=1000, max_subscriptions_per_principal::Integer=100,
-    verification_ttl::Real=300, verification_cooldown::Real=5,
-    rotation_grace::Real=300, timeout::Real=10,
+    verification_cooldown::Real=5, rotation_grace::Real=300, timeout::Real=10,
     max_attempts::Integer=4, retry_delay::Real=0.25,
     allow_private_addresses::Bool=false,
 )
@@ -242,16 +242,16 @@ function enable_events!(server::MCPServer;
     1 <= default_ttl_ms <= max_ttl_ms <= MCP_SAFE_INTEGER_MAX || throw(ArgumentError("Invalid event TTL limits"))
     max_subscriptions > 0 && max_subscriptions_per_principal > 0 || throw(ArgumentError("Subscription limits must be positive"))
     1 <= max_attempts <= 10 || throw(ArgumentError("max_attempts must be between 1 and 10"))
-    all(x -> isfinite(x) && x > 0, (verification_ttl, verification_cooldown, timeout)) ||
-        throw(ArgumentError("Verification and request timeouts must be positive and finite"))
+    all(x -> isfinite(x) && x > 0, (verification_cooldown, timeout)) ||
+        throw(ArgumentError("Verification cooldown and request timeout must be positive and finite"))
     all(x -> isfinite(x) && x >= 0, (rotation_grace, retry_delay)) ||
         throw(ArgumentError("Rotation grace and retry delay must be non-negative and finite"))
     server.events = MCPEvents(
         store, principal, authorize, Dict{String,MCPServerEvent}(), request, resolve, clock, wait,
         Int(default_ttl_ms), Int(max_ttl_ms), Int(max_subscriptions), Int(max_subscriptions_per_principal),
-        Float64(verification_ttl), Float64(verification_cooldown), Float64(rotation_grace), Float64(timeout),
+        Float64(verification_cooldown), Float64(rotation_grace), Float64(timeout),
         Int(max_attempts), Float64(retry_delay), allow_private_addresses,
-        Dict{Tuple{String,String},Float64}(), Dict{String,Float64}(), ReentrantLock(), ReentrantLock(),
+        Dict{Tuple{String,String},Float64}(), Dict{String,Int}(), Threads.Condition(),
     )
     ensure_capability!(server, "events")
     return server
@@ -559,23 +559,26 @@ function post_event_webhook(events::MCPEvents, url, headers, body; deadline=even
 end
 
 function verify_event_callback!(events::MCPEvents, principal, uri, id, secret)
-    # ponytail: one verification at a time; use per-destination locks if
-    # callback registration throughput requires parallel handshakes.
-    @lock events.verification_lock begin
+    # Rate limits are per principal so one caller cannot block callbacks that
+    # share a host, such as a hosted client's receiver. Each principal runs one
+    # verification per host at a time, and a failure starts a cooldown.
+    key = (principal, uri.host)
+    @lock events.lock begin
+        while get(events.verifications, key, 0.0) == Inf
+            wait(events.lock)
+        end
         now = events.clock()
-        filter!(pair -> last(pair) > now, events.verified)
-        filter!(pair -> last(pair) > now, events.verification_attempts)
-        key = (principal, uri.url)
-        get(events.verified, key, 0.0) > now && return nothing
-        get(events.verification_attempts, uri.host, 0.0) > now &&
+        filter!(entry -> last(entry) > now, events.verifications)
+        haskey(events.verifications, key) &&
             throw(event_error(-32013, "ResourceExhausted"; limit="callbackVerification"))
-        length(events.verified) < events.max_subscriptions &&
-            length(events.verification_attempts) < events.max_subscriptions ||
-            throw(event_error(-32013, "ResourceExhausted"; limit="callbackVerification"))
-        events.verification_attempts[uri.host] = now + events.verification_cooldown
+        events.verifications[key] = Inf
+    end
+    verified = false
+    try
+        started = events.clock()
         challenge = base64encode(rand(RandomDevice(), UInt8, 32))
         body = JSON.json(JSONDict("type" => "verification", "challenge" => challenge))
-        headers = event_webhook_headers("msg_verification_" * string(uuid4()), id, body, (secret,); signed_at=now)
+        headers = event_webhook_headers("msg_verification_" * string(uuid4()), id, body, (secret,); signed_at=started)
         response = post_event_webhook(events, uri.url, headers, body)
         response.status in 200:299 ||
             throw(callback_failure(response.status >= 500 ? "http_5xx" : "http_4xx"))
@@ -586,24 +589,38 @@ function verify_event_callback!(events::MCPEvents, principal, uri, id, secret)
         catch
             nothing
         end
-        received isa AbstractString && events.clock() - now <= events.timeout &&
+        received isa AbstractString && events.clock() - started <= events.timeout &&
             constant_time_equal(received, challenge) || throw(callback_failure("challenge_failed"))
-        events.verified[key] = events.clock() + events.verification_ttl
-        delete!(events.verification_attempts, uri.host)
+        verified = true
+    finally
+        @lock events.lock begin
+            if verified
+                delete!(events.verifications, key)
+            else
+                events.verifications[key] = events.clock() + events.verification_cooldown
+            end
+            notify(events.lock)
+        end
     end
     return nothing
 end
 
-function prune_event_subscriptions!(events::MCPEvents)
-    for subscription in event_subscriptions(events.store)
-        subscription.expires_at > events.clock() && continue
-        lock(subscription.lock) do
-            current = get_event_subscription(events.store, subscription.id)
-            current === nothing && return
-            current.lock === subscription.lock && current.expires_at <= events.clock() &&
-                delete_event_subscription!(events.store, current.id)
-        end
+# Delete expired records and return the live ones. Call with events.lock held.
+function live_event_subscriptions!(events::MCPEvents)
+    now = events.clock()
+    live = MCPWebhookSubscription[]
+    for record in event_subscriptions(events.store)
+        record.expires_at > now ? push!(live, record) : delete_event_subscription!(events.store, record.id)
     end
+    return live
+end
+
+function check_event_quota(events::MCPEvents, records, principal, id)
+    any(record -> record.id == id, records) && return nothing
+    length(records) < events.max_subscriptions ||
+        throw(event_error(-32013, "ResourceExhausted"; limit="subscriptions", max=events.max_subscriptions))
+    count(record -> record.principal == principal, records) < events.max_subscriptions_per_principal ||
+        throw(event_error(-32013, "ResourceExhausted"; limit="subscriptionsPerPrincipal", max=events.max_subscriptions_per_principal))
     return nothing
 end
 
@@ -639,40 +656,31 @@ function subscribe_event(server::MCPServer, context::MCPRequestContext, params::
     ttl_value = get(params, "ttlMs", nothing)
     ttl_ms = ttl_value === nothing ? events.default_ttl_ms : min(event_integer(ttl_value, "ttlMs"; minimum=1), events.max_ttl_ms)
     id = event_subscription_id(principal, uri.url, name, arguments)
-    @lock events.lock begin
-        prune_event_subscriptions!(events)
-        records = event_subscriptions(events.store)
-        if get_event_subscription(events.store, id) === nothing
-            length(records) < events.max_subscriptions ||
-                throw(event_error(-32013, "ResourceExhausted"; limit="subscriptions", max=events.max_subscriptions))
-            count(record -> record.principal == principal, records) < events.max_subscriptions_per_principal ||
-                throw(event_error(-32013, "ResourceExhausted"; limit="subscriptionsPerPrincipal", max=events.max_subscriptions_per_principal))
-        end
+    # Check quotas before sending any callback traffic. A live subscription
+    # from this principal to this URL shows the endpoint already consented.
+    verified = @lock events.lock begin
+        records = live_event_subscriptions!(events)
+        check_event_quota(events, records, principal, id)
+        any(record -> record.principal == principal && record.url == uri.url, records)
     end
-    verify_event_callback!(events, principal, uri, id, secret)
-    return @lock events.lock begin
+    if !verified
+        verify_event_callback!(events, principal, uri, id, secret)
+        # Access can change while the endpoint answers.
         event_authorized(events, principal, name, arguments) || throw(event_error(-32012, "Forbidden"))
-        prune_event_subscriptions!(events)
+    end
+    return @lock events.lock begin
+        records = live_event_subscriptions!(events)
+        check_event_quota(events, records, principal, id)
         previous = get_event_subscription(events.store, id)
-        records = event_subscriptions(events.store)
-        if previous === nothing
-            length(records) < events.max_subscriptions &&
-                count(record -> record.principal == principal, records) < events.max_subscriptions_per_principal ||
-                throw(event_error(-32013, "ResourceExhausted"; limit="subscriptions"))
-        end
-        subscription_lock = previous === nothing ? ReentrantLock() : previous.lock
-        lock(subscription_lock) do
-            now = events.clock()
-            old_secret = previous === nothing ? nothing : previous.secret != secret ? previous.secret : previous.previous_secret
-            old_until = previous === nothing ? 0.0 : previous.secret != secret ? now + events.rotation_grace : previous.previous_secret_until
-            expires_at = now + ttl_ms / 1000
-            subscription = MCPWebhookSubscription(
-                id, principal, name, deepcopy(arguments), uri.url, String(secret), expires_at,
-                old_secret, old_until, subscription_lock,
-            )
-            save_event_subscription!(events.store, subscription)
-            JSONDict("id" => id, "refreshBefore" => event_iso8601(expires_at), "cursor" => nothing, "truncated" => false)
-        end
+        now = events.clock()
+        rotated = previous !== nothing && previous.secret != secret
+        expires_at = now + ttl_ms / 1000
+        save_event_subscription!(events.store, MCPWebhookSubscription(
+            id, principal, name, deepcopy(arguments), uri.url, String(secret), expires_at,
+            previous === nothing ? nothing : rotated ? previous.secret : previous.previous_secret,
+            previous === nothing ? 0.0 : rotated ? now + events.rotation_grace : previous.previous_secret_until,
+        ))
+        JSONDict("id" => id, "refreshBefore" => event_iso8601(expires_at), "cursor" => nothing, "truncated" => false)
     end
 end
 
@@ -683,11 +691,10 @@ function unsubscribe_event(server::MCPServer, context::MCPRequestContext, params
     # possible after resource access is revoked or an event is removed.
     id = event_subscription_id(principal, uri.url, name, arguments)
     @lock events.lock begin
-        subscription = get_event_subscription(events.store, id)
-        if subscription !== nothing
-            lock(subscription.lock) do
-                delete_event_subscription!(events.store, id)
-            end
+        delete_event_subscription!(events.store, id)
+        # No new attempt can start now; wait for one that already started.
+        while get(events.sending, id, 0) > 0
+            wait(events.lock)
         end
     end
     return JSONDict()
@@ -706,42 +713,58 @@ function deliver_event!(events, subscription, body, event_id)
     status = nothing
     reason = nothing
     attempts = 0
-    # Each attempt acquires the subscription lock anew, so unsubscribe,
-    # revocation, expiry, and secret rotation take effect between retries.
     for attempt in 1:events.max_attempts
-        result = lock(subscription.lock) do
-            current = get_event_subscription(events.store, subscription.id)
-            current === nothing && return (stop=true, accepted=false, reason="unsubscribed")
-            current.lock === subscription.lock || return (stop=true, accepted=false, reason="unsubscribed")
-            if current.expires_at <= events.clock()
-                delete_event_subscription!(events.store, current.id)
-                return (stop=true, accepted=false, reason="expired")
+        # Reread the record before each attempt, so unsubscribe, refresh, expiry,
+        # and secret rotation take effect between retries.
+        current = @lock events.lock begin
+            record = get_event_subscription(events.store, subscription.id)
+            if record === nothing
+                reason = "unsubscribed"
+            elseif record.expires_at <= events.clock()
+                delete_event_subscription!(events.store, record.id)
+                reason = "expired"
+                record = nothing
+            else
+                events.sending[record.id] = get(events.sending, record.id, 0) + 1
             end
-            if !event_authorized(events, current.principal, current.name, current.arguments)
-                delete_event_subscription!(events.store, current.id)
-                return (stop=true, accepted=false, reason="forbidden")
-            end
-            secrets = current.previous_secret !== nothing && current.previous_secret_until > events.clock() ?
-                (current.secret, current.previous_secret) : (current.secret,)
-            headers = event_webhook_headers(event_id, current.id, body, secrets; signed_at=events.clock())
-            attempts += 1
-            response = try
-                post_event_webhook(events, current.url, headers, body; deadline=min(current.expires_at, events.clock() + events.timeout))
-            catch err
-                reason = err isa MCPEventError ? get(err.data, "reason", "connection_refused") :
-                    err isa MCPError ? "invalid_destination" : "connection_refused"
-                return (stop=err isa MCPError, accepted=false, reason=reason)
-            end
-            status = Int(response.status)
-            status in 200:299 && return (stop=true, accepted=true, reason=nothing)
-            reason = status >= 500 ? "http_5xx" : "http_4xx"
-            (stop=status in (410, 413), accepted=false, reason=reason)
+            record
         end
-        reason = result.reason
-        (result.stop || attempt == events.max_attempts) &&
-            return (subscription_id=subscription.id, accepted=result.accepted, attempts=attempts, status=status, reason=reason)
+        current === nothing && break
+        stop = false
+        try
+            if event_authorized(events, current.principal, current.name, current.arguments)
+                now = events.clock()
+                secrets = current.previous_secret !== nothing && current.previous_secret_until > now ?
+                    (current.secret, current.previous_secret) : (current.secret,)
+                headers = event_webhook_headers(event_id, current.id, body, secrets; signed_at=now)
+                attempts += 1
+                response = post_event_webhook(events, current.url, headers, body; deadline=min(current.expires_at, now + events.timeout))
+                status = Int(response.status)
+                status in 200:299 &&
+                    return (subscription_id=subscription.id, accepted=true, attempts=attempts, status=status, reason=nothing)
+                reason = status >= 500 ? "http_5xx" : "http_4xx"
+                stop = status in (410, 413)
+            else
+                @lock events.lock delete_event_subscription!(events.store, current.id)
+                reason = "forbidden"
+                stop = true
+            end
+        catch err
+            err isa MCPEventError || err isa MCPError || rethrow()
+            reason = err isa MCPEventError ? get(err.data, "reason", "connection_refused") : "invalid_destination"
+            # A destination that resolves to a non-public address is not retried.
+            stop = err isa MCPError
+        finally
+            @lock events.lock begin
+                remaining = events.sending[current.id] - 1
+                remaining == 0 ? delete!(events.sending, current.id) : (events.sending[current.id] = remaining)
+                notify(events.lock)
+            end
+        end
+        (stop || attempt == events.max_attempts) && break
         events.wait(min(events.retry_delay * 2.0^(attempt - 1), 30.0))
     end
+    return (subscription_id=subscription.id, accepted=false, attempts=attempts, status=status, reason=reason)
 end
 
 """
@@ -771,9 +794,7 @@ function emit_event!(server::MCPServer, name::AbstractString, data; event_id=str
     receipts = NamedTuple[]
     for subscription in subscriptions
         if !event_authorized(events, subscription.principal, event_name, subscription.arguments)
-            lock(subscription.lock) do
-                delete_event_subscription!(events.store, subscription.id)
-            end
+            @lock events.lock delete_event_subscription!(events.store, subscription.id)
             continue
         end
         Base.invokelatest(definition.matches, subscription.principal, deepcopy(subscription.arguments), deepcopy(payload)) === true || continue
