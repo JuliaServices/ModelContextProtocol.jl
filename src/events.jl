@@ -258,7 +258,7 @@ function enable_events!(server::MCPServer;
         Int(default_ttl_ms), Int(max_ttl_ms), Int(max_subscriptions), Int(max_subscriptions_per_principal),
         Float64(verification_cooldown), Float64(rotation_grace), Float64(timeout),
         Int(max_attempts), Float64(retry_delay), allow_private_addresses,
-        Dict{Tuple{String,String},Float64}(), Dict{String,Int}(), Threads.Condition(),
+        Dict{Tuple{String,String},Float64}(), Dict{Tuple{String,String},Int}(), Threads.Condition(),
     )
     ensure_capability!(server, "events")
     return server
@@ -715,8 +715,10 @@ function unsubscribe_event(server::MCPServer, context::MCPRequestContext, params
     id = event_subscription_id(principal, uri.url, name, arguments)
     @lock events.lock begin
         delete_event_subscription!(events.store, id)
-        # No new attempt can start now; wait for one that already started.
-        while get(events.sending, id, 0) > 0
+        # No new attempt can start now; wait for the ones already sending. A
+        # subscription created again with the same key sends separately.
+        running = [key for key in keys(events.sending) if first(key) == id]
+        while any(key -> haskey(events.sending, key), running)
             wait(events.lock)
         end
     end
@@ -757,7 +759,8 @@ function deliver_event!(events, subscription, body, event_id)
                 reason = "expired"
                 record = nothing
             else
-                events.sending[record.id] = get(events.sending, record.id, 0) + 1
+                key = (record.id, record.instance)
+                events.sending[key] = get(events.sending, key, 0) + 1
             end
             record
         end
@@ -788,8 +791,9 @@ function deliver_event!(events, subscription, body, event_id)
             stop = err isa MCPError
         finally
             @lock events.lock begin
-                remaining = events.sending[current.id] - 1
-                remaining == 0 ? delete!(events.sending, current.id) : (events.sending[current.id] = remaining)
+                key = (current.id, current.instance)
+                remaining = events.sending[key] - 1
+                remaining == 0 ? delete!(events.sending, key) : (events.sending[key] = remaining)
                 notify(events.lock)
             end
         end

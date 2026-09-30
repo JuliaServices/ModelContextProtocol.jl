@@ -94,8 +94,8 @@ struct MCPEvents
     allow_private_addresses::Bool
     # (principal, callback host) => when the next verification may start; Inf while one runs.
     verifications::Dict{Tuple{String,String},Float64}
-    # Subscription ID => delivery attempts in progress, so unsubscribe can wait for them.
-    sending::Dict{String,Int}
+    # (subscription ID, instance) => delivery attempts in progress, so unsubscribe can wait for them.
+    sending::Dict{Tuple{String,String},Int}
     # Guards definitions, store writes, and both maps. Never held across network I/O
     # or application hooks; notified when a verification or delivery attempt ends.
     lock::Threads.Condition

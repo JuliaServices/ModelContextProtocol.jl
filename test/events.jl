@@ -614,6 +614,35 @@ end
     @test length(event_deliveries(recreated)) == 1
     @test length(event_records(recreated)) == 1
 
+    # Unsubscribe waits for the subscription it removed, not for a new one
+    # created with the same key while it waits.
+    sending = Channel{String}(2)
+    release_old = Channel{Nothing}(1)
+    release_new = Channel{Nothing}(1)
+    gated = function (url, address, headers, body, timeout)
+        event_id = get(JSON.parse(body), "eventId", nothing)
+        if event_id !== nothing
+            put!(sending, event_id)
+            take!(event_id == "old" ? release_old : release_new)
+        end
+        holder[].sender(url, address, headers, body, timeout)
+    end
+    replaced = event_fixture(request=gated)
+    holder[] = replaced
+    event_request(replaced.server, "events/subscribe", event_params())
+    old_delivery = @async EventsMCP.emit_event!(replaced.server, "comment.created", event_data(); event_id="old")
+    @test take!(sending) == "old"
+    stopping = @async event_request(replaced.server, "events/unsubscribe", event_params())
+    @test timedwait(() -> isempty(event_records(replaced)), 10) == :ok
+    event_request(replaced.server, "events/subscribe", event_params())
+    new_delivery = @async EventsMCP.emit_event!(replaced.server, "comment.created", event_data(); event_id="new")
+    @test take!(sending) == "new"
+    put!(release_old, nothing)
+    @test timedwait(() -> istaskdone(stopping), 10) == :ok
+    @test !istaskdone(new_delivery)
+    put!(release_new, nothing)
+    @test timedwait(() -> istaskdone(new_delivery) && istaskdone(old_delivery), 10) == :ok
+
     # A revocation check that finishes after access was restored and the
     # subscription refreshed must not delete the refreshed subscription.
     revoked = Ref(false)
