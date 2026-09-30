@@ -518,9 +518,13 @@ function request_event_webhook(url, address::IPAddr, headers, body, timeout)
     addresses == C_NULL && throw(callback_failure("connection_refused"))
     downloader = Downloads.Downloader(; grace=0)
     downloader.easy_hook = function (easy, _info)
+        # Pin the address; refuse redirects, proxies, and netrc. Downloads reads
+        # ~/.netrc by default, which would send the server's stored credentials
+        # to a callback host the subscriber chose.
         for (option, value) in (
             (curl.CURLOPT_CONNECT_TO, addresses), (curl.CURLOPT_FOLLOWLOCATION, 0),
-            (curl.CURLOPT_PROXY, ""), (curl.CURLOPT_SSL_VERIFYPEER, 1), (curl.CURLOPT_SSL_VERIFYHOST, 2),
+            (curl.CURLOPT_PROXY, ""), (curl.CURLOPT_NETRC, curl.CURL_NETRC_IGNORED),
+            (curl.CURLOPT_SSL_VERIFYPEER, 1), (curl.CURLOPT_SSL_VERIFYHOST, 2),
         )
             curl.setopt(easy, option, value) == 0 || throw(callback_failure("connection_refused"))
         end

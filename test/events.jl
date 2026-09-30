@@ -929,14 +929,24 @@ end
                     `lsof -nP -a -p $(getpid()) -iTCP:$(port) -sTCP:ESTABLISHED -t`)))
                 @test timedwait(() -> !connected(), 5) == :ok
             end
+            # The server's netrc credentials never reach a callback host.
+            mktempdir() do home
+                write(joinpath(home, ".netrc"), "default login server-user password server-secret\n")
+                chmod(joinpath(home, ".netrc"), 0o600)
+                withenv("HOME" => home) do
+                    @test only(EventsMCP.emit_event!(fixture.server, "comment.created", event_data())).accepted
+                end
+            end
+            @test EventsMCP.http_header_value(last(received).headers, "Authorization") === nothing
+            @test length(received) == 3
             wrong_host = event_params(url="https://wrong.test:$(port)/hook")
             _, rejected = event_request(fixture.server, "events/subscribe", wrong_host)
             @test rejected["error"]["code"] == -32015
             @test rejected["error"]["data"]["reason"] == "tls_error"
-            @test length(received) == 2
+            @test length(received) == 3
             _, rejected = event_request(fixture.server, "events/subscribe", event_params(url="https://callback.test:$(port)/redirect"))
             @test rejected["error"]["code"] == -32015
-            @test length(received) == 3
+            @test length(received) == 4
             @test last(received).target == "/redirect"
             @test !any(request -> request.target == "/private", received)
         end
