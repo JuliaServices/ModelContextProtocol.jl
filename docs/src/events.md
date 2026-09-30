@@ -111,9 +111,8 @@ One process owns each file. Replicas need an application-backed
 - `delete_event_subscription!(store, id)`: idempotently delete it.
 
 Distributed backends must enforce quotas and coordinate subscription changes
-and delivery across workers. Built-in locks coordinate one process.
-Reads and refreshes must preserve each record's per-process lock; callers must
-not mutate stored records or their filters.
+and delivery across workers. Built-in locks coordinate one process. Records are
+plain data; callers must not mutate stored records or their filters.
 `InMemoryEventSubscriptionStore` suits tests and temporary subscriptions;
 use durable storage for ChatGPT.
 
@@ -125,22 +124,26 @@ A guessed `id` cannot address or modify another subscription.
 
 The default lifetime is 30 minutes, capped at one day. Omitted `ttlMs` uses the
 default. A finite request is clamped to the configured cap. `ttlMs: null`
-requests no expiry, but this implementation grants a finite default lifetime.
+requests no expiry; this implementation grants the cap instead.
 Refresh before the returned `refreshBefore`. Expired subscriptions stop
 delivering. Unsubscribe is idempotent and remains possible after resource access
 is revoked.
 
 Events are emit-only: `cursor` is always `null` and `truncated` is `false`.
-A non-null replay cursor is explicitly unsupported. Subscription persistence
-does not recover an occurrence whose emission was interrupted. Your application
-owns its reliable queue or outbox.
+A non-null replay cursor is explicitly unsupported, and `maxAgeMs` is ignored
+because it only bounds replay. Subscription persistence does not recover an
+occurrence whose emission was interrupted. Your application owns its reliable
+queue or outbox.
 
 ## Callback verification and delivery
 
 Before accepting a subscription, the server sends a signed challenge and
-requires the endpoint to echo it in a `2xx` JSON response. Successful verification
-is cached for five minutes per subject and exact URL. Failed destinations have
-a short cooldown. Subscription and verification quotas bound state growth.
+requires the endpoint to echo it in a `2xx` JSON response. A live subscription
+from the same subject to the same URL counts as verified, so refreshes, key
+rotation, and new filters send no challenge. Each subject runs one verification
+per callback host at a time, and a failure starts a short cooldown for that
+subject and host. Other subjects are unaffected, which matters when many users
+share a hosted receiver. Subscription quotas bound state growth.
 
 The default HTTPS sender validates every resolved address before each connection
 and pins the selected address with libcurl's `CONNECT_TO`. The original hostname
@@ -174,9 +177,13 @@ Occurrences contain `eventId`, `name`, an ISO 8601 UTC `timestamp`, `data`,
 and `cursor: null`. Application fields belong inside `data`. Pass `timestamp`
 as Unix seconds to preserve the upstream occurrence time; it defaults to now.
 
-Delivery is synchronous and sequential, with no background task or unbounded
-queue. Receipts contain `subscription_id`, `accepted`, `attempts`, `status`,
-and `reason`. A `2xx` acknowledges receipt, not completion of a ChatGPT task.
+Every body is built and validated before any is sent, so a failing `matches`,
+`transform`, or payload sends nothing. Each owner's subscriptions are delivered
+in order and different owners concurrently, up to 16 at a time, so a slow
+endpoint delays only its owner. `emit_event!` returns after every delivery
+finishes; there is no background task or unbounded queue. Receipts contain
+`subscription_id`, `accepted`, `attempts`, `status`, and `reason`. A `2xx`
+acknowledges receipt, not completion of a ChatGPT task.
 The default is four attempts with exponential backoff. `410` and `413` are not
 retried. Access, expiry, and subscription existence are checked before every
 attempt. Unsubscribe drains an in-flight request; later retries stop.
