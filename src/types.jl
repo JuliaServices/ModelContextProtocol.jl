@@ -43,6 +43,60 @@ end
 
 abstract type MCPSessionStore end
 
+"Event state is independent of legacy HTTP sessions."
+abstract type MCPEventSubscriptionStore end
+
+struct MCPWebhookSubscription
+    id::String
+    principal::String
+    name::String
+    arguments::JSONDict
+    url::String
+    secret::String
+    expires_at::Float64
+    previous_secret::Union{String,Nothing}
+    previous_secret_until::Float64
+    lock::ReentrantLock
+end
+
+struct MCPServerEvent
+    name::String
+    description::Union{String,Nothing}
+    input_schema::JSONDict
+    payload_schema::JSONDict
+    input_validator::JSONSchema.Schema
+    payload_validator::JSONSchema.Schema
+    matches::Function
+    transform::Function
+    meta::JSONDict
+end
+
+struct MCPEvents
+    store::MCPEventSubscriptionStore
+    principal::Function
+    authorize::Function
+    definitions::Dict{String,MCPServerEvent}
+    request::Function
+    resolve::Function
+    clock::Function
+    wait::Function
+    default_ttl_ms::Int
+    max_ttl_ms::Int
+    max_subscriptions::Int
+    max_subscriptions_per_principal::Int
+    verification_ttl::Float64
+    verification_cooldown::Float64
+    rotation_grace::Float64
+    timeout::Float64
+    max_attempts::Int
+    retry_delay::Float64
+    allow_private_addresses::Bool
+    verified::Dict{Tuple{String,String},Float64}
+    verification_attempts::Dict{String,Float64}
+    verification_lock::ReentrantLock
+    lock::ReentrantLock
+end
+
 Base.@kwdef struct MCPServerConfig
     name::String
     version::String
@@ -318,7 +372,11 @@ mutable struct MCPServer
     completion_handler::Union{Function,Nothing}
     listeners::Vector{MCPSubscriptionListener}
     listeners_lock::ReentrantLock
+    events::Union{MCPEvents,Nothing}
 end
+
+MCPServer(config, transport_path, capabilities, server_info, tools, prompts, resources, resource_templates, sessions, session_store, request_hook, cancellation_handler, logging_handler, logging_level, missing_protocol_header_behavior, completion_handler, listeners, listeners_lock) =
+    MCPServer(config, transport_path, capabilities, server_info, tools, prompts, resources, resource_templates, sessions, session_store, request_hook, cancellation_handler, logging_handler, logging_level, missing_protocol_header_behavior, completion_handler, listeners, listeners_lock, nothing)
 
 # Preserve the positional server constructor from 1.0.0.
 MCPServer(config, transport_path, capabilities, server_info, tools, prompts, resources, resource_templates, sessions, session_store, request_hook, cancellation_handler, logging_handler, logging_level, missing_protocol_header_behavior, completion_handler) =

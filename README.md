@@ -96,6 +96,11 @@ See the
 for capability checks, multi-round-trip results, custom headers, caching, and
 subscriptions.
 
+The experimental [MCP Events webhook profile](docs/src/events.md) adds
+authenticated event discovery and subscriptions, signed HTTPS callbacks,
+restart-safe subscription storage, and namespaced client helpers. Events use
+MCP `2026-07-28`; polling, push streams, and replay are not advertised.
+
 ## Agentif Tools
 
 When `Agentif.jl` is loaded, this package can register Agentif tools directly:

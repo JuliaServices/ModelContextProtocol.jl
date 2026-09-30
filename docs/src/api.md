@@ -42,6 +42,23 @@ for a complete example and the support limits.
 - `ModelContextProtocol.handle_static_stream_request`
 - `ModelContextProtocol.handle_static_session_delete`
 
+## MCP Events
+
+These APIs are namespaced. See [MCP Events](events.md) for security hooks,
+persistence, delivery receipts, and protocol limits.
+
+- `ModelContextProtocol.enable_events!`
+- `ModelContextProtocol.register_event!`
+- `ModelContextProtocol.emit_event!`
+- `ModelContextProtocol.InMemoryEventSubscriptionStore`
+- `ModelContextProtocol.FileEventSubscriptionStore`
+- `ModelContextProtocol.MCPEventSubscriptionStore`
+- `ModelContextProtocol.list_events`
+- `ModelContextProtocol.subscribe_event`
+- `ModelContextProtocol.unsubscribe_event`
+- `ModelContextProtocol.event_webhook_secret`
+- `ModelContextProtocol.verify_event_webhook`
+
 ## MCP Apps (SEP-1865)
 
 Helpers for serving interactive HTML widgets that hosts render inline. See
