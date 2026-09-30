@@ -1093,6 +1093,13 @@ function manifest_capabilities(server::MCPServer)
     return capabilities
 end
 
+# MCP Events are defined only for 2026-07-28 and later protocol versions.
+function version_capabilities(server::MCPServer, version::AbstractString)
+    capabilities = manifest_capabilities(server)
+    is_modern_protocol_version(version) || pop!(capabilities, "events", nothing)
+    return capabilities
+end
+
 function default_manifest(config::MCPServerConfig, server::MCPServer)
     transport = Dict{String,Any}(
         "type" => "http",
@@ -1109,7 +1116,7 @@ function default_manifest(config::MCPServerConfig, server::MCPServer)
     entry = Dict{String,Any}(
         "protocol" => "https://modelcontextprotocol.io/$(config.protocol_version)",
         "transport" => transport,
-        "capabilities" => manifest_capabilities(server),
+        "capabilities" => version_capabilities(server, config.protocol_version),
         "default" => true,
     )
     manifest = Dict{String,Any}(
@@ -1505,11 +1512,9 @@ function initialize_response(server::MCPServer, session::MCPSession, params::Dic
     session.client_info = session_metadata_dict(params, "clientInfo", "client_info")
     session.client_capabilities = session_metadata_dict(params, "capabilities", "client_capabilities")
     version = negotiate_protocol_version(server, get(params, "protocolVersion", nothing))
-    capabilities = manifest_capabilities(server)
-    is_modern_protocol_version(version) || pop!(capabilities, "events", nothing)
     result = Dict(
         "protocolVersion" => version,
-        "capabilities" => capabilities,
+        "capabilities" => version_capabilities(server, version),
         "serverInfo" => server.server_info,
     )
     server.config.instructions !== nothing && (result["instructions"] = String(server.config.instructions))

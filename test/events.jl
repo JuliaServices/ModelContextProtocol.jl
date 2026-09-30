@@ -127,6 +127,8 @@ event_records(fixture) = EventsMCP.event_subscriptions(fixture.server.events.sto
     @test !haskey(plain.capabilities, "events")
     _, legacy = event_request(server, "initialize", Dict("protocolVersion" => "2025-11-25"); legacy=true)
     @test !haskey(legacy["result"]["capabilities"], "events")
+    # The discovery manifest describes the 2025-11-25 endpoint, which has no events.
+    @test !haskey(only(EventsMCP.server_manifest(server)["model_context_protocols"])["capabilities"], "events")
     @test haskey(server.capabilities, "events")
     @test_throws ArgumentError EventsMCP.register_event!(server; name="comment.created",
         input_schema=Dict(), payload_schema=Dict(), matches=(_...) -> true)
