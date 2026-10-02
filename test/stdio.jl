@@ -67,6 +67,7 @@ function stdio_test_closed(client)
     @test Base.process_exited(connection.process)
     @test !isopen(connection.process.in) && !isopen(connection.process.out)
     @test isempty(connection.pending)
+    @test isempty(connection.request_tasks)
     @test connection.queued_events == connection.queued_writes == 0
     @test all(task -> task === nothing || istaskdone(task),
         (connection.reader, connection.writer, connection.callbacks, connection.input_closer, connection.shutdown))
@@ -246,15 +247,17 @@ end
         end
     end
 
-    @testset "A blocked callback cannot block response routing" begin
+    @testset "A blocked notification cannot block requests or responses" begin
         started, release = Channel{Nothing}(1), Channel{Nothing}(1)
         client = stdio_test_client(; max_pending_messages=2, stderr=devnull)
         register_notification_handler!(client, "test/event", (_, _, _) -> (put!(started, nothing); take!(release)))
+        register_request_handler!(client, "test/request", (_, _, _, _) -> Dict("routed"=>true))
         try
             initialize_client!(client)
             call_tool(client, "notify")
             stdio_take(started)
             @test call_tool(client, "echo"; arguments=Dict("routed"=>true))["structuredContent"]["routed"]
+            @test call_tool(client, "server_request")["callback"]["result"]["routed"]
             error = stdio_catch(() -> call_tool(client, "flood"))
             @test error isa MCPError && error.code == :callback_overflow
             closed = stdio_catch(() -> close(client; timeout=0.5))
@@ -263,6 +266,113 @@ end
             @test !istaskdone(client.stdio.callbacks)
         finally
             put!(release, nothing)
+            stdio_test_closed(client)
+        end
+    end
+
+    @testset "Nested calls can service dependent server requests" begin
+        client = stdio_test_client(; stderr=devnull)
+        register_request_handler!(client, "test/outer", (c, _, _, _) ->
+            call_tool(c, "server_request";
+                arguments=Dict("id"=>"inner", "method"=>"test/inner"), timeout_ms=2000)["callback"]["result"])
+        register_request_handler!(client, "test/inner", (_, _, _, _) -> Dict("nested"=>true))
+        try
+            initialize_client!(client)
+            result = call_tool(client, "server_request";
+                arguments=Dict("id"=>"outer", "method"=>"test/outer"))["callback"]
+            @test haskey(result, "result") && result["result"] == Dict("nested"=>true)
+            @test call_tool(client, "echo"; arguments=Dict("usable"=>true))["structuredContent"]["usable"]
+        finally
+            stdio_test_closed(client)
+        end
+    end
+
+    @testset "Active server requests are bounded and retained for close" begin
+        started, release = Channel{Any}(2), Channel{Nothing}(2)
+        client = stdio_test_client(; max_pending_messages=2, stderr=devnull)
+        register_request_handler!(client, "test/request", (_, _, _, id) -> begin
+            put!(started, id)
+            take!(release)
+            Dict()
+        end)
+        try
+            initialize_client!(client)
+            @test call_tool(client, "server_requests"; arguments=Dict("count"=>2))["count"] == 2
+            @test Set([stdio_take(started), stdio_take(started)]) == Set(["server-1", "server-2"])
+            handlers = lock(() -> collect(client.stdio.request_tasks), client.stdio.lock)
+            @test length(handlers) == 2
+            error = stdio_catch(() -> call_tool(client, "server_request"; arguments=Dict("id"=>"overflow")))
+            @test error isa MCPError && error.code == :callback_overflow
+            closed = stdio_catch(() -> close(client; timeout=0.5))
+            @test closed isa MCPError && closed.code == :callback_timeout
+            @test Base.process_exited(client.stdio.process)
+            @test all(task -> !istaskdone(task), handlers)
+        finally
+            put!(release, nothing)
+            put!(release, nothing)
+            stdio_test_closed(client)
+        end
+    end
+
+    @testset "Active server requests finish after $action" for (action, code) in
+        (("eof", :transport_closed), ("malformed", :jsonrpc_error))
+        waiting, outcomes = Channel{Any}(2), Channel{Any}(2)
+        client = stdio_test_client(; stderr=devnull)
+        register_notification_handler!(client, "test/waiting", (_, _, value) -> put!(waiting, value))
+        register_request_handler!(client, "test/request", (c, _, _, _) -> begin
+            put!(outcomes, stdio_catch(() -> call_tool(c, "hang")))
+            Dict()
+        end)
+        try
+            initialize_client!(client)
+            call_tool(client, "server_requests"; arguments=Dict("count"=>2))
+            stdio_take(waiting)
+            stdio_take(waiting)
+            @test lock(() -> length(client.stdio.request_tasks), client.stdio.lock) == 2
+            error = stdio_catch(() -> call_tool(client, action))
+            @test error isa MCPError && error.code == code
+            @test all(error -> error isa MCPError && error.code == code,
+                [stdio_take(outcomes), stdio_take(outcomes)])
+        finally
+            stdio_test_closed(client)
+        end
+    end
+
+    @testset "Concurrent close from $callbacks" for callbacks in (:requests, :notification_and_request)
+        started, closed = Channel{Nothing}(2), Channel{Any}(2)
+        begin_close, finish = Channel{Nothing}(2), Channel{Nothing}(2)
+        client = stdio_test_client(; stderr=devnull)
+        function close_from_callback(c)
+            put!(started, nothing)
+            take!(begin_close)
+            put!(closed, stdio_catch(() -> close(c)))
+            take!(finish)
+            return Dict()
+        end
+        register_request_handler!(client, "test/request", (c, _, _, _) -> close_from_callback(c))
+        register_notification_handler!(client, "test/event", (c, _, _) -> close_from_callback(c))
+        outer = nothing
+        try
+            initialize_client!(client)
+            if callbacks == :requests
+                call_tool(client, "server_requests"; arguments=Dict("count"=>2))
+            else
+                call_tool(client, "notify")
+                outer = @async stdio_catch(() -> call_tool(client, "server_request"))
+            end
+            stdio_take(started)
+            stdio_take(started)
+            put!(begin_close, nothing)
+            put!(begin_close, nothing)
+            @test stdio_take(closed) === nothing
+            @test stdio_take(closed) === nothing
+            @test Base.process_exited(client.stdio.process)
+            error = stdio_catch(() -> close(client; timeout=0.1))
+            @test error isa MCPError && error.code == :callback_timeout
+            outer === nothing || @test fetch(outer) isa MCPError
+        finally
+            put!(finish, nothing)
+            put!(finish, nothing)
             stdio_test_closed(client)
         end
     end

@@ -23,6 +23,8 @@ The client also owns local child processes through
 `ModelContextProtocol.prepare_stdio_client`. It supports newline-delimited
 JSON-RPC, concurrent calls, notifications, legacy server requests, cancellation,
 and bounded process shutdown for either explicitly selected protocol version.
+Notifications retain arrival order; bounded legacy request-handler tasks allow
+nested calls and may overlap notifications and other request handlers.
 
 The package also includes a separate tools-only server for JuliaC
 `--trim=safe` builds. That server intentionally supports only the documented
@@ -37,7 +39,8 @@ The repository tests these areas:
 - OAuth 2 and OAuth 3 compatibility.
 - Stateful and stateless HTTP client/server integration.
 - Owned stdio child processes, concurrent response correlation, malformed or
-  oversized frames, cancellation, blocked callbacks, and process shutdown.
+  oversized frames, cancellation, nested server requests, bounded callback
+  tasks, blocked callbacks, concurrent callback close, and process shutdown.
 - Strict JSON-RPC parsing and notification side-effect rules.
 - Client result response IDs must match the request before results or session
   state are accepted.

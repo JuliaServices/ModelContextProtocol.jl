@@ -21,11 +21,13 @@ are rejected. A response timeout sends cancellation; a write timeout breaks
 the connection because a partial frame cannot be retried safely.
 
 The byte limit applies to each incoming and outgoing message. The pending
-limit bounds calls, queued writes, and queued callbacks separately. Callback
-overflow or invalid server output breaks the connection. Callbacks run in
-order on a separate task, so a slow or reentrant handler does not stop response
-routing. Closing discards callbacks that have not started. A blocked user
-callback must cooperate with shutdown; see `close(::MCPClient)`.
+limit separately bounds calls, queued writes, queued notifications, and active
+server-request handlers. Callback overflow or invalid server output breaks the
+connection. Notifications run in order; legacy request handlers run in separate
+tasks and may overlap each other and notifications. A handler's nested call can
+receive another server request before it completes. Closing discards callbacks
+that have not started. User callbacks must cooperate with shutdown; see
+`close(::MCPClient)`.
 
 The child's stderr is redirected directly to a filename, `IOStream`, terminal,
 pipe, or `devnull`, separately from protocol stdout. In-memory and custom IO
@@ -62,7 +64,7 @@ function prepare_stdio_client(
     guard = ReentrantLock()
     connection = StdioConnection(process, guard, Threads.Condition(guard), Dict{String,Channel{Any}}(),
         Channel{StdioWrite}(pending_limit), Channel{JSONDict}(pending_limit), 0, 0,
-        nothing, nothing, nothing, nothing, nothing, nothing, byte_limit, pending_limit)
+        nothing, nothing, nothing, nothing, Set{Task}(), nothing, nothing, byte_limit, pending_limit)
     client.stdio = connection
     connection.writer = @async stdio_writer(client)
     connection.callbacks = @async stdio_callbacks(client)
@@ -275,6 +277,7 @@ function stdio_message!(client::MCPClient, bytes::Vector{UInt8})
             id = data["id"]
             (id isa AbstractString || (id isa Integer && !(id isa Bool))) ||
                 throw(mcp_error(:jsonrpc_error, "Invalid server request ID"))
+            return stdio_start_request!(client, data)
         end
         @lock connection.lock begin
             connection.failure === nothing || return
@@ -335,6 +338,42 @@ function stdio_reader(client::MCPClient)
     end
 end
 
+function stdio_start_request!(client::MCPClient, payload::JSONDict)
+    connection = stdio_connection(client)
+    @lock connection.lock begin
+        connection.failure === nothing || return
+        length(connection.request_tasks) < connection.max_pending_messages ||
+            throw(mcp_error(:callback_overflow, "Too many active stdio server requests"))
+        task = @task try
+            @lock connection.lock connection.failure === nothing || return
+            stdio_callback(client, payload)
+        finally
+            @lock connection.lock delete!(connection.request_tasks, current_task())
+        end
+        # Own the task before it can run or shutdown can observe it.
+        push!(connection.request_tasks, task)
+        schedule(task)
+    end
+    return nothing
+end
+
+function stdio_callback(client::MCPClient, payload::JSONDict)
+    connection = stdio_connection(client)
+    try
+        if get(payload, "method", nothing) == JSONRPC_METHOD_PING && haskey(payload, "id") &&
+            !haskey(client.request_handlers, JSONRPC_METHOD_PING)
+            send_jsonrpc_response!(client, payload["id"])
+        else
+            Base.invokelatest(handle_jsonrpc_event!, client, payload)
+        end
+    catch err
+        if @lock(connection.lock, connection.failure === nothing)
+            @warn "Stdio callback failed" exception=(err, catch_backtrace())
+        end
+    end
+    return nothing
+end
+
 function stdio_callbacks(client::MCPClient)
     connection = stdio_connection(client)
     for payload in connection.events
@@ -342,18 +381,7 @@ function stdio_callbacks(client::MCPClient)
             connection.failure === nothing || return
             connection.queued_events -= 1
         end
-        try
-            if get(payload, "method", nothing) == JSONRPC_METHOD_PING && haskey(payload, "id") &&
-                !haskey(client.request_handlers, JSONRPC_METHOD_PING)
-                send_jsonrpc_response!(client, payload["id"])
-            else
-                Base.invokelatest(handle_jsonrpc_event!, client, payload)
-            end
-        catch err
-            if @lock(connection.lock, connection.failure === nothing)
-                @warn "Stdio callback failed" exception=(err, catch_backtrace())
-            end
-        end
+        stdio_callback(client, payload)
     end
 end
 
@@ -422,9 +450,11 @@ a later `close` may finish it. The caller owns any custom stderr destination.
 
 Julia cannot safely interrupt arbitrary user callback code. If a callback
 remains blocked after process/IO shutdown, throw `MCPError(:callback_timeout)`;
-release the callback and close again. A callback that calls `close` does not
-wait on itself, and finishes when its handler returns. Queued callbacks are
-discarded. HTTP clients delegate to `terminate_session!`.
+release the callback and close again. A callback that calls `close` waits for
+process and IO shutdown but not for user callback tasks, preventing callbacks
+that close concurrently from waiting on each other. A later external `close`
+waits for any unfinished callbacks. Queued callbacks are discarded. HTTP
+clients delegate to `terminate_session!`.
 """
 function Base.close(client::MCPClient; timeout::Real=5.0)
     isfinite(timeout) && timeout > 0 || throw(ArgumentError("close timeout must be positive and finite"))
@@ -437,14 +467,23 @@ function Base.close(client::MCPClient; timeout::Real=5.0)
         throw(mcp_error(:shutdown_timeout, "Stdio process cleanup is still in progress; close again to wait"))
     result = fetch(task)
     result isa Exception && throw(result)
-    for worker in (connection.input_closer, connection.reader, connection.writer, connection.callbacks)
-        worker === nothing && continue
-        worker === current_task() && continue
-        if timedwait(() -> istaskdone(worker), max(0.0, deadline - stdio_now()); pollint=0.001) !== :ok
-            code = worker === connection.callbacks ? :callback_timeout : :shutdown_timeout
-            throw(mcp_error(code, "A stdio task is still active; release user callback code and close again"))
+    callback_workers = @lock connection.lock begin
+        if current_task() === connection.callbacks || current_task() in connection.request_tasks
+            ()
+        else
+            (connection.callbacks, connection.request_tasks...)
         end
-        fetch(worker)
+    end
+    for (workers, code) in (((connection.input_closer, connection.reader, connection.writer), :shutdown_timeout),
+                           (callback_workers, :callback_timeout))
+        for worker in workers
+            worker === nothing && continue
+            worker === current_task() && continue
+            if timedwait(() -> istaskdone(worker), max(0.0, deadline - stdio_now()); pollint=0.001) !== :ok
+                throw(mcp_error(code, "A stdio task is still active; release user callback code and close again"))
+            end
+            fetch(worker)
+        end
     end
     client.initialized = false
     client.session = nothing

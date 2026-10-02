@@ -66,10 +66,13 @@ discarded. EOF, invalid JSON/UTF-8, mismatched IDs, and oversized frames fail
 pending calls and start process cleanup.
 
 Notifications and legacy server requests use the existing handler registration
-APIs. One callback task preserves arrival order, independently of response
-reading. A handler can make a nested client call. A slow handler delays other
-callbacks but does not stop response routing. Closing discards queued callbacks
-that have not started.
+APIs. One notification task preserves notification arrival order. Legacy server
+requests run in separate, bounded tasks, so a handler's nested client call can
+receive another server request before it completes. Request handlers may overlap
+each other and notifications; protect shared application state accordingly.
+A slow notification handler delays other notifications but does not block
+server requests or response routing. Closing discards callbacks that have not
+started.
 
 ## Bounds and shutdown
 
@@ -83,10 +86,10 @@ settings are rejected.
 
 `max_message_bytes` defaults to 16 MiB per incoming/outgoing message.
 `max_pending_messages` defaults to 128 and separately limits pending calls,
-queued writes, and queued callbacks. A full call/write queue reports
-`MCPError(:transport_busy)`. Callback overflow fails the connection with
-`MCPError(:callback_overflow)`. These are queue/frame limits, not a total memory
-quota for parsed JSON or user code.
+queued writes, queued notifications, and active server-request handlers. A full
+call/write queue reports `MCPError(:transport_busy)`. Exceeding either callback
+limit fails the connection with `MCPError(:callback_overflow)`. These are
+queue/frame limits, not a total memory quota for parsed JSON or user code.
 
 Stderr can go directly to a filename, open file, terminal, pipe, or `devnull`.
 Caller-provided destinations remain caller-owned. In-memory/custom IO sinks
@@ -102,8 +105,10 @@ available if close times out, so a later `close` can finish waiting.
 Julia cannot safely interrupt arbitrary callback code. A blocked user callback
 can produce `MCPError(:callback_timeout)` after process/IO cleanup. Release that
 callback and close again. A callback may call `close` itself; close skips waiting
-for that callback, which finishes when its handler returns. This transport does
-not provide forced task cancellation.
+for all user callback tasks in that case, after waiting for process and IO
+shutdown. This prevents callbacks that close concurrently from waiting on each
+other. Unfinished callbacks remain owned; a later `close` outside a callback
+waits for them. This transport does not provide forced task cancellation.
 
 The dynamic subprocess client is not a JuliaC `--trim=safe` API. The package's
 [static tools server](static-server.md) remains its supported native subset.

@@ -22,7 +22,7 @@ for line in eachline(stdin)
     params = get(message, "params", Dict())
     if method === nothing
         original = pop!(callbacks, id)
-        respond(original, Dict("callback"=>message))
+        original === nothing || respond(original, Dict("callback"=>message))
     elseif method == "initialize"
         version = mode == "wrong_version" ? "1900-01-01" : params["protocolVersion"]
         respond(id, Dict("protocolVersion"=>version, "capabilities"=>Dict("tools"=>Dict()),
@@ -73,6 +73,14 @@ for line in eachline(stdin)
             request_id = get(arguments, "id", 77)
             callbacks[request_id] = id
             emit(Dict("jsonrpc"=>"2.0", "id"=>request_id, "method"=>get(arguments, "method", "test/request"), "params"=>arguments))
+        elseif name == "server_requests"
+            count = arguments["count"]
+            for i in 1:count
+                request_id = "server-$i"
+                callbacks[request_id] = nothing
+                emit(Dict("jsonrpc"=>"2.0", "id"=>request_id, "method"=>get(arguments, "method", "test/request")))
+            end
+            respond(id, Dict("count"=>count))
         elseif name == "flood"
             for i in 1:8
                 notify("test/event", Dict("value"=>i))

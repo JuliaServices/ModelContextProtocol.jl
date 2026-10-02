@@ -277,6 +277,7 @@ mutable struct StdioConnection
     reader::Union{Nothing,Task}
     writer::Union{Nothing,Task}
     callbacks::Union{Nothing,Task}
+    request_tasks::Set{Task}
     input_closer::Union{Nothing,Task}
     shutdown::Union{Nothing,Task}
     max_message_bytes::Int
