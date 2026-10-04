@@ -12,7 +12,8 @@ The package supports Streamable HTTP for two protocol eras:
   streams, cancellation, ping, logging level changes, resource subscriptions,
   tools, prompts, resources, completions, and MCP Apps.
 - MCP `2026-07-28`: stateless request metadata, `server/discover`, standard and
-  custom request headers, cache metadata, client capability checks,
+  custom request headers, bounded supported-version retries for ordinary HTTP
+  calls, cache metadata, client capability checks,
   multi-round-trip `input_required` results, request-scoped progress and log
   events, and `subscriptions/listen`.
 - Experimental MCP Events webhook profile on `2026-07-28`: event discovery,
@@ -42,6 +43,9 @@ The repository tests these areas:
   Windows.
 - OAuth 2 and OAuth 3 compatibility.
 - Stateful and stateless HTTP client/server integration.
+- Headerless legacy initialization, continued modern and subsequent-request
+  header enforcement, and bounded version retries that preserve request data
+  without replaying unrelated errors.
 - Owned stdio child processes, concurrent response correlation, malformed or
   oversized frames, cancellation, nested server requests, bounded callback
   tasks, blocked callbacks, concurrent callback close, and process shutdown.

@@ -110,7 +110,8 @@ function jsonrpc_call(
         timeout_value = normalize_timeout_ms(timeout_ms)
         push!(header_pairs, normalize_pair("Mcp-Timeout-Ms", string(timeout_value)))
     end
-    response = submit_jsonrpc_request(client, body; headers=header_pairs, timeout=timeout)
+    response = submit_jsonrpc_request(client, body; headers=header_pairs, timeout=timeout,
+        retry_protocol_version=client_is_modern(client) && !notification)
     notification && return nothing
     isempty(response.body) && throw(mcp_error(:jsonrpc_error, "JSON-RPC response from $(client.transport.url) was empty"))
     if is_event_stream_response(response)
@@ -162,20 +163,61 @@ end
 jsonrpc_notification(client::MCPClient, method::AbstractString; params=nothing, headers=nothing) =
     jsonrpc_call(client, method; params=params, notification=true, headers=headers)
 
-function submit_jsonrpc_request(client::MCPClient, body; headers, timeout)
+function protocol_version_retry_body(body, response::HTTP.Response, headers)
+    request, params, meta, id, requested, reply = try
+        # Preserve raw values so retrying cannot round numbers or repeat custom lowering.
+        request = JSON.parse(client_request_body_text(body), Dict{String,JSON.JSONText})
+        params = JSON.parse(request["params"].value, Dict{String,JSON.JSONText})
+        meta = JSON.parse(params["_meta"].value, Dict{String,JSON.JSONText})
+        id = JSON.parse(request["id"].value)
+        requested = JSON.parse(meta[META_PROTOCOL_VERSION].value)
+        (request, params, meta, id, requested, JSON.parse(client_request_body_text(response.body)))
+    catch
+        return nothing
+    end
+    reply isa AbstractDict || return nothing
+    id !== nothing && get(reply, "id", nothing) == id || return nothing
+    get(reply, "jsonrpc", nothing) == JSONRPC_VERSION && !haskey(reply, "result") || return nothing
+    error = get(reply, "error", nothing)
+    error isa AbstractDict || return nothing
+    code = get(error, "code", nothing)
+    code isa Integer && code == -32022 && get(error, "message", nothing) isa AbstractString || return nothing
+    data = get(error, "data", nothing)
+    data isa AbstractDict || return nothing
+    supported = get(data, "supported", nothing)
+    supported isa AbstractVector && all(version -> version isa AbstractString, supported) || return nothing
+    # Legacy versions need an initialize handshake; retry only the implemented modern format.
+    PROTOCOL_VERSION_2026_07_28 in supported || return nothing
+    requested isa AbstractString && is_modern_protocol_version(requested) || return nothing
+    requested == http_header_value(headers, "MCP-Protocol-Version") == get(data, "requested", nothing) || return nothing
+    meta[META_PROTOCOL_VERSION] = JSON.JSONText(JSON.json(PROTOCOL_VERSION_2026_07_28))
+    params["_meta"] = JSON.JSONText(JSON.json(meta))
+    request["params"] = JSON.JSONText(JSON.json(params))
+    return JSON.json(request)
+end
+
+function submit_jsonrpc_request(client::MCPClient, body; headers, timeout, retry_protocol_version::Bool=false)
     header_pairs = normalize_headers(headers)
     request_headers = build_request_headers(client, header_pairs)
     timeout_settings = transport_timeout_kwargs(normalize_timeout(client, timeout))
-    log_client_http_request(client, "POST", client.transport.url, request_headers, body)
-    response = client.http.request(
-        "POST",
-        client.transport.url;
-        headers=request_headers,
-        body=body,
-        status_exception=false,
-        timeout_settings...,
-    )
-    log_client_http_response(client, "POST", client.transport.url, response)
+    local response
+    for attempt in 1:2
+        log_client_http_request(client, "POST", client.transport.url, request_headers, body)
+        response = client.http.request(
+            "POST",
+            client.transport.url;
+            headers=request_headers,
+            body=body,
+            status_exception=false,
+            timeout_settings...,
+        )
+        log_client_http_response(client, "POST", client.transport.url, response)
+        attempt == 1 && retry_protocol_version && response.status == 400 || break
+        retry_body = protocol_version_retry_body(body, response, request_headers)
+        retry_body === nothing && break
+        body = retry_body
+        set_header!(request_headers, "MCP-Protocol-Version", PROTOCOL_VERSION_2026_07_28)
+    end
     status = response.status
     if status in 200:299 || status == 204
         return response

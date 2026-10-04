@@ -2284,10 +2284,14 @@ function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
     if meta_version !== nothing && !isempty(header_version) && meta_version != header_version
         return jsonrpc_error(server, nothing, id, -32020, "Header mismatch: MCP-Protocol-Version header '$(header_version)' does not match _meta protocolVersion '$(meta_version)'"; status=400)
     end
+    initialize_version = method == JSONRPC_METHOD_INITIALIZE ? negotiate_protocol_version(server, get(params, "protocolVersion", nothing)) : nothing
     effective_version = if meta_version !== nothing
         meta_version
     elseif !isempty(header_version)
         header_version
+    elseif initialize_version !== nothing && id !== nothing && header_version_raw === nothing && !is_modern_protocol_version(initialize_version)
+        # Legacy initialization negotiates the version before this header is required.
+        initialize_version
     else
         version, missing_error = resolve_protocol_version(server, req, "JSON-RPC request")
         missing_error !== nothing && return missing_error
