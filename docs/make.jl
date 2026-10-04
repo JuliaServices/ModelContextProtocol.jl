@@ -20,6 +20,7 @@ makedocs(
         "Home" => "index.md",
         "Local stdio client" => "stdio.md",
         "MCP 2026-07-28" => "protocol-2026.md",
+        "MCP Events" => "events.md",
         "Auth0 Federation Example" => "auth0.md",
         "Trim-safe static server" => "static-server.md",
         "API" => "api.md",

@@ -15,6 +15,10 @@ The package supports Streamable HTTP for two protocol eras:
   custom request headers, cache metadata, client capability checks,
   multi-round-trip `input_required` results, request-scoped progress and log
   events, and `subscriptions/listen`.
+- Experimental MCP Events webhook profile on `2026-07-28`: event discovery,
+  owner-scoped idempotent subscriptions, finite TTLs, durable subscription
+  storage, callback verification, Standard Webhooks HMAC signing and rotation,
+  filtering, access rechecks, bounded retries, and client helpers.
 
 The general server accepts both versions by default. The client defaults to
 `2025-11-25`. Applications opt in to `2026-07-28` with `MCPClientConfig`.
@@ -51,6 +55,9 @@ The repository tests these areas:
   the request body, including custom JSON lowering and duplicate object keys.
 - JuliaC trim compilation for the static server.
 - Documenter build and doctests.
+- Seeded event request, identity, signature mutation, and lifecycle fuzzing; callback
+  address policy and DNS rebinding; authenticated HTTP lifecycle; restart
+  recovery; pinned HTTPS delivery, TLS hostname checks, and redirects.
 
 ## Intentional limits
 
@@ -62,6 +69,12 @@ The repository tests these areas:
   API. The separate static server remains the supported native subset.
 - Tool input and output schemas are advertised but are not a complete runtime
   JSON Schema validation engine. A handler must still validate domain rules.
+- Event schemas use JSONSchema.jl drafts 4, 6, and 7. Delivery is webhook-only
+  and synchronous. No polling, push, replay, dynamic catalog notifications,
+  durable outbox, or gap/termination envelopes are implemented. Subscriptions
+  always have finite lifetimes.
+- The file event store has one process owner. Replicas need a shared
+  transactional backend and distributed coordination.
 - Modern request-scoped progress and log events keep their correct order, but
   the server buffers them until the handler returns.
 - Modern sampling, roots, and elicitation are exposed as multi-round-trip input

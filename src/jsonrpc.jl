@@ -48,7 +48,7 @@ end
 function log_client_http_request(client::MCPClient, method::AbstractString, url::AbstractString, headers::HTTP.Headers, body)
     client.verbose || return
     header_pairs = headers_to_pairs(headers)
-    request_body = client_request_body_text(body)
+    request_body = redact_event_request_body(client_request_body_text(body))
     request = HTTP.Request(String(method), String(url), header_pairs, request_body)
     println("MCP client HTTP request:")
     println(request)

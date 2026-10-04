@@ -12,6 +12,9 @@ MCP `2026-07-28` protocol over Streamable HTTP. Clients default to
 modern client setup, capability checks, multi-round-trip results, custom
 headers, and subscriptions.
 
+See [MCP Events](events.md) for authenticated webhook subscriptions, signed
+callbacks, persistence, and client helpers.
+
 For a server launched as a local command, see the [stdio client guide](stdio.md).
 The same initialization, list, and call APIs work with an owned child process.
 
