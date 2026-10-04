@@ -7,6 +7,7 @@ using ModelContextProtocol
 
 include("response_ids.jl")
 include("protocol_negotiation.jl")
+include("legacy_http_lifecycle.jl")
 include("events.jl")
 include("tool_arguments.jl")
 
