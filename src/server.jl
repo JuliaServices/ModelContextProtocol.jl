@@ -801,13 +801,17 @@ function validate_stream_headers(server::MCPServer, req::HTTP.Request)
     end
     version, missing_error = resolve_protocol_version(server, req, "event stream request")
     missing_error !== nothing && return missing_error
-    if version != server.config.protocol_version
+    if !server_supports_version(server, version)
         data = Dict(
             "error" => "Unsupported MCP protocol version",
             "expected" => server.config.protocol_version,
             "received" => version,
         )
         return HTTP.Response(400, response_headers(server), JSON.json(data))
+    end
+    if is_modern_protocol_version(version)
+        return HTTP.Response(405, response_headers(server; extra=HeaderPair["Allow" => "POST"]),
+            JSON.json(Dict("error" => "GET event streams require a legacy protocol version")))
     end
     return nothing
 end
@@ -2403,13 +2407,17 @@ function handle_session_delete(server::MCPServer, req::HTTP.Request)
     origin_error !== nothing && return origin_error
     version, version_error = resolve_protocol_version(server, req, "session delete request")
     version_error !== nothing && return version_error
-    if version != server.config.protocol_version
+    if !server_supports_version(server, version)
         data = Dict(
             "error" => "Unsupported MCP protocol version",
             "expected" => server.config.protocol_version,
             "received" => version,
         )
         return HTTP.Response(400, response_headers(server), JSON.json(data))
+    end
+    if is_modern_protocol_version(version)
+        return HTTP.Response(405, response_headers(server; extra=HeaderPair["Allow" => "POST"]),
+            JSON.json(Dict("error" => "Session termination requires a legacy protocol version")))
     end
     session_id = http_header_value(req.headers, "MCP-Session-Id")
     if session_id === nothing || isempty(strip(String(session_id)))

@@ -43,6 +43,8 @@ The repository tests these areas:
   Windows.
 - OAuth 2 and OAuth 3 compatibility.
 - Stateful and stateless HTTP client/server integration.
+- Legacy event streams and session cleanup on either server preference, with
+  modern session operations, unsupported versions, and invalid origins rejected.
 - Headerless legacy initialization, handlers that use the request's version,
   continued modern and subsequent-request header enforcement, and bounded
   version retries that preserve request data without replaying unrelated errors.

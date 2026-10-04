@@ -12,6 +12,10 @@ requests always require matching version metadata and HTTP headers.
 Handlers receive the request's protocol version even when the server prefers
 the other era, so modern capability checks and `input_required` results remain
 limited to modern requests.
+Supported legacy clients can also open their event stream and terminate their
+session regardless of the server's preferred version. These standalone `GET`
+and `DELETE` operations return HTTP `405` for an advertised modern version and
+HTTP `400` for unsupported versions.
 
 ## Select the stateless client
 
