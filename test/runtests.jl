@@ -6,6 +6,7 @@ using Sockets
 using ModelContextProtocol
 
 include("response_ids.jl")
+include("protocol_negotiation.jl")
 include("events.jl")
 include("tool_arguments.jl")
 

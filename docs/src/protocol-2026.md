@@ -5,6 +5,14 @@ protocol and the stateless MCP `2026-07-28` protocol over Streamable HTTP.
 The client defaults to `2025-11-25` for compatibility. The server accepts both
 versions with its default configuration.
 
+Legacy clients can omit the `MCP-Protocol-Version` HTTP header on their first
+`initialize` request, which negotiates the version in `params.protocolVersion`.
+Later legacy requests still follow the server's missing-header policy. Modern
+requests always require matching version metadata and HTTP headers.
+Handlers receive the request's protocol version even when the server prefers
+the other era, so modern capability checks and `input_required` results remain
+limited to modern requests.
+
 ## Select the stateless client
 
 Set the version when you prepare the client. `initialize_client!` then calls
@@ -30,6 +38,19 @@ client identity in `params._meta`. Streamable HTTP requests also include the
 required `Mcp-Method` and `Mcp-Name` headers. The package rejects a response or
 request that violates the matching rules.
 
+The ordinary HTTP request helpers retry once when a matching
+`UnsupportedProtocolVersionError` (`-32022`, HTTP `400`) advertises
+`2026-07-28`. The retry updates the version header and metadata together while
+preserving the request ID, arguments, other metadata, and headers. It applies
+only to that request; the client's configured version stays unchanged. Invalid
+or unrelated errors, repeated rejections, and servers offering no compatible
+modern version remain errors. This does not add automatic fallback to a legacy
+session or version retry for stdio and long-lived subscription listeners.
+
+This follows the dated specifications for
+[legacy version headers](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#protocol-version-header)
+and [modern version negotiation](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning#protocol-version-negotiation).
+
 The modern protocol does not use sessions, `notifications/initialized`,
 `notifications/cancelled` over HTTP, `ping`, `logging/setLevel`, or the old
 resource subscription methods. The client reports an error if an application
@@ -38,8 +59,8 @@ only clears local client state in modern mode.
 
 ## Require a client capability
 
-A tool can state the client capability that it needs. The server checks the
-capability before it invokes the handler.
+A tool can state the client capability that it needs for modern requests. The
+server checks the capability before it invokes the handler in that protocol.
 
 ```@example modern
 using ModelContextProtocol
