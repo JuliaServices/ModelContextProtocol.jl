@@ -63,7 +63,7 @@ default_client_info() = Dict(
 
 function list_tools(client::MCPClient; cursor=nothing, limit=nothing, headers=nothing, timeout_ms=nothing)
     result = list_entities(client, JSONRPC_METHOD_TOOLS_LIST; cursor=cursor, limit=limit, headers=headers, timeout_ms=timeout_ms)
-    client_is_modern(client) || return result
+    (client_is_modern(client) && client.transport.kind == :http) || return result
     result isa AbstractDict || return result
     tools = get(result, "tools", nothing)
     tools isa AbstractVector || return result
@@ -117,8 +117,9 @@ apply_mrtr_params!(params::Dict{String,Any}, input_responses, request_state) = b
     params
 end
 
-function custom_tool_headers(client::MCPClient, name::String, arguments)
-    client_is_modern(client) || return HeaderPair[]
+function prepare_tool_arguments(client::MCPClient, name::String, arguments)
+    client.transport.kind == :stdio && return arguments, HeaderPair[]
+    client_is_modern(client) || return arguments, HeaderPair[]
     if !haskey(client.tool_schemas, name)
         cursor = nothing
         seen_cursors = Set{String}()
@@ -134,12 +135,16 @@ function custom_tool_headers(client::MCPClient, name::String, arguments)
         end
     end
     schema = get(client.tool_schemas, name, nothing)
-    schema === nothing && return HeaderPair[]
+    schema === nothing && return arguments, HeaderPair[]
+    request_arguments = arguments
     args = if arguments === nothing
         Dict{String,Any}()
     elseif arguments isa AbstractDict || arguments isa NamedTuple
-        parsed = JSON.parse(JSON.json(arguments))
+        encoded = JSON.json(arguments)
+        parsed = JSON.parse(encoded)
         parsed isa AbstractDict || throw(ArgumentError("tool arguments must lower to a JSON object"))
+        # Use the same lowered values for custom headers and the request body.
+        request_arguments = JSON.JSONText(encoded)
         to_json_dict(parsed)
     else
         throw(ArgumentError("tool arguments must be a dictionary or named tuple"))
@@ -150,17 +155,18 @@ function custom_tool_headers(client::MCPClient, name::String, arguments)
         present || continue
         push!(headers, normalize_pair("Mcp-Param-$(spec.name)", encode_mcp_header_value(value, spec.type)))
     end
-    return headers
+    return request_arguments, headers
 end
 
 function call_tool(client::MCPClient, name::AbstractString; arguments=nothing, headers=nothing, timeout_ms=nothing, input_responses=nothing, request_state=nothing, meta=nothing)
     tool_name = String(name)
     params = Dict{String,Any}("name" => tool_name)
-    arguments !== nothing && (params["arguments"] = arguments)
     meta !== nothing && (params["_meta"] = to_string_dict(meta))
     apply_mrtr_params!(params, input_responses, request_state)
     request_headers = normalize_headers(headers)
-    append!(request_headers, custom_tool_headers(client, tool_name, arguments))
+    request_arguments, tool_headers = prepare_tool_arguments(client, tool_name, arguments)
+    arguments !== nothing && (params["arguments"] = request_arguments)
+    append!(request_headers, tool_headers)
     return jsonrpc_call(client, JSONRPC_METHOD_TOOLS_CALL; params=params, headers=request_headers, timeout_ms=timeout_ms)
 end
 
@@ -202,6 +208,7 @@ function listen_subscriptions!(
     resource_uris=String[],
     headers=nothing,
 )
+    ensure_http_transport(client.transport)
     client_is_modern(client) || throw(mcp_error(:unsupported_protocol_version, "subscriptions/listen requires protocol version >= $(PROTOCOL_VERSION_2026_07_28)"))
     notifications = Dict{String,Any}()
     tools_list_changed && (notifications["toolsListChanged"] = true)
@@ -303,11 +310,16 @@ function initialize_client!(
     client::MCPClient;
     protocol_version::AbstractString=client.protocol_version,
     capabilities=nothing,
-    client_info=default_client_info(),
+    client_info=client.transport.kind == :stdio ? client.client_info : default_client_info(),
     extra_params=nothing,
     headers=nothing,
     timeout_ms=nothing,
 )
+    if client.transport.kind == :stdio
+        String(protocol_version) == client.protocol_version ||
+            throw(ArgumentError("Choose the stdio protocol version in MCPClientConfig before starting the child"))
+        capabilities === nothing && (capabilities = client.capabilities)
+    end
     if client_is_modern(client)
         # Modern protocol has no initialize handshake; record identity for
         # per-request _meta and use server/discover for capability discovery.
@@ -327,6 +339,11 @@ function initialize_client!(
     merge_extra_params!(params, extra_params)
     result = jsonrpc_call(client, JSONRPC_METHOD_INITIALIZE; params=params, headers=headers, timeout_ms=timeout_ms)
     session_data = result isa AbstractDict ? to_json_dict(result) : Dict{String,Any}()
+    if client.transport.kind == :stdio
+        get(session_data, "protocolVersion", nothing) == String(protocol_version) ||
+            throw(mcp_error(:unsupported_protocol_version, "The stdio server did not accept protocol version $(protocol_version)"))
+        client.protocol_version = String(protocol_version)
+    end
     client.session = session_data
     client.last_event_id = nothing
     send_initialized_notification!(client; headers=headers)
@@ -341,6 +358,7 @@ function cancel_request(client::MCPClient, request_id; reason=nothing, headers=n
 end
 
 function open_event_stream(client::MCPClient; headers=nothing, timeout=nothing)
+    ensure_http_transport(client.transport)
     client_is_modern(client) && throw(mcp_error(:unsupported_protocol_version, "The 2026-07-28 protocol uses subscriptions/listen instead of a standalone event stream"))
     client.initialized || throw(mcp_error(:not_initialized, "Client must be initialized before opening an event stream"))
     header_pairs = normalize_headers(headers)
@@ -459,6 +477,10 @@ function send_jsonrpc_response!(client::MCPClient, id; result=nothing, error=not
         payload["error"] = normalize_jsonrpc_response_error(error)
     end
     body = JSON.json(payload)
+    if client.transport.kind == :stdio
+        stdio_check_headers(client, headers)
+        return stdio_write!(client, body, stdio_deadline(client, timeout, nothing))
+    end
     response = submit_jsonrpc_request(client, body; headers=normalize_headers(headers), timeout=timeout)
     return response
 end
@@ -584,6 +606,7 @@ function event_listener_loop(client::MCPClient, poll_interval::Real, headers)
 end
 
 function start_event_listener!(client::MCPClient; poll_interval::Real=1.0, headers=nothing)
+    ensure_http_transport(client.transport)
     client_is_modern(client) && throw(mcp_error(:unsupported_protocol_version, "The 2026-07-28 protocol uses listen_subscriptions! instead of the legacy event listener"))
     client.initialized || throw(mcp_error(:not_initialized, "Client must be initialized before starting event listener"))
     stop_event_listener!(client)
@@ -615,6 +638,11 @@ function stop_event_listener!(client::MCPClient)
 end
 
 function terminate_session!(client::MCPClient; headers=nothing, timeout=nothing)
+    if client.transport.kind == :stdio
+        stdio_check_headers(client, headers)
+        seconds = timeout === nothing ? 5.0 : stdio_timeout_seconds(client, timeout, nothing)
+        return close(client; timeout=seconds)
+    end
     if client_is_modern(client)
         stop_event_listener!(client)
         client.session = nothing

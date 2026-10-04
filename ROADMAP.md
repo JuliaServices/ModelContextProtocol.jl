@@ -23,6 +23,13 @@ The package supports Streamable HTTP for two protocol eras:
 The general server accepts both versions by default. The client defaults to
 `2025-11-25`. Applications opt in to `2026-07-28` with `MCPClientConfig`.
 
+The client also owns local child processes through
+`ModelContextProtocol.prepare_stdio_client`. It supports newline-delimited
+JSON-RPC, concurrent calls, notifications, legacy server requests, cancellation,
+and bounded process shutdown for either explicitly selected protocol version.
+Notifications retain arrival order; bounded legacy request-handler tasks allow
+nested calls and may overlap notifications and other request handlers.
+
 The package also includes a separate tools-only server for JuliaC
 `--trim=safe` builds. That server intentionally supports only the documented
 `2025-11-25` subset.
@@ -35,12 +42,17 @@ The repository tests these areas:
   Windows.
 - OAuth 2 and OAuth 3 compatibility.
 - Stateful and stateless HTTP client/server integration.
+- Owned stdio child processes, concurrent response correlation, malformed or
+  oversized frames, cancellation, nested server requests, bounded callback
+  tasks, blocked callbacks, concurrent callback close, and process shutdown.
 - Strict JSON-RPC parsing and notification side-effect rules.
 - Client result response IDs must match the request before results or session
   state are accepted.
 - MCP Apps resource and tool metadata.
 - Official MCP conformance scenarios for stateless metadata, capability
   checks, standard request headers, and `x-mcp-header` behavior.
+- Modern tool calls use the same serialized arguments for custom headers and
+  the request body, including custom JSON lowering and duplicate object keys.
 - JuliaC trim compilation for the static server.
 - Documenter build and doctests.
 - Seeded event request, identity, signature mutation, and lifecycle fuzzing; callback
@@ -49,7 +61,12 @@ The repository tests these areas:
 
 ## Intentional limits
 
-- The transport is HTTP only. The package does not provide a stdio transport.
+- Stdio is a client transport only. It does not provide a stdio server,
+  protocol auto-detection, automatic restart/replay, modern subscriptions,
+  HTTP headers/OAuth, or automatic Agentif tool-catalog import. Callbacks must
+  cooperate with shutdown; a blocked callback produces an explicit close error.
+- The general client, including subprocess stdio, is not a JuliaC trim-safe
+  API. The separate static server remains the supported native subset.
 - Tool input and output schemas are advertised but are not a complete runtime
   JSON Schema validation engine. A handler must still validate domain rules.
 - Event schemas use JSONSchema.jl drafts 4, 6, and 7. Delivery is webhook-only
@@ -76,7 +93,6 @@ The repository tests these areas:
    without ending the server.
 4. Evaluate a lightweight JSON Schema validator for tool arguments and
    structured results.
-5. Add a stdio transport only if a concrete Julia deployment needs it.
 
 Do not add a feature only to increase surface coverage. Preserve the small
 export surface. Keep specialized helpers under the `ModelContextProtocol`

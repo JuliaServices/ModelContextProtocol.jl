@@ -152,6 +152,12 @@ The modern client reads the schema from `tools/list`. It sends a matching
 Base64. It excludes malformed tool definitions from `tools/list`. The server
 validates recognized custom headers before it invokes the tool.
 
+For a known tool, the client serializes supplied arguments once and uses that
+same JSON object for header values and the request body. Custom JSON lowering
+therefore cannot produce different values for routing and tool execution.
+Arguments must be a dictionary or named tuple that lowers to a JSON object.
+Omitting `arguments` keeps the field absent from the request.
+
 Only `string`, `integer`, and `boolean` properties can use this annotation.
 Integers must be in the JavaScript safe-integer range. Header names must be
 unique HTTP field-name tokens. Do not expose passwords, tokens, or personal

@@ -92,6 +92,7 @@ for the full guide.
 
 ## Client Functions
 
+- `ModelContextProtocol.prepare_stdio_client`
 - `discover_server`
 - `prepare_manual_client`
 - `attach_token!`
@@ -114,6 +115,13 @@ for the full guide.
 - `start_event_listener!`
 - `stop_event_listener!`
 - `terminate_session!`
+
+### Owned stdio clients
+
+```@docs
+ModelContextProtocol.prepare_stdio_client
+Base.close(::MCPClient)
+```
 
 ## MCP 2026-07-28
 

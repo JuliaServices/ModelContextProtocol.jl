@@ -7,6 +7,7 @@ using ModelContextProtocol
 
 include("response_ids.jl")
 include("events.jl")
+include("tool_arguments.jl")
 
 @testset "Authentication parameter whitespace" begin
     for whitespace in (" ", "\t", " \t "), quoted in (false, true)
@@ -1758,4 +1759,5 @@ end
         end
     end
 end
+include("stdio.jl")
 include("trim_compile_tests.jl")
