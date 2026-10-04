@@ -43,9 +43,9 @@ The repository tests these areas:
   Windows.
 - OAuth 2 and OAuth 3 compatibility.
 - Stateful and stateless HTTP client/server integration.
-- Headerless legacy initialization, continued modern and subsequent-request
-  header enforcement, and bounded version retries that preserve request data
-  without replaying unrelated errors.
+- Headerless legacy initialization, handlers that use the request's version,
+  continued modern and subsequent-request header enforcement, and bounded
+  version retries that preserve request data without replaying unrelated errors.
 - Owned stdio child processes, concurrent response correlation, malformed or
   oversized frames, cancellation, nested server requests, bounded callback
   tasks, blocked callbacks, concurrent callback close, and process shutdown.

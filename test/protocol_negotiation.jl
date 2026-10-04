@@ -7,10 +7,19 @@ using Test, HTTP, JSON, ModelContextProtocol
         server = MCPServer(name="Version negotiation", version="1.0.0", protocol_version=preferred,
             supported_protocol_versions=["2025-11-25", "2026-07-28"])
         calls = Ref(0)
-        register_tool!(server; name="count", handler=(_context, _arguments) -> begin
+        versions = String[]
+        register_tool!(server; name="count", handler=(context, _arguments) -> begin
             calls[] += 1
+            push!(versions, context.protocol_version)
             Dict("content" => Any[])
         end)
+        capability_calls = Ref(0)
+        register_tool!(server; name="capability", required_client_capabilities=Dict("sampling" => Dict()),
+            handler=(_context, _arguments) -> begin
+                capability_calls[] += 1
+                Dict("content" => Any[])
+            end)
+        register_tool!(server; name="input", handler=(_context, _arguments) -> MCP.MCPInputRequired(request_state="retry"))
         request(method; id="1", params=Dict{String,Any}(), headers=Pair{String,String}[]) = HTTP.Request(
             "POST", "/v1/mcp",
             vcat(["Content-Type" => "application/json", "Accept" => "application/json, text/event-stream"], headers),
@@ -46,6 +55,31 @@ using Test, HTTP, JSON, ModelContextProtocol
                 params=Dict("name" => "count"), headers=session_headers))
             @test accepted.status == 200
             @test calls[] == 1
+            @test versions == ["2025-11-25"]
+            accepted = MCP.handle_jsonrpc_request(server, request("tools/call";
+                params=Dict("name" => "capability"), headers=session_headers))
+            @test accepted.status == 200
+            @test haskey(JSON.parse(String(accepted.body)), "result")
+            @test capability_calls[] == 1
+            rejected = MCP.handle_jsonrpc_request(server, request("tools/call";
+                params=Dict("name" => "input"), headers=session_headers))
+            @test rejected.status == 200
+            @test get(get(JSON.parse(String(rejected.body)), "error", Dict()), "code", nothing) == -32003
+
+            for (name, expected_status) in (("count", 200), ("capability", 400), ("input", 200))
+                response = MCP.handle_jsonrpc_request(server, request("tools/call"; params=Dict(
+                    "name" => name, "_meta" => Dict(MCP.META_PROTOCOL_VERSION => "2026-07-28",
+                        MCP.META_CLIENT_CAPABILITIES => Dict(),
+                        MCP.META_CLIENT_INFO => Dict("name" => "Modern client", "version" => "1.0.0")),
+                ), headers=["MCP-Protocol-Version" => "2026-07-28", "Mcp-Method" => "tools/call", "Mcp-Name" => name]))
+                @test response.status == expected_status
+                payload = JSON.parse(String(response.body))
+                name == "capability" && @test payload["error"]["code"] == -32021
+                name == "input" && @test payload["result"]["resultType"] == "input_required"
+            end
+            @test versions == ["2025-11-25", "2026-07-28"]
+            @test capability_calls[] == 1
+            @test server.config.protocol_version == preferred
         end
 
         sessions_before = length(server.sessions)

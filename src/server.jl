@@ -2319,7 +2319,7 @@ function handle_jsonrpc_request(server::MCPServer, req::HTTP.Request)
             rethrow(err)
         end
     end
-    context = MCPRequestContext(server, req, method, id, params, session, timeout_ms)
+    context = MCPRequestContext(server, req, method, id, params, session, timeout_ms, effective_version, nothing, nothing)
     try
         if method != JSONRPC_METHOD_INITIALIZE && method != JSONRPC_METHOD_NOTIFICATIONS_INITIALIZED
             ensure_session_initialized!(session, method)

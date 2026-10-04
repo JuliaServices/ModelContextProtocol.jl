@@ -9,6 +9,9 @@ Legacy clients can omit the `MCP-Protocol-Version` HTTP header on their first
 `initialize` request, which negotiates the version in `params.protocolVersion`.
 Later legacy requests still follow the server's missing-header policy. Modern
 requests always require matching version metadata and HTTP headers.
+Handlers receive the request's protocol version even when the server prefers
+the other era, so modern capability checks and `input_required` results remain
+limited to modern requests.
 
 ## Select the stateless client
 
@@ -56,8 +59,8 @@ only clears local client state in modern mode.
 
 ## Require a client capability
 
-A tool can state the client capability that it needs. The server checks the
-capability before it invokes the handler.
+A tool can state the client capability that it needs for modern requests. The
+server checks the capability before it invokes the handler in that protocol.
 
 ```@example modern
 using ModelContextProtocol
