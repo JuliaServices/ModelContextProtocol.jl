@@ -24,6 +24,12 @@ ModelContextProtocolAgentifExt = ["Agentif"]
 ModelContextProtocolOAuthExt = ["OAuth"]
 
 [compat]
+Agentif = "1"
+Base64 = "1"
+Logging = "1"
+Sockets = "1"
+Test = "1"
+UUIDs = "1"
 Dates = "1"
 Downloads = "1"
 HTTP = "1.11, 2"
