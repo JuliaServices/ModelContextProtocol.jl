@@ -26,18 +26,18 @@ ModelContextProtocolOAuthExt = ["OAuth"]
 [compat]
 Agentif = "1"
 Base64 = "1"
-Logging = "1"
-Sockets = "1"
-Test = "1"
-UUIDs = "1"
 Dates = "1"
 Downloads = "1"
 HTTP = "1.11, 2"
 JSON = "1"
 JSONSchema = "1.5"
+Logging = "1"
 OAuth = "2, 3, 4"
 Random = "1"
 SHA = "0.7, 1"
+Sockets = "1"
+Test = "1"
+UUIDs = "1"
 julia = "1.10"
 
 [extras]
