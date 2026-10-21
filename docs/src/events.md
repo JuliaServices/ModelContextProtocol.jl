@@ -85,8 +85,18 @@ it explicitly; the package cannot infer whether an argument is a filter, glob,
 or transformation. Optional `transform(subject, arguments, data)` can redact
 each subscriber's payload. Hooks receive independent copies. JSONSchema.jl
 validates subscription arguments and delivered payloads using drafts 4, 6,
-and 7. An omitted dialect is explicitly published as draft 7; it never implies
-2020-12 validation. Newer dialects and external schema references are rejected.
+and 7. When an implicit schema uses only portable keywords, the catalog leaves
+out `$schema`, so clients use MCP's default 2020-12 dialect. Local validation
+retains the same assertions. This allows ChatGPT's event settings discovery to
+accept ordinary object schemas without requiring optional draft-7 support.
+
+Portable schemas include scalar constraints, object properties and required
+fields, homogeneous array items, and common composition keywords. Explicit
+dialects are always preserved. Implicit schemas with references, tuple items,
+`dependencies`, `format`, or unrecognized keywords retain an explicit draft-7
+declaration. Such schemas require a client that supports that dialect. This
+publication rule does not add general 2020-12 validation: newer explicit
+dialects and external schema references are rejected.
 Only local JSON Pointer references are resolved. Domain rules remain your
 application's responsibility.
 

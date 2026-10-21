@@ -304,11 +304,65 @@ function check_event_schema_references(schema)
     return nothing
 end
 
+# Only omit the dialect when draft 7 and MCP's default 2020-12 have the same
+# assertions. Unknown keywords retain the existing explicit draft-7 contract.
+function portable_event_schema(schema)
+    schema isa Bool && return true
+    schema isa AbstractDict || return false
+    for (key, value) in schema
+        if key in ("properties", "patternProperties")
+            value isa AbstractDict && all(portable_event_schema, values(value)) || return false
+        elseif key in ("items", "additionalProperties", "propertyNames", "not", "if", "then", "else")
+            portable_event_schema(value) || return false
+        elseif key in ("allOf", "anyOf", "oneOf")
+            value isa AbstractVector && !isempty(value) && all(portable_event_schema, value) || return false
+        elseif key == "type"
+            types = value isa AbstractString ? (value,) : value
+            types isa Union{Tuple,AbstractVector} && !isempty(types) &&
+                all(type -> type in ("null", "boolean", "object", "array", "number", "string", "integer"), types) || return false
+        elseif key == "required"
+            value isa AbstractVector && all(item -> item isa AbstractString, value) || return false
+        elseif key in ("minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties")
+            value isa Real && !(value isa Bool) && isfinite(value) && isinteger(value) && value >= 0 || return false
+        elseif key in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf")
+            value isa Real && !(value isa Bool) && isfinite(value) || return false
+            key == "multipleOf" && value <= 0 && return false
+        elseif key == "uniqueItems"
+            value isa Bool || return false
+        elseif key in ("pattern", "title", "description", "\$comment")
+            value isa AbstractString || return false
+        elseif key in ("readOnly", "writeOnly")
+            value isa Bool || return false
+        elseif key == "enum"
+            value isa AbstractVector && !isempty(value) || return false
+        elseif key == "examples"
+            value isa AbstractVector || return false
+        elseif key in ("const", "default")
+            # Literal JSON values are data, not nested schemas.
+        else
+            return false
+        end
+    end
+    return true
+end
+
+function event_schema_validator!(schema)
+    portable = portable_event_schema(schema)
+    get!(schema, "\$schema", "http://json-schema.org/draft-07/schema#")
+    schema["\$schema"] isa AbstractString || throw(ArgumentError("Event schema dialect must be a string"))
+    check_event_schema_references(schema)
+    validator = JSONSchema.Schema(deepcopy(schema))
+    portable && delete!(schema, "\$schema")
+    return validator
+end
+
 """
     register_event!(server; name, input_schema, payload_schema, matches, ...)
 
 Register an emit-only webhook event. Schemas are validated by JSONSchema.jl
-(draft 4, 6, or 7); omitted dialects are explicitly published as draft 7.
+(draft 4, 6, or 7). Implicit schemas using only portable keywords are published
+without a dialect, using MCP's default 2020-12. Other implicit schemas are
+explicitly published as draft 7; explicit supported dialects are preserved.
 External schema references are rejected. matches(principal, arguments, data) applies subscription
 filters; transform(principal, arguments, data) may redact the delivered payload.
 The catalog is configured at startup. Duplicate names are rejected; publish
@@ -322,14 +376,11 @@ function register_event!(server::MCPServer; name, input_schema, payload_schema,
     event_name = event_string(name, "name"; max_bytes=256)
     input = event_object(input_schema, "input_schema")
     payload = event_object(payload_schema, "payload_schema")
-    for schema in (input, payload)
-        get!(schema, "\$schema", "http://json-schema.org/draft-07/schema#")
-        schema["\$schema"] isa AbstractString || throw(ArgumentError("Event schema dialect must be a string"))
-        check_event_schema_references(schema)
-    end
+    input_validator = event_schema_validator!(input)
+    payload_validator = event_schema_validator!(payload)
     definition = MCPServerEvent(
         event_name, description === nothing ? nothing : String(description),
-        input, payload, JSONSchema.Schema(deepcopy(input)), JSONSchema.Schema(deepcopy(payload)),
+        input, payload, input_validator, payload_validator,
         matches, transform, event_object(meta, "meta"),
     )
     @lock events.lock begin
