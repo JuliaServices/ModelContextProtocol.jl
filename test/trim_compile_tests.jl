@@ -14,6 +14,9 @@ const _JULIAC_ENTRYPOINT_EXPR = "using JuliaC; if isdefined(JuliaC, :main); Juli
 # default load path.
 function _clean_cmd(cmd::Cmd)
     env = Dict{String,String}(k => v for (k, v) in ENV if k != "JULIA_LOAD_PATH")
+    # The executable runs on this host. Keep setup and JuliaC on the same CPU
+    # target so JuliaC can reuse setup's precompiled package caches.
+    env["JULIA_CPU_TARGET"] = "native"
     return setenv(cmd, env)
 end
 
