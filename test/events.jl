@@ -108,7 +108,8 @@ event_records(fixture) = EventsMCP.event_subscriptions(fixture.server.events.sto
     @test descriptor["delivery"] == ["webhook"]
     @test descriptor["inputSchema"]["required"] == ["resource"]
     @test descriptor["payloadSchema"]["required"] == ["resource", "text"]
-    @test descriptor["inputSchema"]["\$schema"] == "http://json-schema.org/draft-07/schema#"
+    @test !haskey(descriptor["inputSchema"], "\$schema")
+    @test !haskey(descriptor["payloadSchema"], "\$schema")
     _, page = event_request(server, "events/list", Dict("limit" => 1); owner="beta")
     @test page["result"]["nextCursor"] == "2"
     _, next = event_request(server, "events/list", Dict("cursor" => page["result"]["nextCursor"]); owner="beta")
@@ -150,6 +151,131 @@ event_records(fixture) = EventsMCP.event_subscriptions(fixture.server.events.sto
     @test isvalid(server.events.definitions["local-reference"].input_validator, Dict("resource" => "shared"))
     @test !isvalid(server.events.definitions["local-reference"].input_validator, Dict("resource" => 1))
     @test !haskey(local_schema, "\$schema")
+end
+
+@testset "Portable event schema publication preserves validation" begin
+    fixture = event_fixture()
+    server = fixture.server
+    schema = Dict{String,Any}("type" => "object", "properties" => Dict(
+        "label" => Dict("type" => ["string", "null"]),
+        "tags" => Dict("type" => "array", "items" => Dict("type" => "string")),
+    ), "additionalProperties" => false)
+    original = deepcopy(schema)
+    EventsMCP.register_event!(server; name="portable", input_schema=schema, payload_schema=schema,
+        matches=(_...) -> true)
+    definition = server.events.definitions["portable"]
+    @test EventsMCP.event_descriptor(definition)["inputSchema"] == original
+    @test EventsMCP.event_descriptor(definition)["payloadSchema"] == original
+    @test schema == original
+    for validator in (definition.input_validator, definition.payload_validator)
+        @test isvalid(validator, Dict("label" => nothing, "tags" => ["one"]))
+        @test !isvalid(validator, Dict("label" => 1))
+        @test !isvalid(validator, Dict("tags" => [1]))
+        @test !isvalid(validator, Dict("unexpected" => true))
+    end
+    response, rejected = event_request(server, "events/subscribe",
+        event_params(name="portable", arguments=Dict("label" => 1)))
+    @test response.status == 200
+    @test rejected["error"]["code"] == -32602
+    @test isempty(fixture.calls)
+    @test isempty(event_records(fixture))
+    @test_throws ArgumentError EventsMCP.emit_event!(server, "portable", Dict("label" => 1))
+    @test isempty(fixture.calls)
+
+    # Property names and literal values are not schema keyword positions.
+    literals = Dict{String,Any}("type" => "object", "properties" => Dict(
+        "\$schema" => Dict("enum" => [Dict("\$schema" => "literal", "\$ref" => "literal")]),
+    ))
+    EventsMCP.register_event!(server; name="literals", input_schema=literals, payload_schema=Dict(), matches=(_...) -> true)
+    @test EventsMCP.event_descriptor(server.events.definitions["literals"])["inputSchema"] == literals
+
+    for dialect in ("http://json-schema.org/draft-04/schema#", "https://json-schema.org/draft-06/schema", "http://json-schema.org/draft-07/schema#")
+        declared = merge(deepcopy(schema), Dict("\$schema" => dialect))
+        EventsMCP.register_event!(server; name=dialect, input_schema=declared, payload_schema=Dict(), matches=(_...) -> true)
+        @test EventsMCP.event_descriptor(server.events.definitions[dialect])["inputSchema"] == declared
+    end
+
+    legacy_schemas = [
+        Dict("type" => "array", "items" => [Dict("type" => "string")], "additionalItems" => false),
+        Dict("dependencies" => Dict("a" => ["b"])),
+        Dict("definitions" => Dict("text" => Dict("type" => "string")), "\$ref" => "#/definitions/text", "maxLength" => 1),
+        Dict("properties" => Dict("nested" => Dict("type" => "array", "items" => [Dict("type" => "integer")]))),
+        Dict("properties" => Dict("nested" => Dict("\$schema" => "http://json-schema.org/draft-07/schema#", "type" => "string"))),
+        Dict("format" => "email"),
+        Dict("prefixItems" => [Dict("type" => "string")]),
+        Dict("unevaluatedProperties" => false),
+        Dict("dependentRequired" => Dict("a" => ["b"])),
+        Dict("contains" => Dict("type" => "integer"), "minContains" => 2),
+        Dict("x-custom" => Dict("type" => "string")),
+        Dict("exclusiveMinimum" => true, "minimum" => 1),
+    ]
+    for (index, legacy) in enumerate(legacy_schemas)
+        name = "legacy-$(index)"
+        EventsMCP.register_event!(server; name, input_schema=legacy, payload_schema=schema, matches=(_...) -> true)
+        descriptor = EventsMCP.event_descriptor(server.events.definitions[name])
+        @test descriptor["inputSchema"] == merge(legacy, Dict("\$schema" => "http://json-schema.org/draft-07/schema#"))
+        @test descriptor["payloadSchema"] == original
+        @test !haskey(legacy, "\$schema")
+    end
+    tuple_validator = server.events.definitions["legacy-1"].input_validator
+    @test isvalid(tuple_validator, ["one"])
+    @test !isvalid(tuple_validator, [1])
+    @test !isvalid(tuple_validator, ["one", "two"])
+    dependency_validator = server.events.definitions["legacy-2"].input_validator
+    @test !isvalid(dependency_validator, Dict("a" => true))
+    @test isvalid(dependency_validator, Dict("a" => true, "b" => false))
+    @test isvalid(server.events.definitions["legacy-3"].input_validator, "long text")
+    @test_throws ArgumentError EventsMCP.register_event!(server; name="annotation-ref",
+        input_schema=Dict("default" => Dict("\$ref" => "https://127.0.0.1/private")), payload_schema=schema, matches=(_...) -> true)
+end
+
+@testset "Portable event constraints keep their assertions" begin
+    cases = [
+        (Dict("type" => "number", "minimum" => 0, "maximum" => 10,
+            "exclusiveMinimum" => 0, "exclusiveMaximum" => 10, "multipleOf" => 0.5),
+            [1, 9.5], [0, 10, 1.25]),
+        (Dict{String,Any}("type" => "string", "minLength" => 2, "maxLength" => 4,
+            "pattern" => "^[a-z]+\$", "title" => "Label", "description" => "A short label",
+            "\$comment" => "Lowercase labels only", "readOnly" => false, "writeOnly" => true,
+            "default" => "ok", "examples" => ["ok"]),
+            ["ok", "good"], ["x", "longer", "UP"]),
+        (Dict("type" => "array", "items" => Dict("type" => "string"),
+            "minItems" => 1, "maxItems" => 2, "uniqueItems" => true),
+            [["one"], ["one", "two"]], [String[], ["one", "one"], ["one", "two", "three"], [1]]),
+        (Dict{String,Any}("type" => "object", "minProperties" => 1, "maxProperties" => 2,
+            "propertyNames" => Dict("minLength" => 1),
+            "patternProperties" => Dict("^x_" => Dict("type" => "boolean"))),
+            [Dict("x_a" => true), Dict("other" => 1)],
+            [Dict(), Dict("" => 1), Dict("x_a" => 1), Dict("a" => 1, "b" => 2, "c" => 3)]),
+        (Dict("allOf" => [
+            Dict("anyOf" => [Dict("const" => "a"), Dict("const" => "bb")]),
+            Dict("oneOf" => [Dict("type" => "string"), Dict("type" => "number")]),
+            Dict("not" => Dict("const" => "cc")),
+            Dict("if" => Dict("const" => "a"), "then" => Dict("maxLength" => 1),
+                "else" => Dict("minLength" => 2)),
+            true,
+        ]), ["a", "bb"], ["b", "cc", 1]),
+    ]
+    fixture = event_fixture()
+    for (index, (schema, accepted, rejected)) in enumerate(cases)
+        name = "constraints-$(index)"
+        original = deepcopy(schema)
+        EventsMCP.register_event!(fixture.server; name, input_schema=schema,
+            payload_schema=schema, matches=(_...) -> true)
+        definition = fixture.server.events.definitions[name]
+        descriptor = EventsMCP.event_descriptor(definition)
+        @test descriptor["inputSchema"] == original
+        @test descriptor["payloadSchema"] == original
+        @test schema == original
+        for validator in (definition.input_validator, definition.payload_validator)
+            for value in accepted
+                @test isvalid(validator, value)
+            end
+            for value in rejected
+                @test !isvalid(validator, value)
+            end
+        end
+    end
 end
 
 @testset "Webhook lifecycle, isolation, and rotation" begin

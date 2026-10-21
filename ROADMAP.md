@@ -75,7 +75,10 @@ The repository tests these areas:
   API. The separate static server remains the supported native subset.
 - Tool input and output schemas are advertised but are not a complete runtime
   JSON Schema validation engine. A handler must still validate domain rules.
-- Event schemas use JSONSchema.jl drafts 4, 6, and 7. Delivery is webhook-only
+- Event validation uses JSONSchema.jl drafts 4, 6, and 7. Portable implicit
+  schemas are advertised without a dialect for MCP's default 2020-12; explicit
+  dialects and other implicit schemas retain their legacy declarations.
+  This is not a general 2020-12 validator. Delivery is webhook-only
   and synchronous. No polling, push, replay, dynamic catalog notifications,
   durable outbox, or gap/termination envelopes are implemented. Subscriptions
   always have finite lifetimes.

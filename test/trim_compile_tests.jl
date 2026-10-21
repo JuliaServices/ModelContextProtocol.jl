@@ -3,6 +3,7 @@ using Test
 const _TRIM_SAFE_ERROR_BUDGET = 0
 const _TRIM_SUPPORTED = VERSION >= v"1.12.0-rc1"
 const _TRIM_PRE_RELEASE = !isempty(VERSION.prerelease)
+const _TRIM_SETUP_TIMEOUT_S = 600.0
 const _TRIM_COMPILE_TIMEOUT_S = Sys.iswindows() ? 600.0 : 120.0
 const _TRIM_EXECUTABLE_TIMEOUT_S = Sys.iswindows() ? 120.0 : 30.0
 const _TRIM_USE_BUNDLE = Sys.iswindows()
@@ -13,6 +14,9 @@ const _JULIAC_ENTRYPOINT_EXPR = "using JuliaC; if isdefined(JuliaC, :main); Juli
 # default load path.
 function _clean_cmd(cmd::Cmd)
     env = Dict{String,String}(k => v for (k, v) in ENV if k != "JULIA_LOAD_PATH")
+    # The executable runs on this host. Keep setup and JuliaC on the same CPU
+    # target so JuliaC can reuse setup's precompiled package caches.
+    env["JULIA_CPU_TARGET"] = "native"
     return setenv(cmd, env)
 end
 
@@ -25,12 +29,14 @@ function _setup_trim_env()
     import Pkg
     Pkg.develop(path=$(repr(package_path)))
     Pkg.add("JuliaC")
+    # CI disables automatic precompilation; keep cold caches out of the compile deadline.
+    Pkg.precompile()
     """)
     println("[trim] setting up temp environment with JuliaC...")
     flush(stdout)
     exit_code, output, timed_out = _run_command_with_timeout(
         _clean_cmd(`$julia --startup-file=no --history-file=no --project=$env_path $setup_script`);
-        timeout_s = 120.0,
+        timeout_s = _TRIM_SETUP_TIMEOUT_S,
         log_label = "setup",
     )
     rm(setup_script; force = true)
