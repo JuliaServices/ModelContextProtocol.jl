@@ -229,6 +229,55 @@ end
         input_schema=Dict("default" => Dict("\$ref" => "https://127.0.0.1/private")), payload_schema=schema, matches=(_...) -> true)
 end
 
+@testset "Portable event constraints keep their assertions" begin
+    cases = [
+        (Dict("type" => "number", "minimum" => 0, "maximum" => 10,
+            "exclusiveMinimum" => 0, "exclusiveMaximum" => 10, "multipleOf" => 0.5),
+            [1, 9.5], [0, 10, 1.25]),
+        (Dict{String,Any}("type" => "string", "minLength" => 2, "maxLength" => 4,
+            "pattern" => "^[a-z]+\$", "title" => "Label", "description" => "A short label",
+            "\$comment" => "Lowercase labels only", "readOnly" => false, "writeOnly" => true,
+            "default" => "ok", "examples" => ["ok"]),
+            ["ok", "good"], ["x", "longer", "UP"]),
+        (Dict("type" => "array", "items" => Dict("type" => "string"),
+            "minItems" => 1, "maxItems" => 2, "uniqueItems" => true),
+            [["one"], ["one", "two"]], [String[], ["one", "one"], ["one", "two", "three"], [1]]),
+        (Dict{String,Any}("type" => "object", "minProperties" => 1, "maxProperties" => 2,
+            "propertyNames" => Dict("minLength" => 1),
+            "patternProperties" => Dict("^x_" => Dict("type" => "boolean"))),
+            [Dict("x_a" => true), Dict("other" => 1)],
+            [Dict(), Dict("" => 1), Dict("x_a" => 1), Dict("a" => 1, "b" => 2, "c" => 3)]),
+        (Dict("allOf" => [
+            Dict("anyOf" => [Dict("const" => "a"), Dict("const" => "bb")]),
+            Dict("oneOf" => [Dict("type" => "string"), Dict("type" => "number")]),
+            Dict("not" => Dict("const" => "cc")),
+            Dict("if" => Dict("const" => "a"), "then" => Dict("maxLength" => 1),
+                "else" => Dict("minLength" => 2)),
+            true,
+        ]), ["a", "bb"], ["b", "cc", 1]),
+    ]
+    fixture = event_fixture()
+    for (index, (schema, accepted, rejected)) in enumerate(cases)
+        name = "constraints-$(index)"
+        original = deepcopy(schema)
+        EventsMCP.register_event!(fixture.server; name, input_schema=schema,
+            payload_schema=schema, matches=(_...) -> true)
+        definition = fixture.server.events.definitions[name]
+        descriptor = EventsMCP.event_descriptor(definition)
+        @test descriptor["inputSchema"] == original
+        @test descriptor["payloadSchema"] == original
+        @test schema == original
+        for validator in (definition.input_validator, definition.payload_validator)
+            for value in accepted
+                @test isvalid(validator, value)
+            end
+            for value in rejected
+                @test !isvalid(validator, value)
+            end
+        end
+    end
+end
+
 @testset "Webhook lifecycle, isolation, and rotation" begin
     fixture = event_fixture()
     params = event_params(arguments=Dict("resource" => "shared", "metadata" => Dict("z" => 1.0, "a" => [true, nothing, "λ"])))
