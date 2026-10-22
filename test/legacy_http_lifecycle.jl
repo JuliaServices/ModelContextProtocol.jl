@@ -79,3 +79,29 @@ using Test, HTTP, JSON, ModelContextProtocol
         end
     end
 end
+
+@testset "Session event queues are bounded and thread-safe" begin
+    MCP = ModelContextProtocol
+    cap = MCP.MAX_PENDING_SESSION_EVENTS
+    # a client that never opens its event stream keeps only the newest events
+    session = MCP.MCPSession(id="unread")
+    for i in 1:(cap + 5)
+        MCP.enqueue_session_event!(session, "message", "event $i")
+    end
+    @test length(session.pending_events) == cap
+    @test first(session.pending_events).id == "6"
+    @test last(session.pending_events).id == string(cap + 5)
+    # concurrent senders (only meaningful with more than one thread)
+    shared = MCP.MCPSession(id="shared")
+    per_task = 200
+    ntasks = 4 * Threads.nthreads()
+    @sync for _ in 1:ntasks
+        Threads.@spawn for _ in 1:per_task
+            MCP.enqueue_session_event!(shared, "message", "x")
+        end
+    end
+    total = ntasks * per_task
+    @test shared.event_sequence == total
+    @test length(shared.pending_events) == min(total, cap)
+    @test allunique(event.id for event in shared.pending_events)
+end

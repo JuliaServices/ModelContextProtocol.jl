@@ -247,16 +247,17 @@ delete_session!(server::MCPServer, session_id::AbstractString) = delete_session!
 list_sessions(server::MCPServer) = list_sessions(server.session_store)
 
 function session_to_dict(session::MCPSession)
+    sequence, events = @lock SESSION_EVENTS_LOCK (session.event_sequence, copy(session.pending_events))
     return Dict{String,Any}(
         "id" => session.id,
         "initialized" => session.initialized,
-        "eventSequence" => session.event_sequence,
+        "eventSequence" => sequence,
         "pendingEvents" => [
             Dict{String,Any}(
                 "id" => event.id,
                 "event" => event.event,
                 "data" => event.data,
-            ) for event in session.pending_events
+            ) for event in events
         ],
         "subscriptions" => collect(session.subscriptions),
         "clientInfo" => deepcopy(session.client_info),
@@ -575,19 +576,36 @@ function find_session(server::MCPServer, session_id)
     return find_session(server.session_store, String(session_id))
 end
 
+# Guards every session's `event_sequence` and `pending_events`: notifications
+# can be queued from several request tasks at once.
+# ponytail: one lock for all sessions; per-session locks if it ever contends.
+const SESSION_EVENTS_LOCK = ReentrantLock()
+
+# Events a session keeps for a client that has not read them; older ones are
+# dropped, so a client that never opens its event stream can't grow memory
+# without bound.
+const MAX_PENDING_SESSION_EVENTS = 1_000
+
 function next_event_id!(session::MCPSession)
-    session.event_sequence += 1
-    return string(session.event_sequence)
+    @lock SESSION_EVENTS_LOCK begin
+        session.event_sequence += 1
+        return string(session.event_sequence)
+    end
 end
 
 serialize_event_payload(payload) = payload isa AbstractString ? String(payload) : JSON.json(payload)
 
 function enqueue_session_event!(session::MCPSession, event::Union{AbstractString,Nothing}, payload)
-    event_id = next_event_id!(session)
     data = serialize_event_payload(payload)
     event_name = event === nothing ? nothing : String(event)
-    push!(session.pending_events, MCPEvent(id=event_id, event=event_name, data=data))
-    return event_id
+    @lock SESSION_EVENTS_LOCK begin
+        event_id = next_event_id!(session)
+        pending = session.pending_events
+        push!(pending, MCPEvent(id=event_id, event=event_name, data=data))
+        excess = length(pending) - MAX_PENDING_SESSION_EVENTS
+        excess > 0 && deleteat!(pending, 1:excess)
+        return event_id
+    end
 end
 
 function enqueue_server_event!(server::MCPServer, session::MCPSession, event::Union{AbstractString,Nothing}, payload)
@@ -650,11 +668,13 @@ function prune_session_events!(session::MCPSession, last_event_id::AbstractStrin
     catch
         return
     end
-    session.pending_events = MCPEvent[event for event in session.pending_events if try
-        parse(Int, event.id) > parsed
-    catch
-        true
-    end]
+    @lock SESSION_EVENTS_LOCK begin
+        session.pending_events = MCPEvent[event for event in session.pending_events if try
+            parse(Int, event.id) > parsed
+        catch
+            true
+        end]
+    end
     return nothing
 end
 
@@ -2375,8 +2395,11 @@ function handle_stream_request(server::MCPServer, req::HTTP.Request)
     ensure_session_initialized!(session, "event-stream")
     last_event = http_header_value(req.headers, "Last-Event-ID")
     last_event !== nothing && prune_session_events!(session, String(last_event))
-    events = copy(session.pending_events)
-    empty!(session.pending_events)
+    events = @lock SESSION_EVENTS_LOCK begin
+        queued = copy(session.pending_events)
+        empty!(session.pending_events)
+        queued
+    end
     if isempty(events)
         heartbeat_id = next_event_id!(session)
         heartbeat_payload = Dict("sessionId" => session.id)
