@@ -111,4 +111,4 @@ other. Unfinished callbacks remain owned; a later `close` outside a callback
 waits for them. This transport does not provide forced task cancellation.
 
 The dynamic subprocess client is not a JuliaC `--trim=safe` API. The package's
-[static tools server](static-server.md) remains its supported native subset.
+[static server](static-server.md) remains its supported native subset.

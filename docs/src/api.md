@@ -37,7 +37,10 @@ for a complete example and the support limits.
 - `ModelContextProtocol.StaticMCPServer`
 - `ModelContextProtocol.StaticMCPTool`
 - `ModelContextProtocol.StaticMCPToolResult`
+- `ModelContextProtocol.StaticMCPResource`
 - `ModelContextProtocol.StaticMCPRequestContext`
+- `ModelContextProtocol.static_ui_tool_meta`
+- `ModelContextProtocol.static_ui_extensions`
 - `ModelContextProtocol.handle_static_jsonrpc_request`
 - `ModelContextProtocol.handle_static_stream_request`
 - `ModelContextProtocol.handle_static_session_delete`

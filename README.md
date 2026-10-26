@@ -59,11 +59,63 @@ http_server = serve_mcp_http(server; host="127.0.0.1", port=3010)
 wait(http_server.http)
 ```
 
-The package also provides a specialized, tools-only server with a concrete
-request graph for JuliaC `--trim=safe` builds. Its API is namespaced and is not
-exported. See the
+## Static (trim-safe) Server
+
+`StaticMCPServer` is a specialized server with a concrete request graph for
+JuliaC `--trim=safe` builds. It serves tools, fixed resources, and
+[MCP Apps](MCP-App-playbook.md) widgets. Its API is namespaced and is not
+exported. This tool renders a widget in hosts that support MCP Apps:
+
+```julia
+using ModelContextProtocol
+const MCP = ModelContextProtocol
+
+struct CardHandler end
+
+function (::CardHandler)(::MCP.StaticMCPRequestContext, arguments::MCP.JSON.JSONText)
+    return MCP.StaticMCPToolResult(
+        text="Q3 revenue report",
+        structured_content=MCP.JSON.JSONText("{\"title\":\"Q3 revenue\"}"),
+    )
+end
+
+# Build the HTML at load time; mcp_app_html is not part of the trim-checked path.
+const CARD_HTML = MCP.mcp_app_html(
+    app_name="acme-card",
+    body="<main id=\"app\"></main>",
+    script="mcpApp.onRender(function (data) { document.getElementById('app').textContent = data.title; });",
+)
+
+card = MCP.StaticMCPResource(
+    uri="ui://acme/card",
+    name="acme-card",
+    mime_type=MCP.MCP_APP_HTML_MIME_TYPE,
+    text=CARD_HTML,
+)
+
+server = MCP.StaticMCPServer(
+    [MCP.StaticMCPTool(
+        name="show-report",
+        description="Show the Q3 revenue report.",
+        meta=MCP.static_ui_tool_meta(card.uri),
+        handler=CardHandler(),
+    )];
+    name="Acme",
+    version="1.0.0",
+    resources=[card],
+    extensions=MCP.static_ui_extensions(),
+    stateless=true,  # no sessions, so a restarted or second machine serves any client
+)
+
+router = MCP.HTTP.Router()
+MCP.HTTP.register!(router, "POST", "/v1/mcp", req -> MCP.handle_static_jsonrpc_request(server, req))
+MCP.HTTP.register!(router, "GET", "/v1/mcp", req -> MCP.handle_static_stream_request(server, req))
+MCP.HTTP.register!(router, "DELETE", "/v1/mcp", req -> MCP.handle_static_session_delete(server, req))
+```
+
+See the
 [trim-safe static server guide](https://juliaservices.github.io/ModelContextProtocol.jl/stable/static-server/)
-for the example and support limits.
+for protocol versions, sessions, and support limits.
 
 ## Minimal Client
 
