@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>Trim-safe static server · ModelContextProtocol.jl</title><meta name="title" content="Trim-safe static server · ModelContextProtocol.jl"/><meta property="og:title" content="Trim-safe static server · ModelContextProtocol.jl"/><meta property="twitter:title" content="Trim-safe static server · ModelContextProtocol.jl"/><meta name="description" content="Documentation for ModelContextProtocol.jl."/><meta property="og:description" content="Documentation for ModelContextProtocol.jl."/><meta property="twitter:description" content="Documentation for ModelContextProtocol.jl."/><meta property="og:url" content="https://JuliaServices.github.io/ModelContextProtocol.jl/stable/static-server/"/><meta property="twitter:url" content="https://JuliaServices.github.io/ModelContextProtocol.jl/stable/static-server/"/><link rel="canonical" href="https://JuliaServices.github.io/ModelContextProtocol.jl/stable/static-server/"/><script data-outdated-warner src="../assets/warner.js"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/lato-font/3.0.0/css/lato-font.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/juliamono/0.63.2/juliamono.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/fontawesome.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/solid.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/brands.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.8/katex.min.css" rel="stylesheet" type="text/css"/><script>documenterBaseURL=".."</script><script src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.6/require.min.js" data-main="../assets/documenter.js"></script><script src="../search_index.js"></script><script src="../siteinfo.js"></script><script src="../../versions.js"></script><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-mocha.css" data-theme-name="catppuccin-mocha"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-macchiato.css" data-theme-name="catppuccin-macchiato"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-frappe.css" data-theme-name="catppuccin-frappe"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-latte.css" data-theme-name="catppuccin-latte"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/documenter-dark.css" data-theme-name="documenter-dark" data-theme-primary-dark/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/documenter-light.css" data-theme-name="documenter-light" data-theme-primary/><script src="../assets/themeswap.js"></script></head><body><div id="documenter"><nav class="docs-sidebar"><div class="docs-package-name"><span class="docs-autofit"><a href="../">ModelContextProtocol.jl</a></span></div><button class="docs-search-query input is-rounded is-small is-clickable my-2 mx-auto py-1 px-2" id="documenter-search-query">Search docs (Ctrl + /)</button><ul class="docs-menu"><li><a class="tocitem" href="../">Home</a></li><li><a class="tocitem" href="../stdio/">Local stdio client</a></li><li><a class="tocitem" href="../protocol-2026/">MCP 2026-07-28</a></li><li><a class="tocitem" href="../events/">MCP Events</a></li><li><a class="tocitem" href="../auth0/">Auth0 Federation Example</a></li><li class="is-active"><a class="tocitem" href>Trim-safe static server</a><ul class="internal"><li><a class="tocitem" href="#Create-a-server"><span>Create a server</span></a></li><li><a class="tocitem" href="#MCP-Apps-widgets"><span>MCP Apps widgets</span></a></li><li><a class="tocitem" href="#Protocol-versions-and-sessions"><span>Protocol versions and sessions</span></a></li><li><a class="tocitem" href="#Support-limits"><span>Support limits</span></a></li></ul></li><li><a class="tocitem" href="../api/">API</a></li></ul><div class="docs-version-selector field has-addons"><div class="control"><span class="docs-label button is-static is-size-7">Version</span></div><div class="docs-selector control is-expanded"><div class="select is-fullwidth is-size-7"><select id="documenter-version-selector"></select></div></div></div></nav><div class="docs-main"><header class="docs-navbar"><a class="docs-sidebar-button docs-navbar-link fa-solid fa-bars is-hidden-desktop" id="documenter-sidebar-button" href="#"></a><nav class="breadcrumb"><ul class="is-hidden-mobile"><li class="is-active"><a href>Trim-safe static server</a></li></ul><ul class="is-hidden-tablet"><li class="is-active"><a href>Trim-safe static server</a></li></ul></nav><div class="docs-right"><a class="docs-navbar-link" href="https://github.com/JuliaServices/ModelContextProtocol.jl" title="View the repository on GitHub"><span class="docs-icon fa-brands"></span><span class="docs-label is-hidden-touch">GitHub</span></a><a class="docs-navbar-link" href="https://github.com/JuliaServices/ModelContextProtocol.jl/blob/main/docs/src/static-server.md" title="Edit source on GitHub"><span class="docs-icon fa-solid"></span></a><a class="docs-settings-button docs-navbar-link fa-solid fa-gear" id="documenter-settings-button" href="#" title="Settings"></a><a class="docs-article-toggle-button fa-solid fa-chevron-up" id="documenter-article-toggle-button" href="javascript:;" title="Collapse all docstrings"></a></div></header><article class="content" id="documenter-page"><h1 id="Trim-safe-Static-Server"><a class="docs-heading-anchor" href="#Trim-safe-Static-Server">Trim-safe Static Server</a><a id="Trim-safe-Static-Server-1"></a><a class="docs-heading-anchor-permalink" href="#Trim-safe-Static-Server" title="Permalink"></a></h1><p>The static server is a specialized alternative to <code>MCPServer</code>. It keeps the request graph concrete for JuliaC <code>--trim=safe</code> compilation. It supports the MCP <code>2025-11-25</code> initialization, session, ping, tool-list, tool-call, resource-list, resource-read, and session-delete flows. It can also serve MCP Apps widgets and run without sessions.</p><p>The API is not exported. Use each name through the <code>ModelContextProtocol</code> namespace.</p><h2 id="Create-a-server"><a class="docs-heading-anchor" href="#Create-a-server">Create a server</a><a id="Create-a-server-1"></a><a class="docs-heading-anchor-permalink" href="#Create-a-server" title="Permalink"></a></h2><p>Each tool handler must have the same concrete Julia type. One handler type can dispatch by tool name when a server has more than one tool. Tool arguments, schemas, annotations, and structured results use raw <code>JSON.JSONText</code> values. The handler must validate its arguments before it performs work.</p><pre><code class="language-julia hljs">using ModelContextProtocol
+
+const MCPJSON = ModelContextProtocol.JSON
+
+Base.@kwdef struct EchoArguments
+    message::String = &quot;&quot;
+end
+
+struct EchoHandler end
+
+function (::EchoHandler)(
+    ::ModelContextProtocol.StaticMCPRequestContext,
+    arguments::MCPJSON.JSONText,
+)
+    parsed = MCPJSON.parse(arguments.value, EchoArguments)
+    return ModelContextProtocol.StaticMCPToolResult(
+        text=parsed.message,
+        structured_content=MCPJSON.JSONText(MCPJSON.json((; echoed=parsed.message))),
+    )
+end
+
+echo = ModelContextProtocol.StaticMCPTool(
+    name=&quot;echo&quot;,
+    description=&quot;Return the supplied message.&quot;,
+    input_schema=MCPJSON.JSONText(
+        &quot;{\&quot;type\&quot;:\&quot;object\&quot;,\&quot;properties\&quot;:{\&quot;message\&quot;:{\&quot;type\&quot;:\&quot;string\&quot;}},\&quot;required\&quot;:[\&quot;message\&quot;]}&quot;,
+    ),
+    annotations=MCPJSON.JSONText(&quot;{\&quot;readOnlyHint\&quot;:true}&quot;),
+    handler=EchoHandler(),
+)
+
+server = ModelContextProtocol.StaticMCPServer(
+    [echo];
+    name=&quot;Static Echo&quot;,
+    version=&quot;1.0.0&quot;,
+)
+
+only(server.tools).name</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">&quot;echo&quot;</code></pre><p>Register these handlers on one HTTP route:</p><pre><code class="language-julia hljs">HTTP = ModelContextProtocol.HTTP
+router = HTTP.Router()
+HTTP.register!(router, &quot;POST&quot;, &quot;/v1/mcp&quot;) do request
+    ModelContextProtocol.handle_static_jsonrpc_request(server, request)
+end
+HTTP.register!(router, &quot;GET&quot;, &quot;/v1/mcp&quot;) do request
+    ModelContextProtocol.handle_static_stream_request(server, request)
+end
+HTTP.register!(router, &quot;DELETE&quot;, &quot;/v1/mcp&quot;) do request
+    ModelContextProtocol.handle_static_session_delete(server, request)
+end</code></pre><h2 id="MCP-Apps-widgets"><a class="docs-heading-anchor" href="#MCP-Apps-widgets">MCP Apps widgets</a><a id="MCP-Apps-widgets-1"></a><a class="docs-heading-anchor-permalink" href="#MCP-Apps-widgets" title="Permalink"></a></h2><p>An MCP App is an HTML widget that hosts such as Claude and ChatGPT render inline when a linked tool runs. The <a href="https://github.com/JuliaServices/ModelContextProtocol.jl/blob/main/MCP-App-playbook.md">MCP App playbook</a> explains each piece. With the static server:</p><ol><li>Serve the widget HTML as a <code>StaticMCPResource</code> with a <code>ui://</code> uri and <code>mime_type=MCP_APP_HTML_MIME_TYPE</code>. <code>mcp_app_html</code> builds a widget document with the host handshake included.</li><li>Link the tool to the widget with <code>meta=static_ui_tool_meta(uri)</code>.</li><li>Advertise MCP Apps with <code>extensions=static_ui_extensions()</code>.</li><li>Return the widget&#39;s data as <code>structured_content</code>.</li></ol><pre><code class="language-julia hljs">widget_uri = &quot;ui://echo/card&quot;
+widget = ModelContextProtocol.StaticMCPResource(
+    uri=widget_uri,
+    name=&quot;echo-card&quot;,
+    mime_type=ModelContextProtocol.MCP_APP_HTML_MIME_TYPE,
+    text=ModelContextProtocol.mcp_app_html(
+        app_name=&quot;echo-card&quot;,
+        body=&quot;&lt;main id=\&quot;app\&quot;&gt;Loading&lt;/main&gt;&quot;,
+        script=&quot;mcpApp.onRender(function (data) { document.getElementById(&#39;app&#39;).textContent = data.echoed; });&quot;,
+    ),
+    meta=MCPJSON.JSONText(&quot;{\&quot;ui\&quot;:{\&quot;prefersBorder\&quot;:true}}&quot;),
+)
+
+card_echo = ModelContextProtocol.StaticMCPTool(
+    name=&quot;echo&quot;,
+    description=&quot;Return the supplied message in a card.&quot;,
+    input_schema=echo.input_schema,
+    meta=ModelContextProtocol.static_ui_tool_meta(widget_uri),
+    handler=EchoHandler(),
+)
+
+app_server = ModelContextProtocol.StaticMCPServer(
+    [card_echo];
+    name=&quot;Static Echo&quot;,
+    version=&quot;1.0.0&quot;,
+    resources=[widget],
+    extensions=ModelContextProtocol.static_ui_extensions(),
+    stateless=true,
+)
+
+request = ModelContextProtocol.HTTP.Request(
+    &quot;POST&quot;,
+    &quot;/v1/mcp&quot;,
+    [&quot;Content-Type&quot; =&gt; &quot;application/json&quot;, &quot;MCP-Protocol-Version&quot; =&gt; &quot;2025-11-25&quot;],
+    Vector{UInt8}(&quot;{\&quot;jsonrpc\&quot;:\&quot;2.0\&quot;,\&quot;id\&quot;:1,\&quot;method\&quot;:\&quot;tools/list\&quot;}&quot;),
+)
+String(ModelContextProtocol.handle_static_jsonrpc_request(app_server, request).body)</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">&quot;{\&quot;jsonrpc\&quot;:\&quot;2.0\&quot;,\&quot;id\&quot;:1,\&quot;result\&quot;:{\&quot;tools\&quot;:[{\&quot;name\&quot;:\&quot;echo\&quot;,\&quot;description\&quot;:\&quot;Return the supplied message in a card.\&quot;,\&quot;inputSchema\&quot;:{\&quot;type\&quot;:\&quot;object\&quot;,\&quot;properties\&quot;:{\&quot;message\&quot;:{\&quot;type\&quot;:\&quot;string\&quot;}},\&quot;required\&quot;:[\&quot;message\&quot;]},\&quot;annotations\&quot;:{},\&quot;_meta\&quot;:{\&quot;ui\&quot;:{\&quot;resourceUri\&quot;:\&quot;ui://echo/card\&quot;,\&quot;visibility\&quot;:[\&quot;model\&quot;,\&quot;app\&quot;]},\&quot;ui/resourceUri\&quot;:\&quot;ui://echo/card\&quot;}}]}}&quot;</code></pre><p>The static server returns the text block and <code>structuredContent</code> for each tool call. It does not embed the widget HTML in the tool result, so hosts that render only an embedded copy show the text instead.</p><h2 id="Protocol-versions-and-sessions"><a class="docs-heading-anchor" href="#Protocol-versions-and-sessions">Protocol versions and sessions</a><a id="Protocol-versions-and-sessions-1"></a><a class="docs-heading-anchor-permalink" href="#Protocol-versions-and-sessions" title="Permalink"></a></h2><p><code>initialize</code> answers with the client&#39;s requested <code>protocolVersion</code> when it is the server&#39;s <code>protocol_version</code> or in <code>supported_protocol_versions</code>, and with <code>protocol_version</code> otherwise. Requests whose <code>MCP-Protocol-Version</code> header names any other version get HTTP 400. Some clients omit that header after <code>initialize</code>; <code>missing_protocol_header</code> chooses what happens then:</p><ul><li><code>:ignore</code> (the default) serves the request.</li><li><code>:warn</code> logs a warning and serves the request.</li><li><code>:error</code> answers HTTP 400.</li></ul><p>By default the server issues an <code>MCP-Session-Id</code> at <code>initialize</code> and keeps the session in memory. A client must send that id, and the <code>notifications/initialized</code> notification, before other requests. After a restart, or on another machine, the session is unknown and the client gets HTTP 404 and must initialize again.</p><p>Set <code>stateless=true</code> to avoid that. <code>initialize</code> then issues no session id, requests need no session, and the server stores nothing per client, so any process running the same server answers any client. <code>DELETE</code> returns HTTP 405 because there is no session to end. This is still the <code>2025-11-25</code> protocol, not the <code>2026-07-28</code> protocol.</p><h2 id="Support-limits"><a class="docs-heading-anchor" href="#Support-limits">Support limits</a><a id="Support-limits-1"></a><a class="docs-heading-anchor-permalink" href="#Support-limits" title="Permalink"></a></h2><p>The static server does not provide prompts, resource templates, resource subscriptions, completion, OAuth discovery, or unsolicited server events. <code>resources/templates/list</code> returns an empty list. Its <code>GET</code> handler returns HTTP 405 because it does not open an event stream. Use <code>MCPServer</code> when the application needs these features.</p><p>JuliaC verification covers in-memory HTTP requests and the complete static server lifecycle in both session modes. It does not cover live socket or TLS setup in HTTP.jl.</p></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../auth0/">« Auth0 Federation Example</a><a class="docs-footer-nextpage" href="../api/">API »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.19.0 on <span class="colophon-date" title="Tuesday 27 October 2026 07:13">Tuesday 27 October 2026</span>. Using Julia version 1.13.3.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
