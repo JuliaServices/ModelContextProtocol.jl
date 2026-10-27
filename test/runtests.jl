@@ -184,11 +184,13 @@ function jsonrpc_http_request(method::String; id="1", params=Dict{String,Any}(),
     return HTTP.Request("POST", "/v1/mcp", headers, codeunits(JSON.json(body)))
 end
 
-function static_raw_request(body::AbstractString; session_id=nothing)
-    headers = [
-        "Content-Type" => "application/json",
-        "MCP-Protocol-Version" => ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
-    ]
+function static_raw_request(
+    body::AbstractString;
+    session_id=nothing,
+    protocol_version=ModelContextProtocol.DEFAULT_PROTOCOL_VERSION,
+)
+    headers = ["Content-Type" => "application/json"]
+    protocol_version !== nothing && push!(headers, "MCP-Protocol-Version" => protocol_version)
     session_id !== nothing && push!(headers, "MCP-Session-Id" => session_id)
     return HTTP.Request("POST", "/v1/mcp", headers, Vector{UInt8}(codeunits(body)))
 end
@@ -413,6 +415,303 @@ end
         HTTP.Request("DELETE", "/v1/mcp", ["MCP-Session-Id" => session_id]),
     )
     @test deleted.status == 204
+end
+
+const STATIC_WIDGET_URI = "ui://static-test/card"
+# Exercises JSON escaping: quotes, backslash, newline, tab, a control byte,
+# a closing script tag, and multi-byte Unicode including U+2028.
+const STATIC_WIDGET_HTML = "<!doctype html>\n<html><body data-x=\"1\">\n<script>const s = \"</script>\";\tback\\slash \u0001 é 🎾  </script>\n</body></html>\n"
+
+struct StaticAppHandler
+    kind::String
+end
+
+function (handler::StaticAppHandler)(
+    context::ModelContextProtocol.StaticMCPRequestContext,
+    arguments::JSON.JSONText,
+)
+    handler.kind == "bad-meta" &&
+        return ModelContextProtocol.StaticMCPToolResult(text="bad", meta=JSON.JSONText("[]"))
+    return ModelContextProtocol.StaticMCPToolResult(
+        text="card",
+        structured_content=JSON.JSONText(JSON.json((; session_id=context.session_id, arguments=JSON.parse(arguments.value)))),
+        meta=JSON.JSONText("{\"trace\":\"abc\"}"),
+    )
+end
+
+function static_app_server(; kwargs...)
+    card = ModelContextProtocol.StaticMCPTool(
+        name="card",
+        description="Show a card.",
+        output_schema=JSON.JSONText("{\"type\":\"object\"}"),
+        meta=ModelContextProtocol.static_ui_tool_meta(STATIC_WIDGET_URI),
+        handler=StaticAppHandler("card"),
+    )
+    bad_meta = ModelContextProtocol.StaticMCPTool(name="bad-meta", handler=StaticAppHandler("bad-meta"))
+    widget = ModelContextProtocol.StaticMCPResource(
+        uri=STATIC_WIDGET_URI,
+        name="card",
+        title="Card",
+        description="Card widget.",
+        mime_type=ModelContextProtocol.MCP_APP_HTML_MIME_TYPE,
+        text=STATIC_WIDGET_HTML,
+        meta=JSON.JSONText("{\"ui\":{\"prefersBorder\":true}}"),
+    )
+    notes = ModelContextProtocol.StaticMCPResource(
+        uri="file:///notes.txt",
+        name="notes",
+        mime_type="text/plain",
+        text="plain notes",
+    )
+    return ModelContextProtocol.StaticMCPServer(
+        [card, bad_meta];
+        name="Static Apps",
+        version="1.0.0",
+        resources=[widget, notes],
+        extensions=ModelContextProtocol.static_ui_extensions(),
+        supported_protocol_versions=["2025-06-18"],
+        kwargs...,
+    )
+end
+
+static_initialize_body(version) = JSON.json(Dict(
+    "jsonrpc" => "2.0",
+    "id" => 1,
+    "method" => "initialize",
+    "params" => Dict(
+        "protocolVersion" => version,
+        "capabilities" => Dict{String,Any}(),
+        "clientInfo" => Dict("name" => "static-test", "version" => "0.1.0"),
+    ),
+))
+
+static_body(method; id=1, params=nothing) = JSON.json(
+    params === nothing ? Dict("jsonrpc" => "2.0", "id" => id, "method" => method) :
+    Dict("jsonrpc" => "2.0", "id" => id, "method" => method, "params" => params),
+)
+
+static_payload(response) = JSON.parse(String(copy(response.body)))
+
+function static_initialized_session(server; protocol_version=ModelContextProtocol.DEFAULT_PROTOCOL_VERSION)
+    init = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request(static_initialize_body(protocol_version); protocol_version=nothing),
+    )
+    session_id = HTTP.header(init, "MCP-Session-Id")
+    ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}"; session_id),
+    )
+    return session_id
+end
+
+@testset "Static server construction" begin
+    tool(; kwargs...) = ModelContextProtocol.StaticMCPTool(; name="t", handler=StaticAppHandler("card"), kwargs...)
+    resource(; kwargs...) = ModelContextProtocol.StaticMCPResource(; uri="ui://r", name="r", mime_type="text/plain", text="x", kwargs...)
+    build(; tools=[tool()], kwargs...) = ModelContextProtocol.StaticMCPServer(tools; name="s", version="1", kwargs...)
+
+    @test build().missing_protocol_header === :ignore
+    @test !build().stateless
+    @test build(; protocol_version="2025-11-25", supported_protocol_versions=["2025-06-18", "2025-11-25"]).protocol_versions ==
+          ["2025-11-25", "2025-06-18"]
+    @test_throws ArgumentError build(; tools=[tool(output_schema=JSON.JSONText("[]"))])
+    @test_throws ArgumentError build(; tools=[tool(meta=JSON.JSONText("null"))])
+    @test_throws ArgumentError build(; resources=[resource(), resource()])
+    @test_throws ArgumentError build(; resources=[resource(uri="")])
+    @test_throws ArgumentError build(; resources=[resource(meta=JSON.JSONText("1"))])
+    @test_throws ArgumentError build(; resources=[resource(text=String(UInt8[0xff, 0xfe]))])
+    @test_throws ArgumentError build(; extensions=JSON.JSONText("[]"))
+    @test_throws ArgumentError build(; supported_protocol_versions=[ModelContextProtocol.PROTOCOL_VERSION_2026_07_28])
+    @test_throws ArgumentError build(; protocol_version=ModelContextProtocol.PROTOCOL_VERSION_2026_07_28)
+    @test_throws ArgumentError build(; missing_protocol_header=:sometimes)
+    @test build(; missing_protocol_header="WARN").missing_protocol_header === :warn
+
+    # Positional constructors from before meta fields existed.
+    positional_tool = ModelContextProtocol.StaticMCPTool(
+        "p", StaticAppHandler("card"), nothing, nothing, JSON.JSONText("{}"), JSON.JSONText("{}"),
+    )
+    @test positional_tool.output_schema === nothing && positional_tool.meta.value == "{}"
+    positional_result = ModelContextProtocol.StaticMCPToolResult("t", JSON.JSONText("null"), false)
+    @test positional_result.meta.value == "{}"
+end
+
+@testset "Static server MCP Apps" begin
+    @test JSON.parse(ModelContextProtocol.static_ui_tool_meta(STATIC_WIDGET_URI).value) ==
+          ModelContextProtocol.ui_tool_meta(STATIC_WIDGET_URI)
+    @test JSON.parse(ModelContextProtocol.static_ui_tool_meta(STATIC_WIDGET_URI; visibility=["app"]).value) ==
+          ModelContextProtocol.ui_tool_meta(STATIC_WIDGET_URI; visibility=["app"])
+    @test JSON.parse(ModelContextProtocol.static_ui_extensions().value) ==
+          ModelContextProtocol.ui_extension_capability()["extensions"]
+
+    server = static_app_server()
+    init = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request(static_initialize_body("2025-06-18"); protocol_version=nothing),
+    )
+    @test init.status == 200
+    @test HTTP.header(init, "MCP-Protocol-Version") == "2025-06-18"
+    result = static_payload(init)["result"]
+    @test result["protocolVersion"] == "2025-06-18"
+    @test result["capabilities"]["resources"] == Dict("listChanged" => false)
+    @test result["capabilities"]["extensions"] == Dict(
+        ModelContextProtocol.MCP_APPS_EXTENSION_ID => Dict("mimeTypes" => [ModelContextProtocol.MCP_APP_HTML_MIME_TYPE]),
+    )
+
+    for (requested, expected) in (("1999-01-01", "2025-11-25"), ("2025-11-25", "2025-11-25"))
+        negotiated = ModelContextProtocol.handle_static_jsonrpc_request(
+            server,
+            static_raw_request(static_initialize_body(requested); protocol_version=nothing),
+        )
+        @test static_payload(negotiated)["result"]["protocolVersion"] == expected
+        @test HTTP.header(negotiated, "MCP-Protocol-Version") == expected
+    end
+
+    session_id = static_initialized_session(server)
+    call(body) = ModelContextProtocol.handle_static_jsonrpc_request(server, static_raw_request(body; session_id))
+
+    tools = static_payload(call(static_body("tools/list")))["result"]["tools"]
+    card = only(filter(t -> t["name"] == "card", tools))
+    @test card["_meta"] == ModelContextProtocol.ui_tool_meta(STATIC_WIDGET_URI)
+    @test card["outputSchema"] == Dict("type" => "object")
+    bad_meta = only(filter(t -> t["name"] == "bad-meta", tools))
+    @test !haskey(bad_meta, "_meta")
+    @test !haskey(bad_meta, "outputSchema")
+
+    called = static_payload(call(static_body("tools/call"; params=Dict("name" => "card", "arguments" => Dict("id" => 7)))))["result"]
+    @test called["_meta"] == Dict("trace" => "abc")
+    @test called["structuredContent"] == Dict("session_id" => session_id, "arguments" => Dict("id" => 7))
+    @test only(called["content"])["text"] == "card"
+    @test static_payload(call(static_body("tools/call"; params=Dict("name" => "bad-meta"))))["error"]["code"] == -32603
+
+    listed = static_payload(call(static_body("resources/list")))["result"]["resources"]
+    @test length(listed) == 2
+    @test listed[1] == Dict(
+        "uri" => STATIC_WIDGET_URI,
+        "name" => "card",
+        "title" => "Card",
+        "description" => "Card widget.",
+        "mimeType" => ModelContextProtocol.MCP_APP_HTML_MIME_TYPE,
+        "_meta" => Dict("ui" => Dict("prefersBorder" => true)),
+    )
+    @test listed[2] == Dict("uri" => "file:///notes.txt", "name" => "notes", "mimeType" => "text/plain")
+
+    read_response = call(static_body("resources/read"; params=Dict("uri" => STATIC_WIDGET_URI)))
+    @test read_response.status == 200
+    contents = only(static_payload(read_response)["result"]["contents"])
+    @test contents["text"] == STATIC_WIDGET_HTML
+    @test contents["uri"] == STATIC_WIDGET_URI
+    @test contents["mimeType"] == ModelContextProtocol.MCP_APP_HTML_MIME_TYPE
+    @test contents["_meta"] == Dict("ui" => Dict("prefersBorder" => true))
+    @test !haskey(only(static_payload(call(static_body("resources/read"; params=Dict("uri" => "file:///notes.txt"))))["result"]["contents"]), "_meta")
+
+    missing_resource = static_payload(call(static_body("resources/read"; params=Dict("uri" => "ui://missing"))))
+    @test missing_resource["error"]["code"] == -32002
+    @test missing_resource["error"]["message"] == "Resource not found"
+    @test missing_resource["error"]["data"] == Dict("uri" => "ui://missing")
+    for params in (nothing, Dict{String,Any}(), Dict("uri" => 1), Dict("uri" => ""), [STATIC_WIDGET_URI])
+        invalid = static_payload(call(static_body("resources/read"; params)))
+        @test invalid["error"]["code"] == -32602
+    end
+    @test static_payload(call(static_body("resources/templates/list")))["result"] == Dict("resourceTemplates" => Any[])
+    @test static_payload(call(static_body("ping")))["result"] == Dict{String,Any}()
+    @test static_payload(call(static_body("prompts/list")))["error"]["code"] == -32601
+
+    plain = ModelContextProtocol.StaticMCPServer(
+        [ModelContextProtocol.StaticMCPTool(name="t", handler=StaticAppHandler("card"))];
+        name="Plain",
+        version="1",
+    )
+    plain_init = static_payload(ModelContextProtocol.handle_static_jsonrpc_request(
+        plain,
+        static_raw_request(static_initialize_body("2025-06-18"); protocol_version=nothing),
+    ))["result"]
+    @test plain_init["protocolVersion"] == "2025-11-25"
+    @test plain_init["capabilities"] == Dict("tools" => Dict("listChanged" => false))
+end
+
+@testset "Static server protocol header policy" begin
+    tools_list = static_body("tools/list")
+    for policy in (:ignore, :warn, :error)
+        server = static_app_server(; missing_protocol_header=policy)
+        session_id = static_initialized_session(server)
+        with_header = ModelContextProtocol.handle_static_jsonrpc_request(
+            server, static_raw_request(tools_list; session_id, protocol_version="2025-06-18"))
+        @test with_header.status == 200
+        unsupported = ModelContextProtocol.handle_static_jsonrpc_request(
+            server, static_raw_request(tools_list; session_id, protocol_version="2024-11-05"))
+        @test unsupported.status == 400
+        @test static_payload(unsupported)["error"]["code"] == -32600
+
+        missing_request = static_raw_request(tools_list; session_id, protocol_version=nothing)
+        if policy === :error
+            missing_header = ModelContextProtocol.handle_static_jsonrpc_request(server, missing_request)
+            @test missing_header.status == 400
+            @test static_payload(missing_header)["error"]["code"] == -32600
+            @test static_payload(missing_header)["id"] == 1
+        elseif policy === :warn
+            missing_header = @test_logs (:warn, r"MCP-Protocol-Version") ModelContextProtocol.handle_static_jsonrpc_request(server, missing_request)
+            @test missing_header.status == 200
+        else
+            missing_header = @test_logs ModelContextProtocol.handle_static_jsonrpc_request(server, missing_request)
+            @test missing_header.status == 200
+        end
+    end
+end
+
+@testset "Static server stateless mode" begin
+    server = static_app_server(; stateless=true)
+    init = ModelContextProtocol.handle_static_jsonrpc_request(
+        server,
+        static_raw_request(static_initialize_body("2025-11-25"); protocol_version=nothing),
+    )
+    @test init.status == 200
+    @test !HTTP.hasheader(init, "MCP-Session-Id")
+    @test isempty(server.sessions)
+
+    # A fresh server stands in for a restarted or second machine: no initialize,
+    # no session, no initialized notification.
+    for target in (server, static_app_server(; stateless=true))
+        @test static_payload(ModelContextProtocol.handle_static_jsonrpc_request(
+            target, static_raw_request(static_body("ping"))))["result"] == Dict{String,Any}()
+        listed = ModelContextProtocol.handle_static_jsonrpc_request(target, static_raw_request(static_body("tools/list")))
+        @test listed.status == 200
+        @test length(static_payload(listed)["result"]["tools"]) == 2
+        called = static_payload(ModelContextProtocol.handle_static_jsonrpc_request(
+            target,
+            static_raw_request(static_body("tools/call"; params=Dict("name" => "card", "arguments" => Dict{String,Any}()))),
+        ))["result"]
+        @test called["structuredContent"]["session_id"] == ""
+        read_response = static_payload(ModelContextProtocol.handle_static_jsonrpc_request(
+            target, static_raw_request(static_body("resources/read"; params=Dict("uri" => STATIC_WIDGET_URI)))))
+        @test only(read_response["result"]["contents"])["text"] == STATIC_WIDGET_HTML
+        @test isempty(target.sessions)
+    end
+
+    for notification in ("notifications/initialized", "notifications/cancelled")
+        accepted = ModelContextProtocol.handle_static_jsonrpc_request(
+            server, static_raw_request("{\"jsonrpc\":\"2.0\",\"method\":\"$(notification)\"}"))
+        @test accepted.status == 202
+        @test isempty(accepted.body)
+    end
+
+    stray_session = ModelContextProtocol.handle_static_jsonrpc_request(
+        server, static_raw_request(static_body("tools/list"); session_id="not-issued"))
+    @test stray_session.status == 200
+
+    deleted = ModelContextProtocol.handle_static_session_delete(
+        server, HTTP.Request("DELETE", "/v1/mcp", ["MCP-Session-Id" => "anything"]))
+    @test deleted.status == 405
+    stream = ModelContextProtocol.handle_static_stream_request(server, HTTP.Request("GET", "/v1/mcp"))
+    @test stream.status == 405
+    @test HTTP.header(stream, "Allow") == "POST"
+
+    stateful = static_app_server()
+    @test ModelContextProtocol.handle_static_jsonrpc_request(
+        stateful, static_raw_request(static_body("tools/list"))).status == 400
+    @test ModelContextProtocol.handle_static_jsonrpc_request(
+        stateful, static_raw_request(static_body("tools/list"); session_id="not-issued")).status == 404
+    @test HTTP.header(ModelContextProtocol.handle_static_stream_request(stateful, HTTP.Request("GET", "/v1/mcp")), "Allow") ==
+          "POST, DELETE"
 end
 
 function stub_protected_resource(base::String)

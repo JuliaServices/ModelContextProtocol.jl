@@ -1,20 +1,51 @@
 const STATIC_MCP_SESSION_HEADER = "MCP-Session-Id"
 const STATIC_MCP_PROTOCOL_HEADER = "MCP-Protocol-Version"
 
-"A raw-JSON tool result for the statically dispatchable MCP server."
+"""
+    StaticMCPToolResult(; text, structured_content=JSON.JSONText("null"), is_error=false, meta=JSON.JSONText("{}"))
+
+The result of a static tool call. `text` becomes the single text block in
+`content`. `structured_content` must be a raw JSON object or `null`; when it is
+an object the server sends it as `structuredContent`. `meta` must be a raw JSON
+object; when it is not empty the server sends it as the result `_meta`.
+"""
 Base.@kwdef struct StaticMCPToolResult
     text::String
     structured_content::JSON.JSONText=JSON.JSONText("null")
     is_error::Bool=false
+    meta::JSON.JSONText=JSON.JSONText("{}")
 end
 
-"Request context passed to a static MCP tool handler."
+# Keep the three-field positional constructor working.
+StaticMCPToolResult(text, structured_content, is_error) =
+    StaticMCPToolResult(text, structured_content, is_error, JSON.JSONText("{}"))
+
+"""
+Request context passed to a static MCP tool handler. `session_id` is the
+request's `MCP-Session-Id` header, or empty when the request has none. A
+stateless server issues no session ids, so it is usually empty there.
+"""
 Base.@kwdef struct StaticMCPRequestContext
     request::HTTP.Request
     session_id::String
 end
 
-"A tool whose handler has a concrete callable type."
+"""
+    StaticMCPTool(; name, handler, title=nothing, description=nothing,
+                  input_schema=JSON.JSONText("{\"type\":\"object\"}"),
+                  annotations=JSON.JSONText("{}"), output_schema=nothing,
+                  meta=JSON.JSONText("{}"))
+
+A tool whose handler has a concrete callable type. The server calls
+`handler(context::StaticMCPRequestContext, arguments::JSON.JSONText)` and
+expects a [`StaticMCPToolResult`](@ref ModelContextProtocol.StaticMCPToolResult).
+
+`input_schema`, `annotations`, `output_schema`, and `meta` are raw JSON objects.
+`tools/list` sends `output_schema` as `outputSchema` when it is set, and `meta`
+as `_meta` when it is not empty. Use
+[`static_ui_tool_meta`](@ref ModelContextProtocol.static_ui_tool_meta) to link a
+tool to an MCP App widget.
+"""
 Base.@kwdef struct StaticMCPTool{H}
     name::String
     handler::H
@@ -22,6 +53,31 @@ Base.@kwdef struct StaticMCPTool{H}
     description::Union{String,Nothing}=nothing
     input_schema::JSON.JSONText=JSON.JSONText("{\"type\":\"object\"}")
     annotations::JSON.JSONText=JSON.JSONText("{}")
+    output_schema::Union{JSON.JSONText,Nothing}=nothing
+    meta::JSON.JSONText=JSON.JSONText("{}")
+end
+
+# Keep the six-field positional constructor working.
+StaticMCPTool(name, handler, title, description, input_schema, annotations) =
+    StaticMCPTool(name, handler, title, description, input_schema, annotations, nothing, JSON.JSONText("{}"))
+
+"""
+    StaticMCPResource(; uri, name, mime_type, text, title=nothing, description=nothing,
+                      meta=JSON.JSONText("{}"))
+
+A fixed text resource served by `resources/list` and `resources/read`. `meta`
+is a raw JSON object; when it is not empty the server sends it as `_meta` on
+the listing and on the read contents. An MCP App widget is a resource with a
+`ui://` uri and `mime_type=MCP_APP_HTML_MIME_TYPE`.
+"""
+Base.@kwdef struct StaticMCPResource
+    uri::String
+    name::String
+    mime_type::String
+    text::String
+    title::Union{String,Nothing}=nothing
+    description::Union{String,Nothing}=nothing
+    meta::JSON.JSONText=JSON.JSONText("{}")
 end
 
 Base.@kwdef mutable struct StaticMCPSession
@@ -29,15 +85,49 @@ Base.@kwdef mutable struct StaticMCPSession
     initialized::Bool=false
 end
 
-"A tools-only MCP server whose entire request graph has concrete types."
+"""
+    StaticMCPServer(tools; name, version, description=nothing, instructions=nothing,
+                    resources=StaticMCPResource[], extensions=JSON.JSONText("{}"),
+                    protocol_version=DEFAULT_PROTOCOL_VERSION,
+                    supported_protocol_versions=String[],
+                    missing_protocol_header=:ignore, stateless=false)
+
+An MCP `2025-11-25` server for tools and fixed resources whose entire request
+graph has concrete types, so JuliaC `--trim=safe` can compile it.
+
+- `resources`: fixed resources. The server advertises `capabilities.resources`
+  only when this is not empty.
+- `extensions`: a raw JSON object sent as `capabilities.extensions` when it is
+  not empty. Use [`static_ui_extensions`](@ref ModelContextProtocol.static_ui_extensions)
+  to advertise MCP Apps.
+- `protocol_version` and `supported_protocol_versions`: `initialize` answers
+  with the client's requested `protocolVersion` when it is one of these, and
+  with `protocol_version` otherwise. A request whose `MCP-Protocol-Version`
+  header names any other version gets HTTP 400.
+- `missing_protocol_header`: what to do when a request other than `initialize`
+  has no `MCP-Protocol-Version` header. `:error` answers HTTP 400, `:warn` logs a
+  warning and serves the request, and `:ignore` serves it silently.
+- `stateless`: when `true`, `initialize` issues no `MCP-Session-Id`, requests
+  need no session, and the server keeps no per-client state. Any process
+  running the same server can then answer any client. When `false`, the server
+  issues a session at `initialize` and requires it, plus the
+  `notifications/initialized` notification, before it serves other requests.
+"""
 mutable struct StaticMCPServer{H}
     name::String
     version::String
     description::Union{String,Nothing}
     instructions::Union{String,Nothing}
     protocol_version::String
+    # Every version the server accepts, starting with protocol_version.
+    protocol_versions::Vector{String}
+    missing_protocol_header::Symbol
+    stateless::Bool
+    extensions::JSON.JSONText
     tools::Vector{StaticMCPTool{H}}
     tool_indices::Dict{String,Int}
+    resources::Vector{StaticMCPResource}
+    resource_indices::Dict{String,Int}
     sessions::Dict{String,StaticMCPSession}
     lock::ReentrantLock
 end
@@ -48,7 +138,12 @@ function StaticMCPServer(
     version::AbstractString,
     description::Union{AbstractString,Nothing}=nothing,
     instructions::Union{AbstractString,Nothing}=nothing,
+    resources::Vector{StaticMCPResource}=StaticMCPResource[],
+    extensions::JSON.JSONText=JSON.JSONText("{}"),
     protocol_version::AbstractString=DEFAULT_PROTOCOL_VERSION,
+    supported_protocol_versions::Vector{String}=String[],
+    missing_protocol_header=:ignore,
+    stateless::Bool=false,
 ) where {H}
     isempty(tools) && throw(ArgumentError("A static MCP server requires at least one tool"))
     indices = Dict{String,Int}()
@@ -61,7 +156,34 @@ function StaticMCPServer(
             throw(ArgumentError("Static MCP tool input_schema must be a JSON object"))
         _static_is_json_object(tool.annotations.value) ||
             throw(ArgumentError("Static MCP tool annotations must be a JSON object"))
+        tool.output_schema === nothing || _static_is_json_object(tool.output_schema.value) ||
+            throw(ArgumentError("Static MCP tool output_schema must be a JSON object"))
+        _static_is_json_object(tool.meta.value) ||
+            throw(ArgumentError("Static MCP tool meta must be a JSON object"))
         indices[tool.name] = index
+    end
+    resource_indices = Dict{String,Int}()
+    for index in eachindex(resources)
+        resource = resources[index]
+        isempty(resource.uri) && throw(ArgumentError("A static MCP resource uri cannot be empty"))
+        haskey(resource_indices, resource.uri) &&
+            throw(ArgumentError("Duplicate static MCP resource uri: $(resource.uri)"))
+        isvalid(resource.text) ||
+            throw(ArgumentError("Static MCP resource text must be valid UTF-8: $(resource.uri)"))
+        _static_is_json_object(resource.meta.value) ||
+            throw(ArgumentError("Static MCP resource meta must be a JSON object"))
+        resource_indices[resource.uri] = index
+    end
+    _static_is_json_object(extensions.value) ||
+        throw(ArgumentError("Static MCP extensions must be a JSON object"))
+    versions = String[String(protocol_version)]
+    for supported in supported_protocol_versions
+        supported in versions || push!(versions, supported)
+    end
+    for supported in versions
+        # The 2026-07-28 protocol has no initialize handshake; this server does not implement it.
+        is_modern_protocol_version(supported) &&
+            throw(ArgumentError("The static MCP server does not support protocol version $(supported)"))
     end
     return StaticMCPServer{H}(
         String(name),
@@ -69,8 +191,14 @@ function StaticMCPServer(
         description === nothing ? nothing : String(description),
         instructions === nothing ? nothing : String(instructions),
         String(protocol_version),
+        versions,
+        normalize_missing_protocol_header_behavior(missing_protocol_header),
+        stateless,
+        extensions,
         tools,
         indices,
+        resources,
+        resource_indices,
         Dict{String,StaticMCPSession}(),
         ReentrantLock(),
     )
@@ -508,56 +636,59 @@ function _static_implementation_ok(s::String, start::Int)::Bool
     return i <= n && codeunit(s, i) == UInt8('}') && has_name && has_version
 end
 
-function _static_initialize_params(s::String, params_start::Int)::Bool
-    params_start == 0 && return false
+# Returns the requested protocolVersion when params are valid, or nothing when they are not.
+function _static_initialize_params(s::String, params_start::Int)::Union{String,Nothing}
+    params_start == 0 && return nothing
     n = ncodeunits(s)
-    (params_start <= n && codeunit(s, params_start) == UInt8('{')) || return false
+    (params_start <= n && codeunit(s, params_start) == UInt8('{')) || return nothing
     i = _static_skip_ws(s, params_start + 1)
     has_protocol_version = false
+    protocol_version = ""
     has_capabilities = false
     has_client_info = false
     while i <= n && codeunit(s, i) != UInt8('}')
-        codeunit(s, i) == UInt8('"') || return false
+        codeunit(s, i) == UInt8('"') || return nothing
         key, i = _static_scan_string(s, i)
-        i == 0 && return false
+        i == 0 && return nothing
         i = _static_skip_ws(s, i)
-        (i <= n && codeunit(s, i) == UInt8(':')) || return false
+        (i <= n && codeunit(s, i) == UInt8(':')) || return nothing
         i = _static_skip_ws(s, i + 1)
-        i <= n || return false
+        i <= n || return nothing
         if key == "protocolVersion"
-            has_protocol_version && return false
-            codeunit(s, i) == UInt8('"') || return false
-            _, i = _static_scan_string(s, i)
-            i == 0 && return false
+            has_protocol_version && return nothing
+            codeunit(s, i) == UInt8('"') || return nothing
+            protocol_version, i = _static_scan_string(s, i)
+            i == 0 && return nothing
             has_protocol_version = true
         elseif key == "capabilities"
-            has_capabilities && return false
-            codeunit(s, i) == UInt8('{') || return false
+            has_capabilities && return nothing
+            codeunit(s, i) == UInt8('{') || return nothing
             value_end = _static_value_end(s, i)
-            value_end == 0 && return false
+            value_end == 0 && return nothing
             i = value_end
             has_capabilities = true
         elseif key == "clientInfo"
-            has_client_info && return false
-            _static_implementation_ok(s, i) || return false
+            has_client_info && return nothing
+            _static_implementation_ok(s, i) || return nothing
             i = _static_value_end(s, i)
-            i == 0 && return false
+            i == 0 && return nothing
             has_client_info = true
         else
             i = _static_value_end(s, i)
-            i == 0 && return false
+            i == 0 && return nothing
         end
         i = _static_skip_ws(s, i)
-        i <= n || return false
+        i <= n || return nothing
         if codeunit(s, i) == UInt8(',')
             i = _static_skip_ws(s, i + 1)
-            (i <= n && codeunit(s, i) != UInt8('}')) || return false
+            (i <= n && codeunit(s, i) != UInt8('}')) || return nothing
         elseif codeunit(s, i) != UInt8('}')
-            return false
+            return nothing
         end
     end
-    return i <= n && codeunit(s, i) == UInt8('}') &&
-           has_protocol_version && has_capabilities && has_client_info
+    valid = i <= n && codeunit(s, i) == UInt8('}') &&
+            has_protocol_version && has_capabilities && has_client_info
+    return valid ? protocol_version : nothing
 end
 
 # Extracts params.name and raw params.arguments JSON from the request body.
@@ -602,6 +733,43 @@ function _static_tool_call_params(s::String, params_start::Int)::Tuple{String,JS
             return name, arguments
         else
             return "", arguments
+        end
+    end
+end
+
+# Returns the string value of `key` in the params object, or "" when params
+# are malformed or the key is missing or not a string.
+function _static_params_string(s::String, params_start::Int, key::String)::String
+    params_start == 0 && return ""
+    n = ncodeunits(s)
+    i = params_start
+    (i <= n && codeunit(s, i) == UInt8('{')) || return ""
+    value = ""
+    i = _static_skip_ws(s, i + 1)
+    (i <= n && codeunit(s, i) == UInt8('}')) && return value
+    while true
+        (i <= n && codeunit(s, i) == UInt8('"')) || return ""
+        member, i = _static_scan_string(s, i)
+        i == 0 && return ""
+        i = _static_skip_ws(s, i)
+        (i <= n && codeunit(s, i) == UInt8(':')) || return ""
+        i = _static_skip_ws(s, i + 1)
+        i <= n || return ""
+        if member == key
+            codeunit(s, i) == UInt8('"') || return ""
+            value, i = _static_scan_string(s, i)
+        else
+            i = _static_value_end(s, i)
+        end
+        i == 0 && return ""
+        i = _static_skip_ws(s, i)
+        i <= n || return ""
+        if codeunit(s, i) == UInt8(',')
+            i = _static_skip_ws(s, i + 1)
+        elseif codeunit(s, i) == UInt8('}')
+            return value
+        else
+            return ""
         end
     end
 end
@@ -664,10 +832,12 @@ function _static_success(id::StaticJSONRPCID, result::String)::String
     return string("{\"jsonrpc\":\"2.0\",\"id\":", id_json, ",\"result\":", result, "}")
 end
 
+# `data` is raw JSON for the error's `data` member; "" omits it.
 function _static_error(
     id::StaticJSONRPCID,
     code::Int,
     message::String,
+    data::String="",
 )::String
     id_json = _static_id_json(id)
     return string(
@@ -677,6 +847,7 @@ function _static_error(
         code,
         ",\"message\":",
         _static_json_string(message),
+        isempty(data) ? "" : string(",\"data\":", data),
         "}}",
     )
 end
@@ -704,23 +875,47 @@ function _static_find_session(
     end
 end
 
-function _static_initialize_result(server::StaticMCPServer)::String
+function _static_is_empty_json_object(s::String)::Bool
+    n = ncodeunits(s)
+    i = _static_skip_ws(s, 1)
+    (i <= n && codeunit(s, i) == UInt8('{')) || return false
+    i = _static_skip_ws(s, i + 1)
+    (i <= n && codeunit(s, i) == UInt8('}')) || return false
+    return _static_skip_ws(s, i + 1) == n + 1
+end
+
+# Writes `,"key":<object>` unless the object is empty.
+function _static_write_object_member(io::IO, key::String, object::JSON.JSONText)
+    _static_is_empty_json_object(object.value) && return nothing
+    print(io, ',')
+    _static_write_json_string(io, key)
+    print(io, ':', object.value)
+    return nothing
+end
+
+function _static_write_string_member(io::IO, key::String, value::Union{String,Nothing})
+    value === nothing && return nothing
+    print(io, ',')
+    _static_write_json_string(io, key)
+    print(io, ':')
+    _static_write_json_string(io, value)
+    return nothing
+end
+
+function _static_initialize_result(server::StaticMCPServer, protocol_version::String)::String
     io = IOBuffer()
     print(io, "{\"protocolVersion\":")
-    _static_write_json_string(io, server.protocol_version)
-    print(io, ",\"capabilities\":{\"tools\":{\"listChanged\":false}},\"serverInfo\":{\"name\":")
+    _static_write_json_string(io, protocol_version)
+    print(io, ",\"capabilities\":{\"tools\":{\"listChanged\":false}")
+    isempty(server.resources) || print(io, ",\"resources\":{\"listChanged\":false}")
+    _static_write_object_member(io, "extensions", server.extensions)
+    print(io, "},\"serverInfo\":{\"name\":")
     _static_write_json_string(io, server.name)
     print(io, ",\"version\":")
     _static_write_json_string(io, server.version)
     print(io, '}')
-    if server.description !== nothing
-        print(io, ",\"description\":")
-        _static_write_json_string(io, server.description::String)
-    end
-    if server.instructions !== nothing
-        print(io, ",\"instructions\":")
-        _static_write_json_string(io, server.instructions::String)
-    end
+    _static_write_string_member(io, "description", server.description)
+    _static_write_string_member(io, "instructions", server.instructions)
     print(io, '}')
     return String(take!(io))
 end
@@ -733,18 +928,46 @@ function _static_tools_result(server::StaticMCPServer)::String
         tool = server.tools[index]
         print(io, "{\"name\":")
         _static_write_json_string(io, tool.name)
-        if tool.title !== nothing
-            print(io, ",\"title\":")
-            _static_write_json_string(io, tool.title::String)
-        end
-        if tool.description !== nothing
-            print(io, ",\"description\":")
-            _static_write_json_string(io, tool.description::String)
-        end
+        _static_write_string_member(io, "title", tool.title)
+        _static_write_string_member(io, "description", tool.description)
         print(io, ",\"inputSchema\":", tool.input_schema.value)
-        print(io, ",\"annotations\":", tool.annotations.value, '}')
+        output_schema = tool.output_schema
+        output_schema === nothing || print(io, ",\"outputSchema\":", output_schema.value)
+        print(io, ",\"annotations\":", tool.annotations.value)
+        _static_write_object_member(io, "_meta", tool.meta)
+        print(io, '}')
     end
     print(io, "]}")
+    return String(take!(io))
+end
+
+function _static_resources_result(server::StaticMCPServer)::String
+    io = IOBuffer()
+    print(io, "{\"resources\":[")
+    for index in eachindex(server.resources)
+        index == firstindex(server.resources) || print(io, ',')
+        resource = server.resources[index]
+        print(io, "{\"uri\":")
+        _static_write_json_string(io, resource.uri)
+        _static_write_string_member(io, "name", resource.name)
+        _static_write_string_member(io, "title", resource.title)
+        _static_write_string_member(io, "description", resource.description)
+        _static_write_string_member(io, "mimeType", resource.mime_type)
+        _static_write_object_member(io, "_meta", resource.meta)
+        print(io, '}')
+    end
+    print(io, "]}")
+    return String(take!(io))
+end
+
+function _static_resource_contents(resource::StaticMCPResource)::String
+    io = IOBuffer()
+    print(io, "{\"contents\":[{\"uri\":")
+    _static_write_json_string(io, resource.uri)
+    _static_write_string_member(io, "mimeType", resource.mime_type)
+    _static_write_string_member(io, "text", resource.text)
+    _static_write_object_member(io, "_meta", resource.meta)
+    print(io, "}]}")
     return String(take!(io))
 end
 
@@ -758,7 +981,11 @@ function _static_tool_result(result::StaticMCPToolResult)::String
             error("Static MCP structured_content must be a JSON object or null")
         print(io, ",\"structuredContent\":", result.structured_content.value)
     end
-    print(io, ",\"isError\":", result.is_error ? "true" : "false", '}')
+    print(io, ",\"isError\":", result.is_error ? "true" : "false")
+    _static_is_json_object(result.meta.value) ||
+        error("Static MCP tool result meta must be a JSON object")
+    _static_write_object_member(io, "_meta", result.meta)
+    print(io, '}')
     return String(take!(io))
 end
 
@@ -766,13 +993,19 @@ function _static_session_id(req::HTTP.Request)::String
     return HTTP.header(req.headers, STATIC_MCP_SESSION_HEADER, "")
 end
 
-function _static_protocol_supported(server::StaticMCPServer, req::HTTP.Request)::Bool
-    requested = HTTP.header(req.headers, STATIC_MCP_PROTOCOL_HEADER, "")
-    return isempty(requested) || requested == server.protocol_version
-end
+"""
+    handle_static_jsonrpc_request(server::StaticMCPServer, req::HTTP.Request) -> HTTP.Response
 
+Answer one JSON-RPC message POSTed to the MCP endpoint. Requests get a JSON
+response; notifications get HTTP 202 with no body. The server handles
+`initialize`, `ping`, `tools/list`, `tools/call`, `resources/list`,
+`resources/read`, and `resources/templates/list` (always empty). Other methods
+get JSON-RPC error -32601. `resources/read` for an unknown uri gets error
+-32002 with the uri in `data`.
+"""
 function handle_static_jsonrpc_request(server::StaticMCPServer{H}, req::HTTP.Request) where {H}
-    _static_protocol_supported(server, req) || return _static_response(
+    header_version = String(strip(HTTP.header(req.headers, STATIC_MCP_PROTOCOL_HEADER, "")))
+    isempty(header_version) || header_version in server.protocol_versions || return _static_response(
         400,
         _static_error(nothing, -32600, "Unsupported MCP protocol version"),
     )
@@ -786,41 +1019,53 @@ function handle_static_jsonrpc_request(server::StaticMCPServer{H}, req::HTTP.Req
 
     if rpc.method == "initialize"
         rpc.has_id || return HTTP.Response(202)
-        _static_initialize_params(body, rpc.params_start) ||
+        requested = _static_initialize_params(body, rpc.params_start)
+        requested === nothing &&
             return _static_response(200, _static_error(rpc.id, -32602, "Invalid initialize parameters"))
-        session = _static_create_session!(server)
-        body = _static_success(rpc.id, _static_initialize_result(server))
+        version = requested in server.protocol_versions ? requested : server.protocol_version
+        session_id = server.stateless ? nothing : _static_create_session!(server).id
         return _static_response(
             200,
-            body;
-            session_id=session.id,
-            protocol_version=server.protocol_version,
+            _static_success(rpc.id, _static_initialize_result(server, version));
+            session_id=session_id,
+            protocol_version=version,
         )
     end
 
-    session_id = _static_session_id(req)
-    isempty(session_id) && return _static_response(
-        400,
-        _static_error(rpc.id, -32600, "MCP-Session-Id is required"),
-    )
-    session = _static_find_session(server, session_id)
-    session === nothing && return _static_response(
-        404,
-        _static_error(rpc.id, -32600, "Unknown MCP session"),
-    )
+    # initialize is exempt above: clients send the header only after version negotiation.
+    if isempty(header_version) && server.missing_protocol_header !== :ignore
+        server.missing_protocol_header === :error && return _static_response(
+            400,
+            _static_error(rpc.id, -32600, "MCP-Protocol-Version header is required"),
+        )
+        @warn "MCP request is missing the MCP-Protocol-Version header; serving it as $(server.protocol_version)" method = rpc.method
+    end
 
-    if rpc.method == "notifications/initialized"
-        rpc.has_id &&
-            return _static_response(200, _static_error(rpc.id, -32600, "initialized must be a notification"))
-        session.initialized = true
-        return HTTP.Response(202, Pair{String,String}[], UInt8[])
-    elseif !session.initialized
-        return _static_response(
+    session_id = _static_session_id(req)
+    if !server.stateless
+        isempty(session_id) && return _static_response(
+            400,
+            _static_error(rpc.id, -32600, "MCP-Session-Id is required"),
+        )
+        session = _static_find_session(server, session_id)
+        session === nothing && return _static_response(
+            404,
+            _static_error(rpc.id, -32600, "Unknown MCP session"),
+        )
+        if rpc.method == "notifications/initialized"
+            rpc.has_id &&
+                return _static_response(200, _static_error(rpc.id, -32600, "initialized must be a notification"))
+            session.initialized = true
+            return HTTP.Response(202, Pair{String,String}[], UInt8[])
+        end
+        session.initialized || return _static_response(
             400,
             _static_error(rpc.id, -32002, "MCP session is not initialized"),
         )
-    elseif !rpc.has_id
-        return HTTP.Response(202)
+    end
+
+    if !rpc.has_id
+        return HTTP.Response(202, Pair{String,String}[], UInt8[])
     elseif rpc.method == "ping"
         return _static_response(200, _static_success(rpc.id, "{}"))
     elseif rpc.method == "tools/list"
@@ -844,17 +1089,39 @@ function handle_static_jsonrpc_request(server::StaticMCPServer{H}, req::HTTP.Req
             return _static_response(200, _static_error(rpc.id, code, message))
         end
         return _static_response(200, _static_success(rpc.id, result_json))
+    elseif rpc.method == "resources/list"
+        return _static_response(200, _static_success(rpc.id, _static_resources_result(server)))
+    elseif rpc.method == "resources/templates/list"
+        return _static_response(200, _static_success(rpc.id, "{\"resourceTemplates\":[]}"))
+    elseif rpc.method == "resources/read"
+        uri = _static_params_string(body, rpc.params_start, "uri")
+        isempty(uri) &&
+            return _static_response(200, _static_error(rpc.id, -32602, "Invalid resource parameters"))
+        index = get(server.resource_indices, uri, 0)
+        index == 0 && return _static_response(
+            200,
+            _static_error(rpc.id, -32002, "Resource not found", string("{\"uri\":", _static_json_string(uri), "}")),
+        )
+        return _static_response(200, _static_success(rpc.id, _static_resource_contents(server.resources[index])))
     end
 
     return _static_response(200, _static_error(rpc.id, -32601, "Method not found"))
 end
 
-"Return 405 because the static tools server does not emit unsolicited messages."
-function handle_static_stream_request(::StaticMCPServer, ::HTTP.Request)
-    return HTTP.Response(405, ["Allow" => "POST, DELETE"], UInt8[])
+"Return 405 because the static server does not emit unsolicited messages."
+function handle_static_stream_request(server::StaticMCPServer, ::HTTP.Request)
+    return HTTP.Response(405, ["Allow" => server.stateless ? "POST" : "POST, DELETE"], UInt8[])
 end
 
+"""
+    handle_static_session_delete(server::StaticMCPServer, req::HTTP.Request) -> HTTP.Response
+
+End the session named by the `MCP-Session-Id` header: 204 when it existed, 404
+when it did not, and 400 without the header. A stateless server has no
+sessions and answers 405.
+"""
 function handle_static_session_delete(server::StaticMCPServer, req::HTTP.Request)
+    server.stateless && return HTTP.Response(405, ["Allow" => "POST"], UInt8[])
     session_id = _static_session_id(req)
     isempty(session_id) && return _static_response(
         400,

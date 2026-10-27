@@ -7,8 +7,8 @@ Streamable HTTP.
 
 - The general implementation supports stateful MCP `2025-11-25` and stateless
   MCP `2026-07-28`.
-- The static JuliaC implementation is a separate, tools-only `2025-11-25`
-  subset. Do not add dynamic dispatch or unsupported features to it.
+- The static JuliaC implementation is a separate `2025-11-25` subset for
+  tools, fixed resources, and MCP Apps metadata. Do not add dynamic dispatch or unsupported features to it.
 - Keep the export surface small. Put specialized and low-level helpers under
   the `ModelContextProtocol` namespace.
 

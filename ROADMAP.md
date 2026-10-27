@@ -31,8 +31,9 @@ and bounded process shutdown for either explicitly selected protocol version.
 Notifications retain arrival order; bounded legacy request-handler tasks allow
 nested calls and may overlap notifications and other request handlers.
 
-The package also includes a separate tools-only server for JuliaC
-`--trim=safe` builds. That server intentionally supports only the documented
+The package also includes a separate server for JuliaC `--trim=safe` builds.
+It serves tools, fixed resources, and MCP Apps metadata, with an optional
+session-free mode. That server intentionally supports only the documented
 `2025-11-25` subset.
 
 ## Validation baseline
@@ -90,8 +91,10 @@ The repository tests these areas:
   requests. The application performs the external interaction and retries the
   original MCP request.
 - OAuth helpers do not implement every optional proof-of-possession mechanism.
-- The static JuliaC server does not support prompts, resources, OAuth, MCP Apps,
-  arbitrary middleware, or the `2026-07-28` stateless protocol.
+- The static JuliaC server does not support prompts, resource templates,
+  resource subscriptions, embedded resources in tool results, OAuth, arbitrary
+  middleware, or the `2026-07-28` protocol. Its stateless mode still uses the
+  `2025-11-25` `initialize` handshake.
 
 ## Next work
 

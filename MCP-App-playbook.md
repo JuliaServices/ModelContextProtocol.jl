@@ -446,3 +446,68 @@ group:
 8. Connect a real host (§6.3), remembering to force a handshake refresh.
 9. If deploying multi-replica: shared session store. If authing: 401 challenge.
 10. Keep the widget uri stable forever after.
+
+## 9. Static (trim-safe) server
+
+`StaticMCPServer` serves MCP Apps in JuliaC `--trim=safe` builds. Its names are
+not exported; use them through the `ModelContextProtocol` namespace. The §2
+checklist maps to it like this:
+
+| # | Static server equivalent |
+|---|--------------------------|
+| 1 | `supported_protocol_versions=[…]` and `missing_protocol_header=:warn` or `:ignore` (the default) |
+| 2 | `extensions=static_ui_extensions()` |
+| 3 | `StaticMCPResource(uri="ui://…", mime_type=MCP_APP_HTML_MIME_TYPE, text=html, meta=…)` in `resources=[…]` |
+| 4 | `StaticMCPTool(…, meta=static_ui_tool_meta(uri))` (same nested and flat keys as `ui_tool_meta`) |
+| 5 | `StaticMCPToolResult(text=…, structured_content=…)`. The result does **not** embed the widget, so hosts that render only an embedded copy show the text |
+| 6 | `mcp_app_html(…)`, called at load time (for example in a `const`) because it is not part of the trim-checked path |
+
+```julia
+using ModelContextProtocol
+const MCP = ModelContextProtocol
+
+struct ReportHandler end
+
+function (::ReportHandler)(::MCP.StaticMCPRequestContext, arguments::MCP.JSON.JSONText)
+    return MCP.StaticMCPToolResult(
+        text="Found report: Q3 revenue",
+        structured_content=MCP.JSON.JSONText("{\"title\":\"Q3 revenue\"}"),
+    )
+end
+
+const REPORT_CARD_HTML = MCP.mcp_app_html(
+    app_name="acme-report-card",
+    body="<main id=\"app\">Loading…</main>",
+    script="mcpApp.onRender(function (data) { document.getElementById('app').textContent = data.title; });",
+)
+
+card = MCP.StaticMCPResource(
+    uri="ui://acme/report-card",
+    name="acme-report-card",
+    mime_type=MCP.MCP_APP_HTML_MIME_TYPE,
+    text=REPORT_CARD_HTML,
+    meta=MCP.JSON.JSONText("{\"ui\":{\"prefersBorder\":true}}"),
+)
+
+server = MCP.StaticMCPServer(
+    [MCP.StaticMCPTool(
+        name="report-lookup",
+        description="Look up a report by id.",
+        input_schema=MCP.JSON.JSONText("{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}}}"),
+        meta=MCP.static_ui_tool_meta(card.uri),
+        handler=ReportHandler(),
+    )];
+    name="Acme Reports",
+    version="1.0.0",
+    resources=[card],
+    extensions=MCP.static_ui_extensions(),
+    supported_protocol_versions=["2025-06-18"],
+    stateless=true,
+)
+```
+
+`stateless=true` means `initialize` issues no `MCP-Session-Id` and the server
+keeps no per-client state. Use it when the server may restart or run on more
+than one machine (see §5): any process running the same server answers any
+client. The §6.1 curl checks work unchanged; without a session, leave out the
+`MCP-Session-Id` header.

@@ -4,8 +4,8 @@ The package implements the **webhook profile** of the
 [draft MCP Events proposal](https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md)
 on MCP `2026-07-28`, matching the delivery mode supported by
 [ChatGPT plugins](https://developers.openai.com/plugins/build/mcp-events).
-Enable it explicitly on the general server. The static JuliaC server remains
-tools-only. All event APIs stay under the package namespace.
+Enable it explicitly on the general server. The static JuliaC server does not
+support events. All event APIs stay under the package namespace.
 
 Clients discover definitions with `events/list`, create or refresh subscriptions
 with `events/subscribe`, and stop them with `events/unsubscribe`. These methods

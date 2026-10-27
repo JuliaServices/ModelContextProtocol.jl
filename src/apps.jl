@@ -152,6 +152,47 @@ function ui_tool_meta(resource_uri::Union{AbstractString,MCPUIResource,Nothing}=
 end
 
 """
+    ModelContextProtocol.static_ui_tool_meta(resource_uri; visibility=["model", "app"]) -> JSON.JSONText
+
+The trim-safe form of [`ui_tool_meta`](@ref) for
+[`StaticMCPTool`](@ref ModelContextProtocol.StaticMCPTool)'s `meta` keyword.
+It writes the widget uri both as nested `ui.resourceUri` (next to
+`ui.visibility`) and as flat `ui/resourceUri`, because hosts read one or the
+other.
+"""
+function static_ui_tool_meta(
+    resource_uri::AbstractString;
+    visibility::Vector{String}=String["model", "app"],
+)::JSON.JSONText
+    uri = String(resource_uri)
+    io = IOBuffer()
+    print(io, "{\"ui\":{\"resourceUri\":")
+    _static_write_json_string(io, uri)
+    print(io, ",\"visibility\":[")
+    for index in eachindex(visibility)
+        index == firstindex(visibility) || print(io, ',')
+        _static_write_json_string(io, visibility[index])
+    end
+    print(io, "]},\"ui/resourceUri\":")
+    _static_write_json_string(io, uri)
+    print(io, '}')
+    return JSON.JSONText(String(take!(io)))
+end
+
+"""
+    ModelContextProtocol.static_ui_extensions() -> JSON.JSONText
+
+The MCP Apps extension object for
+[`StaticMCPServer`](@ref ModelContextProtocol.StaticMCPServer)'s `extensions`
+keyword: `{"io.modelcontextprotocol/ui": {"mimeTypes": ["text/html;profile=mcp-app"]}}`.
+It is the `extensions` member of [`ui_extension_capability`](@ref)'s result.
+"""
+static_ui_extensions() = JSON.JSONText(string(
+    "{", _static_json_string(MCP_APPS_EXTENSION_ID),
+    ":{\"mimeTypes\":[", _static_json_string(MCP_APP_HTML_MIME_TYPE), "]}}",
+))
+
+"""
     ui_resource_meta(; prefers_border=true, display_mode="inline", extra=nothing) -> Dict{String,Any}
 
 Build the `_meta` payload for a MCP App resource registration. `display_mode`
