@@ -21,12 +21,14 @@ StaticMCPToolResult(text, structured_content, is_error) =
     StaticMCPToolResult(text, structured_content, is_error, JSON.JSONText("{}"))
 
 """
-Request context passed to a static MCP tool handler. `session_id` is the
-request's `MCP-Session-Id` header, or empty when the request has none. A
-stateless server issues no session ids, so it is usually empty there.
+Request context passed to a static MCP tool handler. `request` is the request the
+server received, with its concrete type, so a handler can read it in a
+trim-compiled program. `session_id` is the request's `MCP-Session-Id` header, or
+empty when the request has none. A stateless server issues no session ids, so it
+is usually empty there.
 """
-Base.@kwdef struct StaticMCPRequestContext
-    request::HTTP.Request
+Base.@kwdef struct StaticMCPRequestContext{R<:HTTP.Request}
+    request::R
     session_id::String
 end
 

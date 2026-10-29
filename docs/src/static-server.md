@@ -14,7 +14,9 @@ namespace.
 Each tool handler must have the same concrete Julia type. One handler type can
 dispatch by tool name when a server has more than one tool. Tool arguments,
 schemas, annotations, and structured results use raw `JSON.JSONText` values.
-The handler must validate its arguments before it performs work.
+The handler must validate its arguments before it performs work. Its
+`context.request` is the request the server received, with its concrete type,
+so the handler can read the request's headers or target in a trimmed program.
 
 ```@example static-server
 using ModelContextProtocol

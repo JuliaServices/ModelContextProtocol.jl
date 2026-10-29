@@ -422,6 +422,13 @@ const STATIC_WIDGET_URI = "ui://static-test/card"
 # a closing script tag, and multi-byte Unicode including U+2028.
 const STATIC_WIDGET_HTML = "<!doctype html>\n<html><body data-x=\"1\">\n<script>const s = \"</script>\";\tback\\slash \u0001 é 🎾  </script>\n</body></html>\n"
 
+@testset "Static request context keeps the request type" begin
+    request = static_raw_request("{}")
+    context = ModelContextProtocol.StaticMCPRequestContext(request=request, session_id="")
+    @test fieldtype(typeof(context), :request) === typeof(request)
+    @test context.request === request
+end
+
 struct StaticAppHandler
     kind::String
 end
@@ -434,7 +441,11 @@ function (handler::StaticAppHandler)(
         return ModelContextProtocol.StaticMCPToolResult(text="bad", meta=JSON.JSONText("[]"))
     return ModelContextProtocol.StaticMCPToolResult(
         text="card",
-        structured_content=JSON.JSONText(JSON.json((; session_id=context.session_id, arguments=JSON.parse(arguments.value)))),
+        structured_content=JSON.JSONText(JSON.json((;
+            session_id=context.session_id,
+            target=context.request.target,
+            arguments=JSON.parse(arguments.value),
+        ))),
         meta=JSON.JSONText("{\"trace\":\"abc\"}"),
     )
 end
@@ -579,7 +590,8 @@ end
 
     called = static_payload(call(static_body("tools/call"; params=Dict("name" => "card", "arguments" => Dict("id" => 7)))))["result"]
     @test called["_meta"] == Dict("trace" => "abc")
-    @test called["structuredContent"] == Dict("session_id" => session_id, "arguments" => Dict("id" => 7))
+    @test called["structuredContent"] ==
+          Dict("session_id" => session_id, "target" => "/v1/mcp", "arguments" => Dict("id" => 7))
     @test only(called["content"])["text"] == "card"
     @test static_payload(call(static_body("tools/call"; params=Dict("name" => "bad-meta"))))["error"]["code"] == -32603
 

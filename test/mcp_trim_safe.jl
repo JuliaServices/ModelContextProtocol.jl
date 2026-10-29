@@ -13,11 +13,12 @@ const JSON = ModelContextProtocol.JSON
 struct TrimEchoHandler end
 
 function (::TrimEchoHandler)(
-    ::ModelContextProtocol.StaticMCPRequestContext,
+    context::ModelContextProtocol.StaticMCPRequestContext,
     arguments::JSON.JSONText,
 )
+    # Reading the request checks that it reaches the handler with a concrete type.
     return ModelContextProtocol.StaticMCPToolResult(
-        text="echoed",
+        text="echoed " * context.request.target,
         structured_content=arguments,
         meta=JSON.JSONText("{\"trace\":\"trim\"}"),
     )
@@ -121,7 +122,7 @@ function run_mcp_trim_sample()::Nothing
     )
     _trim_assert(called.status == 200, "tools/call status")
     called_body = _body(called)
-    _trim_assert(occursin("\"text\":\"echoed\"", called_body), "tools/call text content")
+    _trim_assert(occursin("\"text\":\"echoed /v1/mcp\"", called_body), "tools/call text read from the request")
     _trim_assert(occursin("\"structuredContent\":{\"message\":\"hi \\\"trim\\\"\"}", called_body), "tools/call structured content")
     _trim_assert(occursin("\"isError\":false", called_body), "tools/call success flag")
     _trim_assert(occursin("\"_meta\":{\"trace\":\"trim\"}", called_body), "tools/call result _meta")
