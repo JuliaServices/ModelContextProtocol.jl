@@ -779,7 +779,10 @@ function subscribe_event(server::MCPServer, context::MCPRequestContext, params::
             records = live_event_subscriptions!(events)
             check_event_quota(events, records, principal, id)
             consented = any(record -> record.principal == principal && record.url == uri.url, records)
-            (consented || !(principal in events.verifying)) && break
+            # A termination for this key must land before the receiver hears
+            # of a new subscription with the same ID.
+            terminating = haskey(events.sending, (id, EVENT_TERMINATION))
+            !terminating && (consented || !(principal in events.verifying)) && break
             wait(events.lock)
         end
         if !consented
@@ -857,16 +860,24 @@ function dispatch_events(server, context, params)
         unsubscribe_event(server, context, params)
 end
 
-# The access check ran without the lock. Delete only if the record was not
-# saved again since, so a refresh made after access was restored survives.
-function remove_revoked_subscription!(events::MCPEvents, checked::MCPWebhookSubscription)
-    return @lock events.lock begin
-        current = get_event_subscription(events.store, checked.id)
-        (current === nothing || current.revision != checked.revision) && return false
-        delete_event_subscription!(events.store, checked.id)
-        true
-    end
+# Count a POST in flight. Call with events.lock held.
+function start_sending!(events::MCPEvents, key)
+    events.sending[key] = get(events.sending, key, 0) + 1
+    return nothing
 end
+
+function finish_sending!(events::MCPEvents, key)
+    @lock events.lock begin
+        remaining = events.sending[key] - 1
+        remaining == 0 ? delete!(events.sending, key) : (events.sending[key] = remaining)
+        notify(events.lock)
+    end
+    return nothing
+end
+
+# A termination counts under (id, EVENT_TERMINATION), not an instance, so a
+# re-subscribe of the same key can wait for it alone.
+const EVENT_TERMINATION = "terminated"
 
 function post_subscription_message(events, current, body, webhook_id)
     now = events.clock()
@@ -876,13 +887,27 @@ function post_subscription_message(events, current, body, webhook_id)
     return post_event_webhook(events, current.url, headers, body; deadline=min(current.expires_at, now + events.timeout))
 end
 
-# One best-effort POST. The record is already deleted, so a failure changes nothing.
-function send_event_termination(events, subscription)
+# The access check ran without the lock. Delete only if the record was not
+# saved again since, so a refresh made after access was restored survives.
+# A SEP-3415 receiver then gets one best-effort termination. It is counted
+# under the same lock as the delete, so no re-subscribe starts before it lands.
+function revoke_event_subscription!(events::MCPEvents, checked::MCPWebhookSubscription)
+    key = (checked.id, EVENT_TERMINATION)
+    @lock events.lock begin
+        current = get_event_subscription(events.store, checked.id)
+        (current === nothing || current.revision != checked.revision) && return nothing
+        delete_event_subscription!(events.store, checked.id)
+        checked.legacy_draft && return nothing
+        start_sending!(events, key)
+    end
     body = JSON.json((type="terminated", error=(code=-32024, message="Forbidden")))
     try
-        post_subscription_message(events, subscription, body, "msg_terminated_" * string(uuid4()))
+        post_subscription_message(events, checked, body, "msg_terminated_" * string(uuid4()))
     catch err
+        # The record is already gone, so a failed POST changes nothing.
         err isa MCPEventError || err isa MCPError || rethrow()
+    finally
+        finish_sending!(events, key)
     end
     return nothing
 end
@@ -907,15 +932,20 @@ function deliver_event!(events, subscription, body, draft_id)
                 reason = "expired"
                 record = nothing
             else
-                key = (record.id, record.instance)
-                events.sending[key] = get(events.sending, key, 0) + 1
+                start_sending!(events, (record.id, record.instance))
             end
             record
         end
         current === nothing && break
         stop = false
         try
-            if body !== nothing && event_authorized(events, current.principal, current.name, current.arguments)
+            if !event_authorized(events, current.principal, current.name, current.arguments)
+                reason = "forbidden"
+                stop = true
+                revoke_event_subscription!(events, current)
+            elseif body === nothing
+                stop = true # Access came back before this owner's turn.
+            else
                 attempts += 1
                 response = post_subscription_message(events, current, body, webhook_id)
                 status = Int(response.status)
@@ -923,14 +953,6 @@ function deliver_event!(events, subscription, body, draft_id)
                     return (subscription_id=subscription.id, accepted=true, attempts=attempts, status=status, reason=nothing)
                 reason = status >= 500 ? "http_5xx" : "http_4xx"
                 stop = status in (410, 413)
-            else
-                reason = "forbidden"
-                stop = true
-                # Without a body, emit_event! found the revocation on its own
-                # snapshot, so only that revision may be removed.
-                checked = body === nothing ? subscription : current
-                remove_revoked_subscription!(events, checked) && !checked.legacy_draft &&
-                    send_event_termination(events, checked)
             end
         catch err
             err isa MCPEventError || err isa MCPError || rethrow()
@@ -938,17 +960,12 @@ function deliver_event!(events, subscription, body, draft_id)
             # A destination that resolves to a non-public address is not retried.
             stop = err isa MCPError
         finally
-            @lock events.lock begin
-                key = (current.id, current.instance)
-                remaining = events.sending[key] - 1
-                remaining == 0 ? delete!(events.sending, key) : (events.sending[key] = remaining)
-                notify(events.lock)
-            end
+            finish_sending!(events, (current.id, current.instance))
         end
         (stop || attempt == events.max_attempts) && break
         events.wait(min(events.retry_delay * 2.0^(attempt - 1), 30.0))
     end
-    body === nothing && return nothing # No occurrence was prepared for a revoked subscription.
+    body === nothing && return nothing # No occurrence was prepared for a possibly revoked subscription.
     return (subscription_id=subscription.id, accepted=false, attempts=attempts, status=status, reason=reason)
 end
 
@@ -991,6 +1008,7 @@ function emit_event!(server::MCPServer, name::AbstractString, data; event_id=str
     batches = Dict{String,Vector{Tuple{MCPWebhookSubscription,Union{String,Nothing}}}}()
     for subscription in subscriptions
         if !event_authorized(events, subscription.principal, event_name, subscription.arguments)
+            # Its turn in the owner's queue rechecks access, then removes it.
             push!(get!(valtype(batches), batches, subscription.principal), (subscription, nothing))
             continue
         end

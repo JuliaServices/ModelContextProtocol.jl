@@ -262,6 +262,54 @@ end
     end
 end
 
+@testset "SEP-3415 termination lands before a re-subscribe is verified" begin
+    entered, release = Channel{Nothing}(1), Channel{Nothing}(1)
+    holder = Ref{Any}()
+    gated = function (url, address, headers, body, timeout)
+        get(JSON.parse(body), "type", nothing) == "terminated" && (put!(entered, nothing); take!(release))
+        return holder[].sender(url, address, headers, body, timeout)
+    end
+    f = event_fixture(request=gated)
+    holder[] = f
+    sep = (; capabilities=SEP_EVENT_CAPS, extra_headers=["Mcp-Name" => "comment.created"])
+    event_request(f.server, "events/subscribe", event_params(); sep...)
+    f.owners["alpha"] = false
+    emission = @async EventsMCP.emit_event!(f.server, "comment.created", event_data())
+    take!(entered)
+    f.owners["alpha"] = true
+    resubscribe = @async event_request(f.server, "events/subscribe", event_params(); sep...)
+    for _ in 1:10
+        yield()
+    end
+    @test !istaskdone(resubscribe)
+    put!(release, nothing)
+    @test timedwait(() -> istaskdone(emission) && istaskdone(resubscribe), 10) == :ok
+    @test haskey(fetch(resubscribe)[2], "result")
+    @test [c.parsed["type"] for c in f.calls] == ["verification", "terminated", "verification"]
+    @test length(event_records(f)) == 1
+end
+
+@testset "Access restored before an owner's turn keeps the subscription" begin
+    allowed = Dict(1 => true, 2 => true)
+    holder = Ref{Any}()
+    f = event_fixture(
+        authorize=(_owner, _name, args) -> args === nothing || allowed[args["metadata"]["index"]],
+        wait=_delay -> foreach(i -> allowed[i] = true, keys(allowed)),
+    )
+    holder[] = f
+    filters(i) = Dict("resource" => "shared", "metadata" => Dict("index" => i))
+    ids = [last(event_request(f.server, "events/subscribe", event_params(arguments=filters(i)); capabilities=SEP_EVENT_CAPS,
+        extra_headers=["Mcp-Name" => "comment.created"]))["result"]["id"] for i in 1:2]
+    # The owner's first subscription retries; access to the second returns during that wait.
+    early, late = sortperm(ids)
+    allowed[late] = false
+    push!(f.statuses, 500)
+    receipt = only(EventsMCP.emit_event!(f.server, "comment.created", event_data()))
+    @test (receipt.subscription_id, receipt.accepted, receipt.attempts) == (ids[early], true, 2)
+    @test length(event_records(f)) == 2
+    @test !any(c -> get(c.parsed, "type", nothing) == "terminated", f.calls)
+end
+
 @testset "Webhook identity, retries, refresh and restart across profiles" begin
     mktempdir() do dir
         path = joinpath(dir, "subscriptions.json")

@@ -107,7 +107,8 @@ struct MCPEvents
     verifying::Set{String}
     # (principal, callback host) => end of the cooldown after a failed verification.
     cooldowns::Dict{Tuple{String,String},Float64}
-    # (subscription ID, instance) => delivery attempts in progress, so unsubscribe can wait for them.
+    # (subscription ID, instance or "terminated") => POSTs in progress, so unsubscribe and
+    # re-subscribe can wait for them.
     sending::Dict{Tuple{String,String},Int}
     # Guards definitions, store writes, and the fields above. Never held across network
     # I/O or application hooks; notified when a verification or delivery attempt ends.
