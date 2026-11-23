@@ -876,6 +876,17 @@ function post_subscription_message(events, current, body, webhook_id)
     return post_event_webhook(events, current.url, headers, body; deadline=min(current.expires_at, now + events.timeout))
 end
 
+# One best-effort POST. The record is already deleted, so a failure changes nothing.
+function send_event_termination(events, subscription)
+    body = JSON.json((type="terminated", error=(code=-32024, message="Forbidden")))
+    try
+        post_subscription_message(events, subscription, body, "msg_terminated_" * string(uuid4()))
+    catch err
+        err isa MCPEventError || err isa MCPError || rethrow()
+    end
+    return nothing
+end
+
 function deliver_event!(events, subscription, body, draft_id)
     # Allocate once for this message, outside the retry loop. A refresh can
     # rotate keys while a message is in flight, but its ID and body stay paired.
@@ -915,20 +926,17 @@ function deliver_event!(events, subscription, body, draft_id)
             else
                 reason = "forbidden"
                 stop = true
+                # Without a body, emit_event! found the revocation on its own
+                # snapshot, so only that revision may be removed.
                 checked = body === nothing ? subscription : current
-                if remove_revoked_subscription!(events, checked) && !checked.legacy_draft
-                    # The record is gone even if the endpoint cannot acknowledge termination.
-                    control = JSON.json((type="terminated", error=(code=-32024, message="Forbidden")))
-                    post_subscription_message(events, checked, control, "msg_terminated_" * string(uuid4()))
-                end
+                remove_revoked_subscription!(events, checked) && !checked.legacy_draft &&
+                    send_event_termination(events, checked)
             end
         catch err
             err isa MCPEventError || err isa MCPError || rethrow()
-            if !stop
-                reason = err isa MCPEventError ? get(err.data, "reason", "connection_refused") : "invalid_destination"
-                # A destination that resolves to a non-public address is not retried.
-                stop = err isa MCPError
-            end
+            reason = err isa MCPEventError ? get(err.data, "reason", "connection_refused") : "invalid_destination"
+            # A destination that resolves to a non-public address is not retried.
+            stop = err isa MCPError
         finally
             @lock events.lock begin
                 key = (current.id, current.instance)
@@ -950,7 +958,12 @@ end
 Validate and synchronously deliver an emit-only occurrence to matching webhook
 subscriptions. Filtering and transformation receive the subscription owner,
 not the emitting task's identity. Recheck access and expiry before every bounded
-retry. One event ID and exact body are preserved; each attempt is signed anew.
+retry. Each subscription's message keeps its webhook-id and exact body across
+retries; each attempt is signed anew. SEP-3415 bodies carry event_id unchanged
+under a random webhook-id. Draft bodies use event_id as the webhook-id when it
+is 1-256 visible ASCII bytes, and a deterministic `evt_` hash of it otherwise.
+A subscription whose access was revoked is removed; SEP-3415 receivers also get
+one signed `terminated` envelope.
 
 Return delivery receipts (subscription_id, accepted, attempts, status, reason).
 The caller owns queuing and recovery of failed or interrupted emissions.
@@ -1079,7 +1092,11 @@ function subscribe_event(client::MCPClient, name::AbstractString;
     return call_event_subscription(client, "events/subscribe", params, headers, timeout_ms)
 end
 
-"""Stop a webhook subscription addressed by its original filters and URL."""
+"""
+Stop a webhook subscription addressed by its original filters and URL. Against
+a SEP-3415 server, this throws an `MCPError` (JSON-RPC `NotFound`) when the
+subscription is already absent or expired; a draft server returns an empty result.
+"""
 function unsubscribe_event(client::MCPClient, name::AbstractString; url::AbstractString, arguments=JSONDict(), headers=nothing, timeout_ms=nothing)
     client_is_modern(client) || throw(ArgumentError("MCP Events requires protocol 2026-07-28"))
     params = JSONDict(

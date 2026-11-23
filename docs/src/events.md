@@ -226,7 +226,7 @@ The default is four attempts with exponential backoff. `410` and `413` are not
 retried. Access, expiry, and subscription existence are checked before every
 attempt. Unsubscribe drains an in-flight request; later retries stop.
 
-Each body is at most 256 KiB. Retries preserve the event ID and exact body,
+Each body is at most 256 KiB. Retries keep the `webhook-id` and exact body,
 but generate their signing timestamp and HMAC anew. A refresh with a replacement
 `whsec_` secret dual-signs with the immediately previous key for a five-minute
 grace period by default. Treat upstream text as untrusted data and keep

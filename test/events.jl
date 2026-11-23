@@ -243,6 +243,25 @@ end
     @test !only(event_records(strict)).legacy_draft
 end
 
+@testset "SEP-3415 revocation between retries sends a best-effort termination" begin
+    # A termination POST that cannot be sent must not change the receipt.
+    for unreachable in (false, true)
+        holder = Ref{Any}()
+        f = event_fixture(wait=_delay -> begin
+            holder[].owners["alpha"] = false
+            unreachable && (holder[].addresses[] = IPAddr[ip"10.0.0.1"])
+        end)
+        holder[] = f
+        event_request(f.server, "events/subscribe", event_params(); capabilities=SEP_EVENT_CAPS,
+            extra_headers=["Mcp-Name" => "comment.created"])
+        push!(f.statuses, 500)
+        receipt = only(EventsMCP.emit_event!(f.server, "comment.created", event_data()))
+        @test (receipt.accepted, receipt.attempts, receipt.reason) == (false, 1, "forbidden")
+        @test isempty(event_records(f))
+        @test count(c -> get(c.parsed, "type", nothing) == "terminated", f.calls) == (unreachable ? 0 : 1)
+    end
+end
+
 @testset "Webhook identity, retries, refresh and restart across profiles" begin
     mktempdir() do dir
         path = joinpath(dir, "subscriptions.json")
