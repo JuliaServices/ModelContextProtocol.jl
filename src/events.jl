@@ -814,7 +814,9 @@ function subscribe_event(server::MCPServer, context::MCPRequestContext, params::
                 id, principal, name, deepcopy(arguments), uri.url, String(secret), expires_at,
                 previous === nothing ? nothing : rotated ? previous.secret : previous.previous_secret,
                 previous === nothing ? 0.0 : rotated ? now + events.rotation_grace : previous.previous_secret_until,
-                previous === nothing ? string(uuid4()) : previous.instance, string(uuid4()), legacy_draft,
+                previous === nothing ? string(uuid4()) : previous.instance, string(uuid4()),
+                # A draft refresh never downgrades a receiver already on SEP-3415.
+                legacy_draft && (previous === nothing || previous.legacy_draft),
             ))
             JSONDict("id" => id, "refreshBefore" => event_iso8601(expires_at), "cursor" => nothing, "truncated" => false)
         end

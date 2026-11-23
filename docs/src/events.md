@@ -28,7 +28,7 @@ every client should receive SEP-3415 even when it omits that declaration,
 set `legacy_compat=false` on `enable_events!`. That server advertises only
 the extension. The server saves the webhook profile on each subscription.
 Pre-upgrade records load as draft. A SEP-3415 refresh upgrades the same
-subscription ID in place.
+subscription ID in place; a later draft refresh does not downgrade it.
 
 ## Configure a server
 

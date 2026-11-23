@@ -289,6 +289,16 @@ end
     @test length(event_records(f)) == 1
 end
 
+@testset "A draft refresh keeps a SEP-3415 subscription on SEP-3415" begin
+    f = event_fixture()
+    event_request(f.server, "events/subscribe", event_params(); capabilities=SEP_EVENT_CAPS,
+        extra_headers=["Mcp-Name" => "comment.created"])
+    event_request(f.server, "events/subscribe", event_params())
+    @test !only(event_records(f)).legacy_draft
+    EventsMCP.emit_event!(f.server, "comment.created", event_data(); event_id="evt-1")
+    @test Dict(only(event_deliveries(f)).headers)["webhook-id"] != "evt-1"
+end
+
 @testset "Access restored before an owner's turn keeps the subscription" begin
     allowed = Dict(1 => true, 2 => true)
     holder = Ref{Any}()
