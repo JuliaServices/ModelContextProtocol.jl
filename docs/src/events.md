@@ -157,8 +157,8 @@ default. A finite request is clamped to the configured cap. `ttlMs: null`
 requests no expiry; this implementation grants the cap instead.
 Refresh before the returned `refreshBefore`. Expired subscriptions stop
 delivering. A caller can unsubscribe after its resource access is revoked.
-`events/list` then hides the event, so unsubscribe checks any `Mcp-Param-*`
-headers the caller sends but does not require them.
+`events/list` may then hide the event, so unsubscribe checks any `Mcp-Param-*`
+headers the caller sends for its own subscription but does not require them.
 For an already absent subscription SEP-3415 returns `NotFound` with
 `data.kind == "subscription"`. Draft clients receive an empty success result.
 

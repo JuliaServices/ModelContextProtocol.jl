@@ -834,16 +834,19 @@ end
 function unsubscribe_event(server::MCPServer, context::MCPRequestContext, params::JSONDict)
     events = require_events(server)
     principal, name, arguments, _delivery, uri = event_subscription_params(events, context, params; subscribing=false)
-    # Cleanup must keep working after access is revoked or an event is removed.
-    # events/list then hides the event's x-mcp-header annotations from the
-    # caller, so check the routing headers it sends but do not require them.
-    definition = @lock events.lock get(events.definitions, name, nothing)
-    definition === nothing || check_event_argument_headers(context, definition, arguments; allow_missing=true)
-    # The authenticated principal is part of the lookup key.
+    # The authenticated principal is part of the lookup key. Cleanup remains
+    # possible after resource access is revoked or an event is removed.
     id = event_subscription_id(principal, uri.url, name, arguments)
     @lock events.lock begin
         previous = get_event_subscription(events.store, id)
         existed = previous !== nothing && previous.expires_at > events.clock()
+        # Check routing headers only for the caller's own subscription, so they
+        # reveal nothing about events hidden from it. After revocation,
+        # events/list hides the x-mcp-header annotations too, so a missing
+        # header is allowed; a mismatched one is not.
+        definition = get(events.definitions, name, nothing)
+        existed && definition !== nothing &&
+            check_event_argument_headers(context, definition, arguments; allow_missing=true)
         delete_event_subscription!(events.store, id)
         # No new attempt can start now; wait for the ones already sending. A
         # subscription created again with the same key sends separately.

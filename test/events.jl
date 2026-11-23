@@ -181,6 +181,11 @@ end
             @test EventsMCP.unsubscribe_event(restarted, name; arguments, url=EVENT_URL, headers)["resultType"] == "complete"
             @test !haskey(only(filter(r -> r.method == "events/unsubscribe", seen)).headers, "mcp-param-region")
             @test isempty(event_records(f))
+            # Without its own subscription, a caller learns nothing about the
+            # event's header annotations.
+            _, absent = event_request(f.server, "events/unsubscribe", params; capabilities=SEP_EVENT_CAPS,
+                extra_headers=[good[1], "Mcp-Param-Region" => "wrong"])
+            @test absent["error"]["code"] == -32023
         end
     end
 end
