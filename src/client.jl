@@ -64,30 +64,35 @@ default_client_info() = Dict(
 function list_tools(client::MCPClient; cursor=nothing, limit=nothing, headers=nothing, timeout_ms=nothing)
     result = list_entities(client, JSONRPC_METHOD_TOOLS_LIST; cursor=cursor, limit=limit, headers=headers, timeout_ms=timeout_ms)
     (client_is_modern(client) && client.transport.kind == :http) || return result
+    return cache_input_schemas!(client.tool_schemas, result, "tools")
+end
+
+function cache_input_schemas!(schemas, result, collection)
     result isa AbstractDict || return result
-    tools = get(result, "tools", nothing)
-    tools isa AbstractVector || return result
-    valid_tools = Any[]
-    for raw_tool in tools
-        raw_tool isa AbstractDict || continue
-        tool = to_json_dict(raw_tool)
-        name = get(tool, "name", nothing)
+    entries = get(result, collection, nothing)
+    entries isa AbstractVector || return result
+    valid_entries = Any[]
+    for raw in entries
+        raw isa AbstractDict || continue
+        entry = to_json_dict(raw)
+        name = get(entry, "name", nothing)
         name isa AbstractString || continue
-        schema = get(tool, "inputSchema", Dict{String,Any}("type" => "object"))
+        schema = get(entry, "inputSchema", Dict{String,Any}("type" => "object"))
         schema isa AbstractDict || continue
         schema_dict = to_json_dict(schema)
         try
             mcp_header_specs(schema_dict)
         catch err
-            @warn "Ignoring tool with invalid x-mcp-header annotation" tool=String(name) reason=sprint(showerror, err)
-            delete!(client.tool_schemas, String(name))
+            kind = collection == "tools" ? "tool" : "event"
+            @warn "Ignoring $(kind) with invalid x-mcp-header annotation" name reason=sprint(showerror, err)
+            delete!(schemas, String(name))
             continue
         end
-        client.tool_schemas[String(name)] = deepcopy(schema_dict)
-        push!(valid_tools, tool)
+        schemas[String(name)] = deepcopy(schema_dict)
+        push!(valid_entries, entry)
     end
     filtered = to_json_dict(result)
-    filtered["tools"] = valid_tools
+    filtered[collection] = valid_entries
     return filtered
 end
 
@@ -100,8 +105,9 @@ list_resources(client::MCPClient; cursor=nothing, limit=nothing, headers=nothing
 list_resource_templates(client::MCPClient; cursor=nothing, limit=nothing, headers=nothing, timeout_ms=nothing) =
     list_entities(client, JSONRPC_METHOD_RESOURCES_TEMPLATES_LIST; cursor=cursor, limit=limit, headers=headers, timeout_ms=timeout_ms)
 
-function list_entities(client::MCPClient, method::AbstractString; cursor, limit, headers, timeout_ms)
+function list_entities(client::MCPClient, method::AbstractString; cursor, limit, headers, timeout_ms, meta=nothing)
     params = Dict{String,Any}()
+    meta === nothing || (params["_meta"] = meta)
     cursor !== nothing && (params["cursor"] = String(cursor))
     if limit !== nothing
         limit isa Integer || throw(ArgumentError("limit must be an integer"))
@@ -117,15 +123,13 @@ apply_mrtr_params!(params::Dict{String,Any}, input_responses, request_state) = b
     params
 end
 
-function prepare_tool_arguments(client::MCPClient, name::String, arguments)
-    client.transport.kind == :stdio && return arguments, HeaderPair[]
-    client_is_modern(client) || return arguments, HeaderPair[]
-    if !haskey(client.tool_schemas, name)
+function lookup_input_schema(fetch_page, schemas, name)
+    if !haskey(schemas, name)
         cursor = nothing
         seen_cursors = Set{String}()
         while true
-            result = list_tools(client; cursor)
-            haskey(client.tool_schemas, name) && break
+            result = fetch_page(cursor)
+            haskey(schemas, name) && break
             result isa AbstractDict || break
             next_cursor = get(result, "nextCursor", nothing)
             next_cursor isa AbstractString || break
@@ -134,7 +138,13 @@ function prepare_tool_arguments(client::MCPClient, name::String, arguments)
             push!(seen_cursors, cursor)
         end
     end
-    schema = get(client.tool_schemas, name, nothing)
+    return get(schemas, name, nothing)
+end
+
+function prepare_tool_arguments(client::MCPClient, name::String, arguments)
+    client.transport.kind == :stdio && return arguments, HeaderPair[]
+    client_is_modern(client) || return arguments, HeaderPair[]
+    schema = lookup_input_schema(cursor -> list_tools(client; cursor), client.tool_schemas, name)
     schema === nothing && return arguments, HeaderPair[]
     request_arguments = arguments
     args = if arguments === nothing
@@ -149,13 +159,17 @@ function prepare_tool_arguments(client::MCPClient, name::String, arguments)
     else
         throw(ArgumentError("tool arguments must be a dictionary or named tuple"))
     end
+    return request_arguments, argument_headers(schema, args)
+end
+
+function argument_headers(schema, args)
     headers = HeaderPair[]
     for spec in mcp_header_specs(schema)
         present, value = value_at_path(args, spec.path)
         present || continue
         push!(headers, normalize_pair("Mcp-Param-$(spec.name)", encode_mcp_header_value(value, spec.type)))
     end
-    return request_arguments, headers
+    return headers
 end
 
 function call_tool(client::MCPClient, name::AbstractString; arguments=nothing, headers=nothing, timeout_ms=nothing, input_responses=nothing, request_state=nothing, meta=nothing)
@@ -649,6 +663,7 @@ function terminate_session!(client::MCPClient; headers=nothing, timeout=nothing)
         client.session_id = nothing
         client.initialized = false
         empty!(client.tool_schemas)
+        empty!(client.event_schemas)
         return nothing
     end
     ensure_http_transport(client.transport)

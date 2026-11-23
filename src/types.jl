@@ -62,7 +62,14 @@ struct MCPWebhookSubscription
     # Random per save, so a check made outside the lock can tell whether the
     # record changed since it was read.
     revision::String
+    legacy_draft::Bool
 end
+
+# Records created before SEP-3415 use the draft webhook format.
+MCPWebhookSubscription(id, principal, name, arguments, url, secret, expires_at,
+    previous_secret, previous_secret_until, instance, revision) =
+    MCPWebhookSubscription(id, principal, name, arguments, url, secret, expires_at,
+        previous_secret, previous_secret_until, instance, revision, true)
 
 struct MCPServerEvent
     name::String
@@ -95,6 +102,7 @@ struct MCPEvents
     max_attempts::Int
     retry_delay::Float64
     allow_private_addresses::Bool
+    legacy_compat::Bool
     # Principals with a callback verification in progress; each runs one at a time.
     verifying::Set{String}
     # (principal, callback host) => end of the cooldown after a failed verification.
@@ -368,6 +376,7 @@ mutable struct MCPClient
     last_event_id::Union{String,Nothing}
     tool_schemas::Dict{String,Dict{String,Any}}
     stdio::Union{Nothing,StdioConnection}
+    event_schemas::Dict{String,JSONDict}
 end
 
 # Preserve the public positional client constructors that predate modern
@@ -380,6 +389,9 @@ MCPClient(manifest, transport, protocol_version, http, headers, timeout, verbose
 
 MCPClient(manifest, transport, protocol_version, http, headers, timeout, verbose, capabilities, client_info, auth_token, session, session_id, initialized, next_id, notification_handlers, request_handlers, event_task, last_event_id, tool_schemas) =
     MCPClient(manifest, transport, protocol_version, http, headers, timeout, verbose, capabilities, client_info, auth_token, session, session_id, initialized, next_id, notification_handlers, request_handlers, event_task, last_event_id, tool_schemas, nothing)
+
+MCPClient(manifest, transport, protocol_version, http, headers, timeout, verbose, capabilities, client_info, auth_token, session, session_id, initialized, next_id, notification_handlers, request_handlers, event_task, last_event_id, tool_schemas, stdio) =
+    MCPClient(manifest, transport, protocol_version, http, headers, timeout, verbose, capabilities, client_info, auth_token, session, session_id, initialized, next_id, notification_handlers, request_handlers, event_task, last_event_id, tool_schemas, stdio, Dict{String,JSONDict}())
 
 # A live subscriptions/listen stream (2026-07-28): notifications matching the
 # opted-in filter are pushed onto the channel by the server broadcast helpers.

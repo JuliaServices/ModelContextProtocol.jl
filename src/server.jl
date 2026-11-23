@@ -1120,7 +1120,14 @@ end
 # MCP Events are defined only for 2026-07-28 and later protocol versions.
 function version_capabilities(server::MCPServer, version::AbstractString)
     capabilities = manifest_capabilities(server)
-    is_modern_protocol_version(version) || pop!(capabilities, "events", nothing)
+    if !is_modern_protocol_version(version)
+        pop!(capabilities, "events", nothing)
+        extensions = get(capabilities, "extensions", nothing)
+        if extensions isa AbstractDict && haskey(extensions, MCP_EVENTS_EXTENSION_ID)
+            delete!(extensions, MCP_EVENTS_EXTENSION_ID)
+            isempty(extensions) && delete!(capabilities, "extensions")
+        end
+    end
     return capabilities
 end
 
@@ -1727,7 +1734,7 @@ function value_at_path(arguments::AbstractDict, path::Vector{String})
 end
 
 function mcp_name_body_value(method::AbstractString, params::Dict{String,Any})
-    if method == JSONRPC_METHOD_TOOLS_CALL || method == JSONRPC_METHOD_PROMPTS_GET
+    if method == JSONRPC_METHOD_TOOLS_CALL || method == JSONRPC_METHOD_PROMPTS_GET || method in MCP_NAMED_EVENT_METHODS
         value = get(params, "name", nothing)
         return value isa AbstractString ? String(value) : nothing
     elseif method == JSONRPC_METHOD_RESOURCES_READ
@@ -1737,9 +1744,44 @@ function mcp_name_body_value(method::AbstractString, params::Dict{String,Any})
     return nothing
 end
 
-# Streamable HTTP (2026-07-28) requires Mcp-Method on every request, plus
-# Mcp-Name on tools/call, prompts/get, and resources/read; header values must
-# match the corresponding body values (HeaderMismatch -32020 otherwise).
+# A duplicated routing header has no unambiguous value.
+function routing_header(headers, name)
+    lower_name = lowercase(name)
+    result = nothing
+    for (key, value) in headers
+        lowercase(key) == lower_name || continue
+        result === nothing || return missing
+        result = value
+    end
+    return result
+end
+
+function argument_header_mismatch(headers, schema, arguments; allow_missing=false)
+    arguments isa AbstractDict || (arguments = JSONDict())
+    for spec in mcp_header_specs(schema)
+        name = "Mcp-Param-$(spec.name)"
+        header = routing_header(headers, name)
+        header === missing && return "Header mismatch: duplicate $(name)"
+        header === nothing && allow_missing && continue
+        present, value = value_at_path(arguments, spec.path)
+        if !present
+            header === nothing || return "Header mismatch: $(name) is present but its argument is absent"
+            continue
+        end
+        header === nothing && return "Header mismatch: $(name) is required"
+        expected = try
+            encode_mcp_header_value(value, spec.type)
+        catch err
+            return "Header mismatch: $(sprint(showerror, err))"
+        end
+        decoded = decode_mcp_name(String(header))
+        if decoded === nothing || decoded != decode_mcp_name(expected)
+            return "Header mismatch: $(name) does not match its argument"
+        end
+    end
+    return nothing
+end
+
 function validate_modern_headers(server::MCPServer, req::HTTP.Request, method::AbstractString, params::Dict{String,Any}, id)
     header_method = http_header_value(req.headers, "Mcp-Method")
     if header_method === nothing || isempty(strip(String(header_method)))
@@ -1749,62 +1791,21 @@ function validate_modern_headers(server::MCPServer, req::HTTP.Request, method::A
         return jsonrpc_error(server, nothing, id, -32020, "Header mismatch: Mcp-Method header value '$(header_method)' does not match body method '$(method)'"; status=400)
     end
     expected_name = mcp_name_body_value(method, params)
-    if expected_name !== nothing
-        header_name = http_header_value(req.headers, "Mcp-Name")
-        if header_name === nothing || isempty(strip(String(header_name)))
-            return jsonrpc_error(server, nothing, id, -32020, "Header mismatch: Mcp-Name header is required for $(method)"; status=400)
-        end
-        decoded = decode_mcp_name(String(header_name))
-        if decoded === nothing || decoded != expected_name
+    named_event = method in MCP_NAMED_EVENT_METHODS
+    draft = named_event && uses_event_draft(server, params)
+    if expected_name !== nothing && (!named_event || server.events !== nothing)
+        header_name = routing_header(req.headers, "Mcp-Name")
+        if header_name === nothing
+            draft || return jsonrpc_error(server, nothing, id, -32020, "Header mismatch: Mcp-Name header is required for $(method)"; status=400)
+        elseif header_name === missing || isempty(strip(header_name)) || decode_mcp_name(header_name) != expected_name
             return jsonrpc_error(server, nothing, id, -32020, "Header mismatch: Mcp-Name header value does not match body value"; status=400)
         end
     end
     if method == JSONRPC_METHOD_TOOLS_CALL
-        tool_name = get(params, "name", nothing)
-        tool = tool_name isa AbstractString ? get(server.tools, String(tool_name), nothing) : nothing
+        tool = get(server.tools, expected_name, nothing)
         if tool !== nothing
-            arguments = get(params, "arguments", Dict{String,Any}())
-            arguments isa AbstractDict || (arguments = Dict{String,Any}())
-            for spec in mcp_header_specs(tool.input_schema)
-                present, value = value_at_path(arguments, spec.path)
-                raw_header = http_header_value(req.headers, "Mcp-Param-$(spec.name)")
-                if !present
-                    raw_header === nothing || return jsonrpc_error(
-                        server,
-                        nothing,
-                        id,
-                        -32020,
-                        "Header mismatch: Mcp-Param-$(spec.name) is present but its argument is absent";
-                        status=400,
-                    )
-                    continue
-                end
-                expected = try
-                    encode_mcp_header_value(value, spec.type)
-                catch err
-                    return jsonrpc_error(server, nothing, id, -32020, "Header mismatch: $(sprint(showerror, err))"; status=400)
-                end
-                raw_header === nothing && return jsonrpc_error(
-                    server,
-                    nothing,
-                    id,
-                    -32020,
-                    "Header mismatch: Mcp-Param-$(spec.name) is required";
-                    status=400,
-                )
-                decoded = decode_mcp_name(String(raw_header))
-                expected_decoded = decode_mcp_name(expected)
-                if decoded === nothing || decoded != expected_decoded
-                    return jsonrpc_error(
-                        server,
-                        nothing,
-                        id,
-                        -32020,
-                        "Header mismatch: Mcp-Param-$(spec.name) does not match its argument";
-                        status=400,
-                    )
-                end
-            end
+            mismatch = argument_header_mismatch(req.headers, tool.input_schema, get(params, "arguments", nothing))
+            mismatch === nothing || return jsonrpc_error(server, nothing, id, -32020, mismatch; status=400)
         end
     end
     return nothing
@@ -2122,7 +2123,9 @@ function handle_modern_request(server::MCPServer, req::HTTP.Request, method::Str
                 "requiredCapabilities" => err.required,
             )
         elseif err isa MCPEventError
-            err.code, err.message, err.data
+            err.code == -32020 && (status = 400)
+            wire_code = method in MCP_EVENT_METHODS && uses_event_draft(server, params) ? get(DRAFT_EVENT_ERROR_CODES, err.code, err.code) : err.code
+            wire_code, err.message, err.data
         else
             classified_code, classified_message = classify_error(err)
             if classified_code == -32002 && err isa MCPError && err.code == :resource_not_found

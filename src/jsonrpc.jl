@@ -103,7 +103,10 @@ function jsonrpc_call(
     header_pairs = normalize_headers(headers)
     if client_is_modern(client) && !notification
         push!(header_pairs, normalize_pair("Mcp-Method", method_str))
-        name_value = normalized_params isa Dict{String,Any} ? mcp_name_body_value(method_str, normalized_params) : nothing
+        name_value = if normalized_params isa Dict{String,Any} &&
+                        (!(method_str in MCP_NAMED_EVENT_METHODS) || request_declares_event_extension(normalized_params))
+            mcp_name_body_value(method_str, normalized_params)
+        end
         name_value === nothing || push!(header_pairs, normalize_pair("Mcp-Name", encode_mcp_name(name_value)))
     end
     if timeout_ms !== nothing
