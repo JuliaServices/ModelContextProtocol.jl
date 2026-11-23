@@ -984,8 +984,8 @@ retry. Each subscription's message keeps its webhook-id and exact body across
 retries; each attempt is signed anew. SEP-3415 bodies carry event_id unchanged
 under a random webhook-id. Draft bodies use event_id as the webhook-id when it
 is 1-256 visible ASCII bytes, and a deterministic `evt_` hash of it otherwise.
-A subscription whose access was revoked is removed; SEP-3415 receivers also get
-one signed `terminated` envelope.
+A subscription whose access is still revoked when its owner's turn comes is
+removed; SEP-3415 receivers also get one signed `terminated` envelope.
 
 Return delivery receipts (subscription_id, accepted, attempts, status, reason).
 The caller owns queuing and recovery of failed or interrupted emissions.
