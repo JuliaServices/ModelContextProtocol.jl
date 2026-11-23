@@ -168,11 +168,19 @@ end
             @test isempty(event_records(f))
             good = ["Mcp-Name" => EventsMCP.encode_mcp_name(name), "Mcp-Param-Region" => EventsMCP.encode_mcp_name("Québec")]
             event_request(f.server, "events/subscribe", params; capabilities=SEP_EVENT_CAPS, extra_headers=good)
-            for bad in ([good[1]], [good; "Mcp-Param-Region" => "wrong"])
+            for bad in ([good[1], "Mcp-Param-Region" => "wrong"], [good; "Mcp-Param-Region" => "wrong"])
                 response, result = event_request(f.server, "events/unsubscribe", params; capabilities=SEP_EVENT_CAPS, extra_headers=bad)
                 @test (response.status, result["error"]["code"]) == (400, -32020)
                 @test length(event_records(f)) == 1
             end
+            # Once alpha loses access, events/list hides the annotation, so a
+            # restarted client cannot send Mcp-Param-Region. Cleanup still works.
+            f.owners["alpha"] = false
+            restarted = prepare_manual_client(discovery; config)
+            empty!(seen)
+            @test EventsMCP.unsubscribe_event(restarted, name; arguments, url=EVENT_URL, headers)["resultType"] == "complete"
+            @test !haskey(only(filter(r -> r.method == "events/unsubscribe", seen)).headers, "mcp-param-region")
+            @test isempty(event_records(f))
         end
     end
 end
