@@ -16,7 +16,7 @@ The package supports Streamable HTTP for two protocol eras:
   calls, cache metadata, client capability checks,
   multi-round-trip `input_required` results, request-scoped progress and log
   events, and `subscriptions/listen`.
-- Experimental MCP Events webhook profile on `2026-07-28`: event discovery,
+- SEP-3415 and draft-compatible MCP Events webhooks on `2026-07-28`: event discovery,
   owner-scoped idempotent subscriptions, finite TTLs, durable subscription
   storage, callback verification, Standard Webhooks HMAC signing and rotation,
   filtering, access rechecks, bounded retries, and client helpers.
@@ -81,8 +81,9 @@ The repository tests these areas:
   dialects and other implicit schemas retain their legacy declarations.
   This is not a general 2020-12 validator. Delivery is webhook-only
   and synchronous. No polling, push, replay, dynamic catalog notifications,
-  durable outbox, or gap/termination envelopes are implemented. Subscriptions
-  always have finite lifetimes.
+  durable outbox, or gap envelopes are implemented. On revocation, SEP-3415
+  subscribers receive a best-effort signed termination. Subscriptions always
+  have finite lifetimes.
 - The file event store has one process owner. Replicas need a shared
   transactional backend and distributed coordination.
 - Modern request-scoped progress and log events keep their correct order, but

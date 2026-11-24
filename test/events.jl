@@ -67,12 +67,13 @@ function event_params(; name="comment.created", arguments=Dict("resource" => "sh
     return params
 end
 
-function event_request(server, method, params=Dict{String,Any}(); owner="alpha", id="events-1", legacy=false, jsonrpc="2.0")
+function event_request(server, method, params=Dict{String,Any}(); owner="alpha", id="events-1",
+    legacy=false, jsonrpc="2.0", capabilities=Dict{String,Any}(), extra_headers=Pair{String,String}[])
     wire_params = params isa AbstractDict ? Dict{String,Any}(deepcopy(params)) : deepcopy(params)
     if wire_params isa AbstractDict && !legacy
         wire_params["_meta"] = Dict(
             "io.modelcontextprotocol/protocolVersion" => "2026-07-28",
-            "io.modelcontextprotocol/clientCapabilities" => Dict{String,Any}(),
+            "io.modelcontextprotocol/clientCapabilities" => capabilities,
         )
     end
     envelope = Dict{String,Any}("jsonrpc" => jsonrpc, "method" => method, "params" => wire_params)
@@ -83,6 +84,7 @@ function event_request(server, method, params=Dict{String,Any}(); owner="alpha",
         "Mcp-Method" => method,
         "MCP-Protocol-Version" => legacy ? "2025-11-25" : "2026-07-28",
     ]
+    append!(headers, extra_headers)
     request = HTTP.Request("POST", "/v1/mcp", headers, Vector{UInt8}(codeunits(JSON.json(envelope))))
     owner === nothing || (request.context[:event_owner] = owner)
     response = EventsMCP.handle_jsonrpc_request(server, request)
@@ -93,6 +95,304 @@ end
 event_data(; resource="shared", text="hello") = Dict("resource" => resource, "text" => text)
 event_deliveries(fixture) = filter(call -> !haskey(call.parsed, "type"), fixture.calls)
 event_records(fixture) = EventsMCP.event_subscriptions(fixture.server.events.store)
+
+const SEP_EVENT_CAPS = Dict("extensions" => Dict("io.modelcontextprotocol/events" => Dict()))
+
+module EventProfileTestHTTP
+    const handler = Ref{Function}()
+    request(method, url; headers, body, kwargs...) = handler[](method, headers, body)
+end
+
+@testset "Julia client negotiates final-only, draft-only, and absent Events" begin
+    name = "révision.created"
+    arguments = Dict("region" => "Québec")
+    other_caps = Dict("extensions" => Dict("example.com/other" => Dict("version" => 1)))
+    for profile in (:final, :draft, :absent)
+        f = event_fixture(legacy_compat=profile != :final)
+        EventsMCP.register_event!(f.server; name, matches=(_...) -> true,
+            input_schema=Dict("type" => "object", "properties" => Dict(
+                "region" => Dict("type" => "string", "x-mcp-header" => "Region"))),
+            payload_schema=Dict("type" => "object"))
+        profile == :final || delete!(f.server.capabilities, "extensions")
+        profile == :absent && delete!(f.server.capabilities, "events")
+        seen = NamedTuple[]
+        EventProfileTestHTTP.handler[] = function (method, headers, body)
+            wire = JSON.parse(body)
+            push!(seen, (; method=wire["method"], headers=Dict(lowercase(k) => v for (k, v) in headers),
+                capabilities=wire["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]))
+            req = HTTP.Request(method, "/v1/mcp", headers, body)
+            EventsMCP.http_header_value(headers, "Authorization") == "Bearer test" && (req.context[:event_owner] = "alpha")
+            return EventsMCP.handle_jsonrpc_request(f.server, req)
+        end
+        descriptor = MCPTransportDescriptor(kind=:http, url="https://server.example/v1/mcp")
+        discovery = MCPDiscovery(manifest=Dict(), transports=[descriptor], default_transport=descriptor)
+        config = MCPClientConfig(http=EventProfileTestHTTP, protocol_version="2026-07-28")
+        configured = deepcopy(other_caps)
+        profile == :draft && merge!(configured["extensions"], SEP_EVENT_CAPS["extensions"])
+        client = prepare_manual_client(discovery; config, capabilities=deepcopy(configured))
+        headers = ["Authorization" => "Bearer test"]
+        if profile == :absent
+            @test_throws MCPError EventsMCP.list_events(client; headers)
+            @test [r.method for r in seen] == ["server/discover"]
+            continue
+        end
+        for _ in 1:2
+            @test haskey(EventsMCP.subscribe_event(client, name; arguments, url=EVENT_URL, secret=EVENT_SECRET, headers), "id")
+        end
+        @test only(EventsMCP.emit_event!(f.server, name, Dict(); event_id="revision-9")).accepted
+        @test (Dict(only(event_deliveries(f)).headers)["webhook-id"] == "revision-9") == (profile == :draft)
+        @test EventsMCP.unsubscribe_event(client, name; arguments, url=EVENT_URL, headers)["resultType"] == "complete"
+        @test count(r -> r.method == "server/discover", seen) == 1
+        @test all(r -> r.headers["authorization"] == "Bearer test", seen)
+        for r in filter(r -> r.method in ("events/subscribe", "events/unsubscribe"), seen)
+            @test r.capabilities["extensions"]["example.com/other"] == Dict("version" => 1)
+            if profile == :final
+                @test r.capabilities["extensions"]["io.modelcontextprotocol/events"] == Dict()
+                @test r.headers["mcp-name"] == EventsMCP.encode_mcp_name(name)
+                @test r.headers["mcp-param-region"] == EventsMCP.encode_mcp_name("Québec")
+            else
+                @test r.capabilities == other_caps
+                @test !haskey(r.headers, "mcp-name")
+                @test !haskey(r.headers, "mcp-param-region")
+            end
+        end
+        @test client.capabilities == configured
+        @test isempty(event_records(f))
+        if profile == :final
+            params = event_params(; name, arguments)
+            for bad in ([], ["Mcp-Param-Region" => "wrong"])
+                response, result = event_request(f.server, "events/subscribe", params; capabilities=SEP_EVENT_CAPS,
+                    extra_headers=vcat(["Mcp-Name" => EventsMCP.encode_mcp_name(name)], bad))
+                @test (response.status, result["error"]["code"]) == (400, -32020)
+            end
+            @test isempty(event_records(f))
+            good = ["Mcp-Name" => EventsMCP.encode_mcp_name(name), "Mcp-Param-Region" => EventsMCP.encode_mcp_name("Québec")]
+            event_request(f.server, "events/subscribe", params; capabilities=SEP_EVENT_CAPS, extra_headers=good)
+            for bad in ([good[1], "Mcp-Param-Region" => "wrong"], [good; "Mcp-Param-Region" => "wrong"])
+                response, result = event_request(f.server, "events/unsubscribe", params; capabilities=SEP_EVENT_CAPS, extra_headers=bad)
+                @test (response.status, result["error"]["code"]) == (400, -32020)
+                @test length(event_records(f)) == 1
+            end
+            # Once alpha loses access, events/list hides the annotation, so a
+            # restarted client cannot send Mcp-Param-Region. Cleanup still works.
+            f.owners["alpha"] = false
+            restarted = prepare_manual_client(discovery; config)
+            empty!(seen)
+            @test EventsMCP.unsubscribe_event(restarted, name; arguments, url=EVENT_URL, headers)["resultType"] == "complete"
+            @test !haskey(only(filter(r -> r.method == "events/unsubscribe", seen)).headers, "mcp-param-region")
+            @test isempty(event_records(f))
+            # Without its own subscription, a caller learns nothing about the
+            # event's header annotations.
+            _, absent = event_request(f.server, "events/unsubscribe", params; capabilities=SEP_EVENT_CAPS,
+                extra_headers=[good[1], "Mcp-Param-Region" => "wrong"])
+            @test absent["error"]["code"] == -32023
+        end
+    end
+end
+
+@testset "SEP-3415 and draft requests share an endpoint" begin
+    f = event_fixture(max_subscriptions=1)
+    params = event_params()
+    named = ["Mcp-Name" => params["name"]]
+    f.server.capabilities["extensions"]["example.com/other"] = Dict("setting" => 1)
+    _, discovery = event_request(f.server, "server/discover")
+    caps = discovery["result"]["capabilities"]
+    @test caps["events"] == caps["extensions"]["io.modelcontextprotocol/events"] == Dict()
+    _, legacy = event_request(f.server, "initialize", Dict("protocolVersion" => "2025-11-25"); legacy=true)
+    @test legacy["result"]["capabilities"]["extensions"] == Dict("example.com/other" => Dict("setting" => 1))
+
+    for method in ("events/subscribe", "events/unsubscribe")
+        for (capabilities, headers) in ((SEP_EVENT_CAPS, []), (SEP_EVENT_CAPS, ["Mcp-Name" => "wrong"]),
+                (Dict(), ["Mcp-Name" => "wrong"]), (Dict(), ["Mcp-Name" => ""]),
+                (Dict(), ["Mcp-Name" => params["name"], "Mcp-Name" => "wrong"]))
+            response, failed = event_request(f.server, method, params; capabilities, extra_headers=headers)
+            @test (response.status, failed["error"]["code"]) == (400, -32020)
+        end
+    end
+    @test isempty(f.calls) && isempty(event_records(f))
+
+    for (capabilities, headers, codes) in ((SEP_EVENT_CAPS, named, -32023:-1:-32027), (Dict(), [], -32011:-1:-32015))
+        request(method, p; keywords...) = last(event_request(f.server, method, p;
+            capabilities, extra_headers=headers, keywords...))
+        missing = event_params(name="unknown")
+        _, unknown = event_request(f.server, "events/subscribe", missing; capabilities, extra_headers=["Mcp-Name" => "unknown"])
+        @test unknown["error"]["code"] == codes[1]
+        @test request("events/list", Dict(); owner=nothing)["error"]["code"] == codes[2]
+        @test request("events/subscribe", merge(params, Dict("cursor" => "past")))["error"]["code"] == codes[4]
+        f.verification[] = (status=503, body="private callback response")
+        failure = request("events/subscribe", params)["error"]
+        @test (failure["code"], failure["data"]) == (codes[5], Dict("reason" => "http_5xx"))
+        @test request("events/subscribe", params)["error"]["code"] == codes[3]
+        f.now[] += 6
+        f.verification[] = :echo
+        @test request("events/subscribe", params)["result"]["resultType"] == "complete"
+        @test request("events/subscribe", event_params(url=EVENT_URL * "-extra"))["error"]["code"] == codes[3]
+        @test request("events/unsubscribe", params)["result"]["resultType"] == "complete"
+        absent = request("events/unsubscribe", params)
+        if capabilities == SEP_EVENT_CAPS
+            @test absent["error"]["code"] == -32023
+            @test absent["error"]["data"]["kind"] == "subscription"
+        else
+            @test absent["result"]["resultType"] == "complete"
+        end
+    end
+
+    # A conforming client may omit its declaration. A strict server still
+    # serves it the extension protocol and enforces routing without a signal.
+    strict = event_fixture(legacy_compat=false)
+    _, discovered = event_request(strict.server, "server/discover")
+    @test !haskey(discovered["result"]["capabilities"], "events")
+    @test discovered["result"]["capabilities"]["extensions"] == SEP_EVENT_CAPS["extensions"]
+    @test last(event_request(strict.server, "events/subscribe", params))["error"]["code"] == -32020
+    @test haskey(last(event_request(strict.server, "events/subscribe", params; extra_headers=named)), "result")
+    @test !only(event_records(strict)).legacy_draft
+end
+
+@testset "SEP-3415 revocation between retries sends a best-effort termination" begin
+    # A termination POST that cannot be sent must not change the receipt.
+    for unreachable in (false, true)
+        holder = Ref{Any}()
+        f = event_fixture(wait=_delay -> begin
+            holder[].owners["alpha"] = false
+            unreachable && (holder[].addresses[] = IPAddr[ip"10.0.0.1"])
+        end)
+        holder[] = f
+        event_request(f.server, "events/subscribe", event_params(); capabilities=SEP_EVENT_CAPS,
+            extra_headers=["Mcp-Name" => "comment.created"])
+        push!(f.statuses, 500)
+        receipt = only(EventsMCP.emit_event!(f.server, "comment.created", event_data()))
+        @test (receipt.accepted, receipt.attempts, receipt.reason) == (false, 1, "forbidden")
+        @test isempty(event_records(f))
+        @test count(c -> get(c.parsed, "type", nothing) == "terminated", f.calls) == (unreachable ? 0 : 1)
+    end
+end
+
+@testset "SEP-3415 termination lands before a re-subscribe is verified" begin
+    entered, release = Channel{Nothing}(1), Channel{Nothing}(1)
+    holder = Ref{Any}()
+    gated = function (url, address, headers, body, timeout)
+        get(JSON.parse(body), "type", nothing) == "terminated" && (put!(entered, nothing); take!(release))
+        return holder[].sender(url, address, headers, body, timeout)
+    end
+    f = event_fixture(request=gated)
+    holder[] = f
+    sep = (; capabilities=SEP_EVENT_CAPS, extra_headers=["Mcp-Name" => "comment.created"])
+    event_request(f.server, "events/subscribe", event_params(); sep...)
+    f.owners["alpha"] = false
+    emission = @async EventsMCP.emit_event!(f.server, "comment.created", event_data())
+    take!(entered)
+    f.owners["alpha"] = true
+    resubscribe = @async event_request(f.server, "events/subscribe", event_params(); sep...)
+    for _ in 1:10
+        yield()
+    end
+    @test !istaskdone(resubscribe)
+    put!(release, nothing)
+    @test timedwait(() -> istaskdone(emission) && istaskdone(resubscribe), 10) == :ok
+    @test haskey(fetch(resubscribe)[2], "result")
+    @test [c.parsed["type"] for c in f.calls] == ["verification", "terminated", "verification"]
+    @test length(event_records(f)) == 1
+end
+
+@testset "A draft refresh keeps a SEP-3415 subscription on SEP-3415" begin
+    f = event_fixture()
+    event_request(f.server, "events/subscribe", event_params(); capabilities=SEP_EVENT_CAPS,
+        extra_headers=["Mcp-Name" => "comment.created"])
+    event_request(f.server, "events/subscribe", event_params())
+    @test !only(event_records(f)).legacy_draft
+    EventsMCP.emit_event!(f.server, "comment.created", event_data(); event_id="evt-1")
+    @test Dict(only(event_deliveries(f)).headers)["webhook-id"] != "evt-1"
+end
+
+@testset "Access restored before an owner's turn keeps the subscription" begin
+    allowed = Dict(1 => true, 2 => true)
+    holder = Ref{Any}()
+    f = event_fixture(
+        authorize=(_owner, _name, args) -> args === nothing || allowed[args["metadata"]["index"]],
+        wait=_delay -> foreach(i -> allowed[i] = true, keys(allowed)),
+    )
+    holder[] = f
+    filters(i) = Dict("resource" => "shared", "metadata" => Dict("index" => i))
+    ids = [last(event_request(f.server, "events/subscribe", event_params(arguments=filters(i)); capabilities=SEP_EVENT_CAPS,
+        extra_headers=["Mcp-Name" => "comment.created"]))["result"]["id"] for i in 1:2]
+    # The owner's first subscription retries; access to the second returns during that wait.
+    early, late = sortperm(ids)
+    allowed[late] = false
+    push!(f.statuses, 500)
+    receipt = only(EventsMCP.emit_event!(f.server, "comment.created", event_data()))
+    @test (receipt.subscription_id, receipt.accepted, receipt.attempts) == (ids[early], true, 2)
+    @test length(event_records(f)) == 2
+    @test !any(c -> get(c.parsed, "type", nothing) == "terminated", f.calls)
+end
+
+@testset "Webhook identity, retries, refresh and restart across profiles" begin
+    mktempdir() do dir
+        path = joinpath(dir, "subscriptions.json")
+        f = event_fixture(store=EventsMCP.FileEventSubscriptionStore(path))
+        ids = String[]
+        named = ["Mcp-Name" => "comment.created"]
+        filters(i) = Dict("resource" => "shared", "metadata" => Dict("index" => i))
+        for i in 1:3
+            _, result = event_request(f.server, "events/subscribe", event_params(arguments=filters(i));
+                capabilities=i == 1 ? Dict() : SEP_EVENT_CAPS, extra_headers=named)
+            push!(ids, result["result"]["id"])
+        end
+        # Model the actual file format written before the bridge.
+        disk = JSON.parsefile(path)
+        old = only(filter(x -> x["id"] == ids[1], disk["subscriptions"]))
+        delete!(old, "legacyDraft")
+        write(path, JSON.json(disk))
+        f = event_fixture(store=EventsMCP.FileEventSubscriptionStore(path), retry_delay=1)
+        append!(f.statuses, [503, 202, 503, 202, 503, 202])
+        @test all(r -> r.accepted && r.attempts == 2, EventsMCP.emit_event!(f.server, "comment.created", event_data(); event_id="source-1"))
+        webhook_ids = String[]
+        for (i, id) in enumerate(ids)
+            pair = filter(c -> Dict(c.headers)["X-MCP-Subscription-Id"] == id, event_deliveries(f))
+            first_try, retry = pair
+            @test length(pair) == 2
+            @test first_try.body == retry.body
+            @test retry.parsed["eventId"] == "source-1"
+            h1, h2 = Dict(first_try.headers), Dict(retry.headers)
+            @test h1["webhook-id"] == h2["webhook-id"]
+            @test h1["webhook-signature"] != h2["webhook-signature"]
+            @test h1["webhook-timestamp"] != h2["webhook-timestamp"]
+            @test EventsMCP.verify_event_webhook(EVENT_SECRET, retry.headers, retry.body; now=f.now[])
+            push!(webhook_ids, h1["webhook-id"])
+        end
+        @test first(webhook_ids) == "source-1"
+        @test all(id -> occursin(r"^[A-Za-z0-9_-]+$", id), webhook_ids[2:3])
+        @test allunique(webhook_ids)
+
+        empty!(f.calls)
+        EventsMCP.emit_event!(f.server, "comment.created", event_data(); event_id="révision 1")
+        for c in event_deliveries(f)
+            h = Dict(c.headers)
+            if h["X-MCP-Subscription-Id"] == ids[1]
+                @test c.parsed["eventId"] == h["webhook-id"]
+                @test startswith(c.parsed["eventId"], "evt_")
+            else
+                @test c.parsed["eventId"] == "révision 1"
+                @test !(h["webhook-id"] in webhook_ids)
+            end
+        end
+        # An upgraded client refreshes the same identity without another challenge.
+        empty!(f.calls)
+        _, upgraded = event_request(f.server, "events/subscribe", event_params(arguments=filters(1));
+            capabilities=SEP_EVENT_CAPS, extra_headers=named)
+        @test upgraded["result"]["id"] == ids[1]
+        @test isempty(f.calls)
+        @test all(r -> !r.legacy_draft, event_records(f))
+        f.owners["alpha"] = false
+        @test isempty(EventsMCP.emit_event!(f.server, "comment.created", event_data()))
+        @test isempty(event_records(f))
+        @test length(f.calls) == 3
+        for c in f.calls
+            @test c.parsed == Dict("type" => "terminated", "error" => Dict("code" => -32024, "message" => "Forbidden"))
+            @test startswith(Dict(c.headers)["webhook-id"], "msg_terminated_")
+            @test EventsMCP.verify_event_webhook(EVENT_SECRET, c.headers, c.body; now=f.now[])
+        end
+    end
+end
 
 @testset "MCP Events discovery and opt-in" begin
     fixture = event_fixture()

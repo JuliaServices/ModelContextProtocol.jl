@@ -148,7 +148,8 @@ See the
 for capability checks, multi-round-trip results, custom headers, caching, and
 subscriptions.
 
-The experimental [MCP Events webhook profile](docs/src/events.md) adds
+The [MCP Events webhook profile](docs/src/events.md) supports SEP-3415 and
+the earlier ChatGPT-compatible draft on the same endpoint. Both profiles offer
 authenticated event discovery and subscriptions, signed HTTPS callbacks,
 restart-safe subscription storage, and namespaced client helpers. Events use
 MCP `2026-07-28`; polling, push streams, and replay are not advertised.

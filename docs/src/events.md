@@ -1,16 +1,34 @@
 # MCP Events
 
-The package implements the **webhook profile** of the
-[draft MCP Events proposal](https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md)
-on MCP `2026-07-28`, matching the delivery mode supported by
-[ChatGPT plugins](https://developers.openai.com/plugins/build/mcp-events).
-Enable it explicitly on the general server. The static JuliaC server does not
-support events. All event APIs stay under the package namespace.
+On MCP `2026-07-28`, the general server and client support webhooks from
+the [SEP-3415 Events extension](https://github.com/modelcontextprotocol/ext-events/blob/main/specification/beta/events/events.mdx)
+and the earlier draft used by [ChatGPT plugins](https://developers.openai.com/plugins/build/mcp-events).
+Enable Events on the general server with `ModelContextProtocol.enable_events!`.
 
 Clients discover definitions with `events/list`, create or refresh subscriptions
 with `events/subscribe`, and stop them with `events/unsubscribe`. These methods
-use the existing authenticated MCP endpoint. Enabling events adds `events: {}`
-to `server/discover`; each event advertises only `delivery: ["webhook"]`.
+use the existing authenticated MCP endpoint. Each event advertises `delivery: ["webhook"]`.
+
+| Wire behavior | SEP-3415 | Earlier draft |
+| --- | --- | --- |
+| Capability in `server/discover` | `capabilities.extensions["io.modelcontextprotocol/events"]` | `capabilities.events` |
+| HTTP subscribe, refresh, unsubscribe | `Mcp-Name` and any `Mcp-Param-*` headers declared by `x-mcp-header` | May omit those headers |
+| `webhook-id` for an occurrence | A fresh message ID per subscription delivery, stable across retries | The body’s `eventId` |
+| Access revoked | A signed `terminated` envelope | Delivery stops silently |
+
+By default the server advertises both capabilities. A client selects SEP-3415
+by including `{"extensions":{"io.modelcontextprotocol/events":{}}}` in
+`params._meta["io.modelcontextprotocol/clientCapabilities"]` on its event
+requests. An undeclared client receives the draft profile, even if it supplies
+`Mcp-Name`. A supplied routing header must match its body value in either profile.
+The Julia client discovers the server automatically and prefers SEP-3415.
+
+The extension makes the client declaration optional. For deployments where
+every client should receive SEP-3415 even when it omits that declaration,
+set `legacy_compat=false` on `enable_events!`. That server advertises only
+the extension. The server saves the webhook profile on each subscription.
+Pre-upgrade records load as draft. A SEP-3415 refresh upgrades the same
+subscription ID in place; a later draft refresh does not downgrade it.
 
 ## Configure a server
 
@@ -72,7 +90,7 @@ MCP.register_event!(server;
         arguments["document_id"] == data["document_id"],
 )
 
-@assert haskey(server.capabilities, "events")
+@assert haskey(server.capabilities["extensions"], "io.modelcontextprotocol/events")
 println("Webhook event registered")
 ```
 
@@ -123,6 +141,8 @@ One process owns each file. Replicas need an application-backed
 Distributed backends must enforce quotas and coordinate subscription changes
 and delivery across workers. Built-in locks coordinate one process. Records are
 plain data; callers must not mutate stored records or their filters.
+Custom stores should persist and restore the record's `legacy_draft` flag.
+Use `true` for rows created before SEP-3415 support.
 `InMemoryEventSubscriptionStore` suits tests and temporary subscriptions;
 use durable storage for ChatGPT.
 
@@ -136,8 +156,11 @@ The default lifetime is 30 minutes, capped at one day. Omitted `ttlMs` uses the
 default. A finite request is clamped to the configured cap. `ttlMs: null`
 requests no expiry; this implementation grants the cap instead.
 Refresh before the returned `refreshBefore`. Expired subscriptions stop
-delivering. Unsubscribe is idempotent and remains possible after resource access
-is revoked.
+delivering. A caller can unsubscribe after its resource access is revoked.
+`events/list` may then hide the event, so unsubscribe checks any `Mcp-Param-*`
+headers the caller sends for its own subscription but does not require them.
+For an already absent subscription SEP-3415 returns `NotFound` with
+`data.kind == "subscription"`. Draft clients receive an empty success result.
 
 Events are emit-only: `cursor` is always `null` and `truncated` is `false`.
 A non-null replay cursor is explicitly unsupported, and `maxAgeMs` is ignored
@@ -188,6 +211,9 @@ rm(directory; recursive=true) # hide
 Occurrences contain `eventId`, `name`, an ISO 8601 UTC `timestamp`, `data`,
 and `cursor: null`. Application fields belong inside `data`. Pass `timestamp`
 as Unix seconds to preserve the upstream occurrence time; it defaults to now.
+SEP-3415 preserves the upstream ID in the body, including Unicode. For draft
+receivers, IDs of 1–256 visible ASCII bytes pass through unchanged. Other IDs
+become a deterministic `evt_` hash in both the draft body and header.
 
 Every body is built and validated before any is sent, so a failing `matches`,
 `transform`, or payload sends nothing. Each owner's subscriptions are delivered
@@ -200,7 +226,7 @@ The default is four attempts with exponential backoff. `410` and `413` are not
 retried. Access, expiry, and subscription existence are checked before every
 attempt. Unsubscribe drains an in-flight request; later retries stop.
 
-Each body is at most 256 KiB. Retries preserve the event ID and exact body,
+Each body is at most 256 KiB. Retries keep the `webhook-id` and exact body,
 but generate their signing timestamp and HMAC anew. A refresh with a replacement
 `whsec_` secret dual-signs with the immediately previous key for a five-minute
 grace period by default. Treat upstream text as untrusted data and keep
@@ -225,33 +251,41 @@ ModelContextProtocol.unsubscribe_event(client, "comment.created";
 )
 ```
 
-The receiver must know the secret before subscribing. Select it with
-`X-MCP-Subscription-Id` and call
+The receiver must know the secret before subscribing. For the initial challenge,
+use the pending secret for the callback URL. For subsequent deliveries select
+the secret with `X-MCP-Subscription-Id` and call
 `verify_event_webhook(secret, headers, raw_body)` before parsing JSON.
 Verification checks exact bytes, required header uniqueness, body size,
 timestamp freshness, and any matching `v1` signature during rotation.
 The subscription ID is routing metadata, not part of the Standard Webhooks
 signature; use separate secrets for different routes.
 
-Echo the challenge for verified `type: "verification"` requests.
-For events, validate the name and payload schema, deduplicate `webhook-id`,
-and durably accept or enqueue the event before acknowledging it.
+Echo the challenge for verified `type: "verification"` requests. A signed
+`type: "terminated"` tells a SEP-3415 receiver to remove its subscription.
+For events, validate the name and payload schema and deduplicate retries by
+subscription ID and `webhook-id`. To recognize a repeated upstream occurrence,
+deduplicate by subscription ID and the body's `eventId`. The same upstream
+event can legitimately match multiple subscriptions. Durably accept or enqueue
+the event before acknowledging it.
 
 ## Limits and errors
 
-Polling, push streams, replay, dynamic catalogs, no-expiry grants, asymmetric
-signing, JSON Schema 2020-12 validation, and draft `gap`/`terminated` envelopes are not implemented or
-advertised. Access revocation stops delivery and removes the subscription.
+This profile provides emit-only webhooks with finite lifetimes. It offers no
+polling, push streams, replay, dynamic catalogs, no-expiry grants, asymmetric
+signing, full JSON Schema 2020-12 validation, or replay-gap notifications.
+On access revocation the server removes the subscription and makes one
+best-effort signed termination POST for SEP-3415 receivers.
 Existing MCP transport notifications and `subscriptions/listen` are separate.
 
-| Code | Meaning |
-| --- | --- |
-| `-32602` | Invalid arguments, URL, secret, TTL, or destination address. |
-| `-32011` | Unknown event, with `data.kind: "event"`. |
-| `-32012` | Missing authenticated owner or denied access. |
-| `-32013` | Subscription quota or callback verification cooldown. |
-| `-32014` | Unsupported delivery mode or replay cursor. |
-| `-32015` | Callback failure, with a safe `data.reason`. |
+| SEP-3415 | Draft | Meaning |
+| --- | --- | --- |
+| `-32602` | `-32602` | Invalid arguments, URL, secret, TTL, or destination address. |
+| `-32020` | `-32020` | Routing header mismatch (HTTP 400). |
+| `-32023` | `-32011` | Unknown event. SEP-3415 also uses this code for an absent subscription. |
+| `-32024` | `-32012` | Missing authenticated owner or denied access. |
+| `-32025` | `-32013` | Subscription quota or callback verification cooldown. |
+| `-32026` | `-32014` | Unsupported delivery mode or replay cursor. |
+| `-32027` | `-32015` | Callback failure, with a safe `data.reason`. |
 
 Endpoint bodies and transport diagnostics are never returned in callback
 errors. Event methods sent as JSON-RPC notifications are rejected with HTTP

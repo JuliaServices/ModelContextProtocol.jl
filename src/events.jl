@@ -1,6 +1,32 @@
 const MCP_EVENT_BODY_LIMIT = 256 * 1024
 const MCP_EVENT_ARGUMENT_LIMIT = 16 * 1024
 const MCP_EVENT_METHODS = ("events/list", "events/subscribe", "events/unsubscribe")
+const MCP_NAMED_EVENT_METHODS = ("events/subscribe", "events/unsubscribe")
+const MCP_EVENTS_EXTENSION_ID = "io.modelcontextprotocol/events"
+
+function declares_event_extension(capabilities)
+    capabilities isa AbstractDict || return false
+    extensions = get(capabilities, "extensions", nothing)
+    return extensions isa AbstractDict && get(extensions, MCP_EVENTS_EXTENSION_ID, nothing) isa AbstractDict
+end
+
+function request_declares_event_extension(params)
+    meta = get(params, "_meta", nothing)
+    capabilities = meta isa AbstractDict ? get(meta, META_CLIENT_CAPABILITIES, nothing) : nothing
+    return declares_event_extension(capabilities)
+end
+
+uses_event_draft(server::MCPServer, params) =
+    server.events !== nothing && server.events.legacy_compat && !request_declares_event_extension(params)
+
+# Keep the accepted error codes internally. Translate only at the draft wire boundary.
+const DRAFT_EVENT_ERROR_CODES = Dict(
+    -32023 => -32011, # NotFound
+    -32024 => -32012, # Forbidden
+    -32025 => -32013, # ResourceExhausted
+    -32026 => -32014, # Unsupported
+    -32027 => -32015, # CallbackEndpointError
+)
 
 function redact_event_request_body(body::String)
     isempty(body) && return body
@@ -76,6 +102,7 @@ function subscription_record(subscription::MCPWebhookSubscription)
         "previousSecret" => subscription.previous_secret,
         "previousSecretUntil" => subscription.previous_secret_until,
         "instance" => subscription.instance, "revision" => subscription.revision,
+        "legacyDraft" => subscription.legacy_draft,
     )
 end
 
@@ -221,10 +248,13 @@ function FileEventSubscriptionStore(path::AbstractString)
             previous_until isa Real && !(previous_until isa Bool) && isfinite(previous_until) || error("Invalid rotation expiry")
             previous_secret = get(record, "previousSecret", nothing)
             previous_secret === nothing || event_webhook_key(previous_secret)
+            legacy_draft = get(record, "legacyDraft", true)
+            legacy_draft isa Bool || error("Invalid event dialect")
             store.state.records[id] = MCPWebhookSubscription(
                 id, principal, name, arguments, url, secret, Float64(expires_at),
                 previous_secret, Float64(previous_until),
                 event_string(record["instance"], "instance"), event_string(record["revision"], "revision"),
+                legacy_draft,
             )
         end
     catch
@@ -236,7 +266,9 @@ end
 """
     enable_events!(server; store, principal, authorize, ...)
 
-Enable the draft MCP Events webhook profile on MCP 2026-07-28 requests.
+Enable SEP-3415 webhook delivery on MCP 2026-07-28 requests. By default,
+clients that omit the Events extension declaration use the earlier draft.
+Set `legacy_compat=false` to serve SEP-3415 to every client.
 principal(context) must return a stable authenticated subject or nothing.
 authorize(principal, name, arguments) must return true to allow access; arguments
 is nothing for catalog discovery. It is called again before each delivery.
@@ -256,7 +288,7 @@ function enable_events!(server::MCPServer;
     max_subscriptions::Integer=1000, max_subscriptions_per_principal::Integer=100,
     verification_cooldown::Real=5, rotation_grace::Real=300, timeout::Real=10,
     max_attempts::Integer=4, retry_delay::Real=0.25,
-    allow_private_addresses::Bool=false,
+    allow_private_addresses::Bool=false, legacy_compat::Bool=true,
 )
     server.events === nothing || throw(ArgumentError("Events are already enabled"))
     1 <= default_ttl_ms <= max_ttl_ms <= MCP_SAFE_INTEGER_MAX || throw(ArgumentError("Invalid event TTL limits"))
@@ -266,14 +298,21 @@ function enable_events!(server::MCPServer;
         throw(ArgumentError("Verification cooldown and request timeout must be positive and finite"))
     all(x -> isfinite(x) && x >= 0, (rotation_grace, retry_delay)) ||
         throw(ArgumentError("Rotation grace and retry delay must be non-negative and finite"))
+    extensions = to_string_dict(get(server.capabilities, "extensions", nothing))
+    extensions[MCP_EVENTS_EXTENSION_ID] = JSONDict()
     server.events = MCPEvents(
         store, principal, authorize, Dict{String,MCPServerEvent}(), request, resolve, clock, wait,
         Int(default_ttl_ms), Int(max_ttl_ms), Int(max_subscriptions), Int(max_subscriptions_per_principal),
         Float64(verification_cooldown), Float64(rotation_grace), Float64(timeout),
-        Int(max_attempts), Float64(retry_delay), allow_private_addresses,
+        Int(max_attempts), Float64(retry_delay), allow_private_addresses, legacy_compat,
         Set{String}(), Dict{Tuple{String,String},Float64}(), Dict{Tuple{String,String},Int}(), Threads.Condition(),
     )
-    ensure_capability!(server, "events")
+    server.capabilities["extensions"] = extensions
+    if legacy_compat
+        ensure_capability!(server, "events")
+    else
+        pop!(server.capabilities, "events", nothing)
+    end
     return server
 end
 
@@ -329,7 +368,7 @@ function portable_event_schema(schema)
             key == "multipleOf" && value <= 0 && return false
         elseif key == "uniqueItems"
             value isa Bool || return false
-        elseif key in ("pattern", "title", "description", "\$comment")
+        elseif key in ("pattern", "title", "description", "\$comment", MCP_HEADER_ANNOTATION)
             value isa AbstractString || return false
         elseif key in ("readOnly", "writeOnly")
             value isa Bool || return false
@@ -375,6 +414,7 @@ function register_event!(server::MCPServer; name, input_schema, payload_schema,
     events = require_events(server)
     event_name = event_string(name, "name"; max_bytes=256)
     input = event_object(input_schema, "input_schema")
+    mcp_header_specs(input)
     payload = event_object(payload_schema, "payload_schema")
     input_validator = event_schema_validator!(input)
     payload_validator = event_schema_validator!(payload)
@@ -403,7 +443,7 @@ end
 function event_principal(events::MCPEvents, context::MCPRequestContext)
     principal = Base.invokelatest(events.principal, context)
     principal isa AbstractString && 0 < ncodeunits(principal) <= 4096 && isvalid(principal) ||
-        throw(event_error(-32012, "Forbidden"))
+        throw(event_error(-32024, "Forbidden"))
     return String(principal)
 end
 
@@ -498,9 +538,11 @@ end
 """Generate a Standard Webhooks signing secret from 32 cryptographically random bytes."""
 event_webhook_secret() = "whsec_" * base64encode(rand(RandomDevice(), UInt8, 32))
 
+is_event_header_id(id) = id isa AbstractString && 0 < ncodeunits(id) <= 256 &&
+    all(b -> 0x21 <= b <= 0x7e, codeunits(id))
+
 function event_header_id(id)
-    id isa AbstractString && 0 < ncodeunits(id) <= 256 &&
-        all(b -> 0x21 <= b <= 0x7e, codeunits(id)) ||
+    is_event_header_id(id) ||
         throw(ArgumentError("Webhook IDs must contain 1-256 visible ASCII bytes"))
     return String(id)
 end
@@ -569,7 +611,7 @@ function verify_event_webhook(secret, headers, body; now=time(), tolerance=300)
 end
 
 function callback_failure(reason)
-    return event_error(-32015, "CallbackEndpointError"; reason=reason)
+    return event_error(-32027, "CallbackEndpointError"; reason=reason)
 end
 
 function request_event_webhook(url, address::IPAddr, headers, body, timeout)
@@ -669,9 +711,9 @@ end
 function check_event_quota(events::MCPEvents, records, principal, id)
     any(record -> record.id == id, records) && return nothing
     length(records) < events.max_subscriptions ||
-        throw(event_error(-32013, "ResourceExhausted"; limit="subscriptions", max=events.max_subscriptions))
+        throw(event_error(-32025, "ResourceExhausted"; limit="subscriptions", max=events.max_subscriptions))
     count(record -> record.principal == principal, records) < events.max_subscriptions_per_principal ||
-        throw(event_error(-32013, "ResourceExhausted"; limit="subscriptionsPerPrincipal", max=events.max_subscriptions_per_principal))
+        throw(event_error(-32025, "ResourceExhausted"; limit="subscriptionsPerPrincipal", max=events.max_subscriptions_per_principal))
     return nothing
 end
 
@@ -683,12 +725,18 @@ function event_subscription_params(events::MCPEvents, context, params; subscribi
     delivery = event_object(get(params, "delivery", nothing), "delivery")
     mode = get(delivery, "mode", subscribing ? nothing : "webhook")
     mode isa AbstractString || throw(mcp_error(:invalid_params, "delivery.mode must be a string"))
-    mode == "webhook" || throw(event_error(-32014, "Unsupported"; feature="deliveryMode", value=mode))
+    mode == "webhook" || throw(event_error(-32026, "Unsupported"; feature="deliveryMode", value=mode))
     uri = callback_uri(event_string(get(delivery, "url", nothing), "delivery.url"))
     return principal, name, arguments, delivery, uri
 end
 
 event_iso8601(timestamp) = Dates.format(Dates.unix2datetime(timestamp), dateformat"yyyy-mm-ddTHH:MM:SS.sss") * "Z"
+
+function check_event_argument_headers(context, definition, arguments; allow_missing)
+    mismatch = argument_header_mismatch(context.http_request.headers, definition.input_schema, arguments; allow_missing)
+    mismatch === nothing || throw(event_error(-32020, mismatch))
+    return nothing
+end
 
 # Omitted ttlMs gets the default. null asks for no expiry, which is never
 # granted, so it gets the longest finite lifetime. The draft has no rejection
@@ -704,15 +752,17 @@ end
 function subscribe_event(server::MCPServer, context::MCPRequestContext, params::JSONDict)
     events = require_events(server)
     principal, name, arguments, delivery, uri = event_subscription_params(events, context, params; subscribing=true)
+    legacy_draft = uses_event_draft(server, params)
     definition = @lock events.lock get(events.definitions, name, nothing)
-    definition === nothing && throw(event_error(-32011, "NotFound"; kind="event"))
-    event_authorized(events, principal, name, nothing) || throw(event_error(-32012, "Forbidden"))
+    definition === nothing && throw(event_error(-32023, "NotFound"; kind="event"))
+    event_authorized(events, principal, name, nothing) || throw(event_error(-32024, "Forbidden"))
+    check_event_argument_headers(context, definition, arguments; allow_missing=legacy_draft)
     JSONSchema.isvalid(definition.input_validator, arguments) || throw(mcp_error(:invalid_params, "Arguments do not match the event inputSchema"))
-    event_authorized(events, principal, name, arguments) || throw(event_error(-32012, "Forbidden"))
+    event_authorized(events, principal, name, arguments) || throw(event_error(-32024, "Forbidden"))
     secret = get(delivery, "secret", nothing)
     event_webhook_key(secret)
     # Emit-only events cannot replay, so maxAgeMs, which only bounds replay, is ignored.
-    get(params, "cursor", nothing) === nothing || throw(event_error(-32014, "Unsupported"; feature="cursor"))
+    get(params, "cursor", nothing) === nothing || throw(event_error(-32026, "Unsupported"; feature="cursor"))
     ttl_ms = event_ttl_ms(events, params)
     id = event_subscription_id(principal, uri.url, name, arguments)
     # Verification is limited per principal, so one caller cannot block others
@@ -729,14 +779,17 @@ function subscribe_event(server::MCPServer, context::MCPRequestContext, params::
             records = live_event_subscriptions!(events)
             check_event_quota(events, records, principal, id)
             consented = any(record -> record.principal == principal && record.url == uri.url, records)
-            (consented || !(principal in events.verifying)) && break
+            # A termination for this key must land before the receiver hears
+            # of a new subscription with the same ID.
+            terminating = haskey(events.sending, (id, EVENT_TERMINATION))
+            !terminating && (consented || !(principal in events.verifying)) && break
             wait(events.lock)
         end
         if !consented
             now = events.clock()
             filter!(entry -> last(entry) > now, events.cooldowns)
             haskey(events.cooldowns, cooldown) &&
-                throw(event_error(-32013, "ResourceExhausted"; limit="callbackVerification"))
+                throw(event_error(-32025, "ResourceExhausted"; limit="callbackVerification"))
             push!(events.verifying, principal)
         end
         !consented
@@ -749,7 +802,7 @@ function subscribe_event(server::MCPServer, context::MCPRequestContext, params::
         end
         # Access can change while this request waits for a turn, the store,
         # or the endpoint, so check it again just before saving.
-        event_authorized(events, principal, name, arguments) || throw(event_error(-32012, "Forbidden"))
+        event_authorized(events, principal, name, arguments) || throw(event_error(-32024, "Forbidden"))
         return @lock events.lock begin
             records = live_event_subscriptions!(events)
             check_event_quota(events, records, principal, id)
@@ -762,6 +815,8 @@ function subscribe_event(server::MCPServer, context::MCPRequestContext, params::
                 previous === nothing ? nothing : rotated ? previous.secret : previous.previous_secret,
                 previous === nothing ? 0.0 : rotated ? now + events.rotation_grace : previous.previous_secret_until,
                 previous === nothing ? string(uuid4()) : previous.instance, string(uuid4()),
+                # A draft refresh never downgrades a receiver already on SEP-3415.
+                legacy_draft && (previous === nothing || previous.legacy_draft),
             ))
             JSONDict("id" => id, "refreshBefore" => event_iso8601(expires_at), "cursor" => nothing, "truncated" => false)
         end
@@ -783,6 +838,15 @@ function unsubscribe_event(server::MCPServer, context::MCPRequestContext, params
     # possible after resource access is revoked or an event is removed.
     id = event_subscription_id(principal, uri.url, name, arguments)
     @lock events.lock begin
+        previous = get_event_subscription(events.store, id)
+        existed = previous !== nothing && previous.expires_at > events.clock()
+        # Check routing headers only for the caller's own subscription, so they
+        # reveal nothing about events hidden from it. After revocation,
+        # events/list hides the x-mcp-header annotations too, so a missing
+        # header is allowed; a mismatched one is not.
+        definition = get(events.definitions, name, nothing)
+        existed && definition !== nothing &&
+            check_event_argument_headers(context, definition, arguments; allow_missing=true)
         delete_event_subscription!(events.store, id)
         # No new attempt can start now; wait for the ones already sending. A
         # subscription created again with the same key sends separately.
@@ -790,6 +854,7 @@ function unsubscribe_event(server::MCPServer, context::MCPRequestContext, params
         while any(key -> haskey(events.sending, key), running)
             wait(events.lock)
         end
+        existed || uses_event_draft(server, params) || throw(event_error(-32023, "NotFound"; kind="subscription"))
     end
     return JSONDict()
 end
@@ -800,18 +865,62 @@ function dispatch_events(server, context, params)
         unsubscribe_event(server, context, params)
 end
 
-# The access check ran without the lock. Delete only if the record was not
-# saved again since, so a refresh made after access was restored survives.
-function remove_revoked_subscription!(events::MCPEvents, checked::MCPWebhookSubscription)
+# Count a POST in flight. Call with events.lock held.
+function start_sending!(events::MCPEvents, key)
+    events.sending[key] = get(events.sending, key, 0) + 1
+    return nothing
+end
+
+function finish_sending!(events::MCPEvents, key)
     @lock events.lock begin
-        current = get_event_subscription(events.store, checked.id)
-        current !== nothing && current.revision == checked.revision &&
-            delete_event_subscription!(events.store, checked.id)
+        remaining = events.sending[key] - 1
+        remaining == 0 ? delete!(events.sending, key) : (events.sending[key] = remaining)
+        notify(events.lock)
     end
     return nothing
 end
 
-function deliver_event!(events, subscription, body, event_id)
+# A termination counts under (id, EVENT_TERMINATION), not an instance, so a
+# re-subscribe of the same key can wait for it alone.
+const EVENT_TERMINATION = "terminated"
+
+function post_subscription_message(events, current, body, webhook_id)
+    now = events.clock()
+    secrets = current.previous_secret !== nothing && current.previous_secret_until > now ?
+        (current.secret, current.previous_secret) : (current.secret,)
+    headers = event_webhook_headers(webhook_id, current.id, body, secrets; signed_at=now)
+    return post_event_webhook(events, current.url, headers, body; deadline=min(current.expires_at, now + events.timeout))
+end
+
+# The access check ran without the lock. Delete only if the record was not
+# saved again since, so a refresh made after access was restored survives.
+# A SEP-3415 receiver then gets one best-effort termination. It is counted
+# under the same lock as the delete, so no re-subscribe starts before it lands.
+function revoke_event_subscription!(events::MCPEvents, checked::MCPWebhookSubscription)
+    key = (checked.id, EVENT_TERMINATION)
+    @lock events.lock begin
+        current = get_event_subscription(events.store, checked.id)
+        (current === nothing || current.revision != checked.revision) && return nothing
+        delete_event_subscription!(events.store, checked.id)
+        checked.legacy_draft && return nothing
+        start_sending!(events, key)
+    end
+    body = JSON.json((type="terminated", error=(code=-32024, message="Forbidden")))
+    try
+        post_subscription_message(events, checked, body, "msg_terminated_" * string(uuid4()))
+    catch err
+        # The record is already gone, so a failed POST changes nothing.
+        err isa MCPEventError || err isa MCPError || rethrow()
+    finally
+        finish_sending!(events, key)
+    end
+    return nothing
+end
+
+function deliver_event!(events, subscription, body, draft_id)
+    # Allocate once for this message, outside the retry loop. A refresh can
+    # rotate keys while a message is in flight, but its ID and body stay paired.
+    webhook_id = subscription.legacy_draft ? draft_id : "msg_" * string(uuid4())
     status = nothing
     reason = nothing
     attempts = 0
@@ -828,30 +937,27 @@ function deliver_event!(events, subscription, body, event_id)
                 reason = "expired"
                 record = nothing
             else
-                key = (record.id, record.instance)
-                events.sending[key] = get(events.sending, key, 0) + 1
+                start_sending!(events, (record.id, record.instance))
             end
             record
         end
         current === nothing && break
         stop = false
         try
-            if event_authorized(events, current.principal, current.name, current.arguments)
-                now = events.clock()
-                secrets = current.previous_secret !== nothing && current.previous_secret_until > now ?
-                    (current.secret, current.previous_secret) : (current.secret,)
-                headers = event_webhook_headers(event_id, current.id, body, secrets; signed_at=now)
+            if !event_authorized(events, current.principal, current.name, current.arguments)
+                reason = "forbidden"
+                stop = true
+                revoke_event_subscription!(events, current)
+            elseif body === nothing
+                stop = true # Access came back before this owner's turn.
+            else
                 attempts += 1
-                response = post_event_webhook(events, current.url, headers, body; deadline=min(current.expires_at, now + events.timeout))
+                response = post_subscription_message(events, current, body, webhook_id)
                 status = Int(response.status)
                 status in 200:299 &&
                     return (subscription_id=subscription.id, accepted=true, attempts=attempts, status=status, reason=nothing)
                 reason = status >= 500 ? "http_5xx" : "http_4xx"
                 stop = status in (410, 413)
-            else
-                remove_revoked_subscription!(events, current)
-                reason = "forbidden"
-                stop = true
             end
         catch err
             err isa MCPEventError || err isa MCPError || rethrow()
@@ -859,16 +965,12 @@ function deliver_event!(events, subscription, body, event_id)
             # A destination that resolves to a non-public address is not retried.
             stop = err isa MCPError
         finally
-            @lock events.lock begin
-                key = (current.id, current.instance)
-                remaining = events.sending[key] - 1
-                remaining == 0 ? delete!(events.sending, key) : (events.sending[key] = remaining)
-                notify(events.lock)
-            end
+            finish_sending!(events, (current.id, current.instance))
         end
         (stop || attempt == events.max_attempts) && break
         events.wait(min(events.retry_delay * 2.0^(attempt - 1), 30.0))
     end
+    body === nothing && return nothing # No occurrence was prepared for a possibly revoked subscription.
     return (subscription_id=subscription.id, accepted=false, attempts=attempts, status=status, reason=reason)
 end
 
@@ -878,7 +980,12 @@ end
 Validate and synchronously deliver an emit-only occurrence to matching webhook
 subscriptions. Filtering and transformation receive the subscription owner,
 not the emitting task's identity. Recheck access and expiry before every bounded
-retry. One event ID and exact body are preserved; each attempt is signed anew.
+retry. Each subscription's message keeps its webhook-id and exact body across
+retries; each attempt is signed anew. SEP-3415 bodies carry event_id unchanged
+under a random webhook-id. Draft bodies use event_id as the webhook-id when it
+is 1-256 visible ASCII bytes, and a deterministic `evt_` hash of it otherwise.
+A subscription whose access is still revoked when its owner's turn comes is
+removed; SEP-3415 receivers also get one signed `terminated` envelope.
 
 Return delivery receipts (subscription_id, accepted, attempts, status, reason).
 The caller owns queuing and recovery of failed or interrupted emissions.
@@ -890,7 +997,11 @@ owner. The call returns after every delivery finishes.
 function emit_event!(server::MCPServer, name::AbstractString, data; event_id=string(uuid4()), timestamp=time())
     events = require_events(server)
     event_name = event_string(name, "name"; max_bytes=256)
-    id = event_header_id(event_id)
+    event_id isa AbstractString && isvalid(event_id) && !isempty(event_id) ||
+        throw(ArgumentError("event_id must be a non-empty UTF-8 string"))
+    # Old receivers require the body ID to double as an HTTP header. Preserve
+    # existing IDs wherever possible, and deterministically encode other IDs.
+    draft_id = is_event_header_id(event_id) ? String(event_id) : "evt_" * bytes2hex(sha256(event_id))
     timestamp isa Real && !(timestamp isa Bool) && isfinite(timestamp) || throw(ArgumentError("timestamp must be finite Unix seconds"))
     occurred_at = event_iso8601(timestamp)
     definition = @lock events.lock get(events.definitions, event_name, nothing)
@@ -899,21 +1010,22 @@ function emit_event!(server::MCPServer, name::AbstractString, data; event_id=str
     JSONSchema.isvalid(definition.payload_validator, payload) || throw(ArgumentError("Data does not match the event payloadSchema"))
     subscriptions = filter(subscription -> subscription.name == event_name, event_subscriptions(events.store))
     sort!(subscriptions; by=subscription -> subscription.id)
-    batches = Dict{String,Vector{Tuple{MCPWebhookSubscription,String}}}()
+    batches = Dict{String,Vector{Tuple{MCPWebhookSubscription,Union{String,Nothing}}}}()
     for subscription in subscriptions
         if !event_authorized(events, subscription.principal, event_name, subscription.arguments)
-            remove_revoked_subscription!(events, subscription)
+            # Its turn in the owner's queue rechecks access, then removes it.
+            push!(get!(valtype(batches), batches, subscription.principal), (subscription, nothing))
             continue
         end
         Base.invokelatest(definition.matches, subscription.principal, deepcopy(subscription.arguments), deepcopy(payload)) === true || continue
         transformed = event_object(Base.invokelatest(definition.transform, subscription.principal, deepcopy(subscription.arguments), deepcopy(payload)), "transformed data")
         JSONSchema.isvalid(definition.payload_validator, transformed) || throw(ArgumentError("Transformed data does not match the event payloadSchema"))
         body = JSON.json(JSONDict(
-            "eventId" => id, "name" => event_name, "timestamp" => occurred_at,
+            "eventId" => subscription.legacy_draft ? draft_id : event_id, "name" => event_name, "timestamp" => occurred_at,
             "data" => transformed, "cursor" => nothing,
         ))
         ncodeunits(body) <= MCP_EVENT_BODY_LIMIT || throw(ArgumentError("Event body exceeds 256 KiB"))
-        push!(get!(() -> Tuple{MCPWebhookSubscription,String}[], batches, subscription.principal), (subscription, body))
+        push!(get!(valtype(batches), batches, subscription.principal), (subscription, body))
     end
     owners = collect(values(batches))
     receipts = Vector{Vector{NamedTuple}}(undef, length(owners))
@@ -924,16 +1036,59 @@ function emit_event!(server::MCPServer, name::AbstractString, data; event_id=str
     # deployment needs more parallel callbacks per emission.
     @sync for _ in 1:min(16, length(owners))
         @async for index in queue
-            receipts[index] = NamedTuple[deliver_event!(events, subscription, body, id) for (subscription, body) in owners[index]]
+            delivered = NamedTuple[]
+            for (subscription, body) in owners[index]
+                receipt = deliver_event!(events, subscription, body, draft_id)
+                receipt === nothing || push!(delivered, receipt)
+            end
+            receipts[index] = delivered
         end
     end
     return sort!(reduce(vcat, receipts; init=NamedTuple[]); by=receipt -> receipt.subscription_id)
 end
 
-"""List discoverable event definitions over a client's MCP 2026-07-28 endpoint."""
-function list_events(client::MCPClient; cursor=nothing, limit=nothing, headers=nothing, timeout_ms=nothing)
+function event_request_capabilities(client::MCPClient, headers, timeout_ms)
     client_is_modern(client) || throw(ArgumentError("MCP Events requires protocol 2026-07-28"))
-    return list_entities(client, "events/list"; cursor=cursor, limit=limit, headers=headers, timeout_ms=timeout_ms)
+    info = client.session
+    info === nothing && (info = discover_server_info!(client; headers, timeout_ms))
+    capabilities = info isa AbstractDict ? get(info, "capabilities", nothing) : nothing
+    final = declares_event_extension(capabilities)
+    if !final && !(capabilities isa AbstractDict && get(capabilities, "events", nothing) isa AbstractDict)
+        throw(mcp_error(:method_not_found, "The server did not advertise MCP Events"))
+    end
+    # Negotiate for this request without modifying the caller's other capabilities.
+    declared = copy(client.capabilities)
+    if final || declares_event_extension(declared)
+        extensions = to_string_dict(get(declared, "extensions", nothing))
+        if final
+            extensions[MCP_EVENTS_EXTENSION_ID] = JSONDict()
+        else
+            delete!(extensions, MCP_EVENTS_EXTENSION_ID)
+        end
+        declared["extensions"] = extensions
+    end
+    return declared
+end
+
+"""List event definitions using the webhook profile advertised by the server."""
+function list_events(client::MCPClient; cursor=nothing, limit=nothing, headers=nothing, timeout_ms=nothing)
+    capabilities = event_request_capabilities(client, headers, timeout_ms)
+    meta = JSONDict(META_CLIENT_CAPABILITIES => capabilities)
+    result = list_entities(client, "events/list"; cursor, limit, headers, timeout_ms, meta)
+    (client.transport.kind == :http && declares_event_extension(capabilities)) || return result
+    return cache_input_schemas!(client.event_schemas, result, "events")
+end
+
+function call_event_subscription(client, method, params, headers, timeout_ms)
+    capabilities = event_request_capabilities(client, headers, timeout_ms)
+    params["_meta"] = JSONDict(META_CLIENT_CAPABILITIES => capabilities)
+    if client.transport.kind == :http && declares_event_extension(capabilities)
+        schema = lookup_input_schema(client.event_schemas, params["name"]) do cursor
+            list_events(client; cursor, headers, timeout_ms)
+        end
+        headers = append!(normalize_headers(headers), argument_headers(schema, params["arguments"]))
+    end
+    return jsonrpc_call(client, method; params, headers, timeout_ms)
 end
 
 """
@@ -957,15 +1112,19 @@ function subscribe_event(client::MCPClient, name::AbstractString;
     )
     ttl_ms === missing || (params["ttlMs"] = ttl_ms)
     max_age_ms === nothing || (params["maxAgeMs"] = max_age_ms)
-    return jsonrpc_call(client, "events/subscribe"; params=params, headers=headers, timeout_ms=timeout_ms)
+    return call_event_subscription(client, "events/subscribe", params, headers, timeout_ms)
 end
 
-"""Idempotently stop a webhook subscription addressed by its original filters and URL."""
+"""
+Stop a webhook subscription addressed by its original filters and URL. Against
+a SEP-3415 server, this throws an `MCPError` (JSON-RPC `NotFound`) when the
+subscription is already absent or expired; a draft server returns an empty result.
+"""
 function unsubscribe_event(client::MCPClient, name::AbstractString; url::AbstractString, arguments=JSONDict(), headers=nothing, timeout_ms=nothing)
     client_is_modern(client) || throw(ArgumentError("MCP Events requires protocol 2026-07-28"))
     params = JSONDict(
         "name" => String(name), "arguments" => event_object(arguments, "arguments"),
         "delivery" => JSONDict("mode" => "webhook", "url" => String(url)),
     )
-    return jsonrpc_call(client, "events/unsubscribe"; params=params, headers=headers, timeout_ms=timeout_ms)
+    return call_event_subscription(client, "events/unsubscribe", params, headers, timeout_ms)
 end
