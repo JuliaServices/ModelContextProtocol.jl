@@ -628,8 +628,9 @@ function broadcast_server_event!(server::MCPServer, event::Union{AbstractString,
     return nothing
 end
 
+# Standard MCP clients read JSON-RPC messages only from unnamed or `message` SSE events.
 function enqueue_jsonrpc_event!(server::MCPServer, session::MCPSession, envelope::Dict{String,Any})
-    enqueue_server_event!(server, session, "jsonrpc", envelope)
+    enqueue_server_event!(server, session, "message", envelope)
     return nothing
 end
 
