@@ -105,3 +105,29 @@ end
     @test length(shared.pending_events) == min(total, cap)
     @test allunique(event.id for event in shared.pending_events)
 end
+
+@testset "Event stream messages use the standard SSE event type" begin
+    MCP = ModelContextProtocol
+    server = MCPServer(name="Event types", version="1.0.0")
+    register_resource!(server; uri="memory://doc", handler=(_context, _args) -> Dict("contents" => Any[]))
+    http = serve_mcp_http(server; host="127.0.0.1", port=0)
+    try
+        transport = MCPTransportDescriptor(kind=:http, url=base_url(http) * "/v1/mcp")
+        discovery = MCPDiscovery(manifest=Dict{String,Any}(), transports=[transport], default_transport=transport)
+        client = prepare_manual_client(discovery)
+        initialize_client!(client)
+        subscribe_resource(client, "memory://doc")
+        updates = Any[]
+        register_notification_handler!(client, "notifications/resources/updated", (_c, _m, params) -> push!(updates, params))
+        notify_resource_updated!(server, "memory://doc")
+        events = MCP.parse_sse_events(String(open_event_stream(client).body))
+        jsonrpc_events = filter(event -> occursin("\"jsonrpc\"", event.data), events)
+        @test length(jsonrpc_events) == 1
+        # The TypeScript and Python SDK clients parse only unnamed or `message` events.
+        @test only(jsonrpc_events).event in (nothing, "", "message")
+        foreach(event -> MCP.handle_sse_event!(client, event), events)
+        @test [update["uri"] for update in updates] == ["memory://doc"]
+    finally
+        HTTP.forceclose(http.http)
+    end
+end

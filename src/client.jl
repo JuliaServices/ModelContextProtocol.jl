@@ -591,7 +591,7 @@ function handle_sse_event!(client::MCPClient, event)
     if event.id !== nothing && !isempty(String(event.id))
         client.last_event_id = String(event.id)
     end
-    if event.event === nothing || event.event == "" || event.event == "jsonrpc"
+    if event.event in (nothing, "", "message", "jsonrpc")
         data_str = event.data
         isempty(data_str) && return
         payload = try
