@@ -537,7 +537,8 @@ function parse_sse_events(body::AbstractString)
         event_id = nothing
         empty!(data_lines)
     end
-    for raw_line in split(body, '\n')
+    # SSE lines end in CRLF, LF, or CR.
+    for raw_line in split(replace(body, "\r\n" => "\n", '\r' => '\n'), '\n')
         line = String(raw_line)
         if isempty(line)
             emit_event!()
