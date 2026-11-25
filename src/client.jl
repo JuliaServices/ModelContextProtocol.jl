@@ -372,27 +372,8 @@ function cancel_request(client::MCPClient, request_id; reason=nothing, headers=n
 end
 
 function open_event_stream(client::MCPClient; headers=nothing, timeout=nothing)
-    ensure_http_transport(client.transport)
-    client_is_modern(client) && throw(mcp_error(:unsupported_protocol_version, "The 2026-07-28 protocol uses subscriptions/listen instead of a standalone event stream"))
-    client.initialized || throw(mcp_error(:not_initialized, "Client must be initialized before opening an event stream"))
-    header_pairs = normalize_headers(headers)
-    request_headers = build_request_headers(client, header_pairs; content_type=nothing, accept="text/event-stream")
-    if client.last_event_id !== nothing
-        set_header!(request_headers, "Last-Event-ID", String(client.last_event_id))
-    end
-    timeout_settings = transport_timeout_kwargs(normalize_timeout(client, timeout))
-    log_client_http_request(client, "GET", client.transport.url, request_headers, nothing)
     events = Any[]
-    response = client.http.request(
-        "GET",
-        client.transport.url;
-        headers=request_headers,
-        status_exception=false,
-        sse_callback=(stream, event) -> begin
-            push!(events, event)
-        end,
-        timeout_settings...,
-    )
+    response = request_event_stream(event -> push!(events, event), client; headers=headers, timeout=timeout)
     buffer = IOBuffer()
     for event in events
         event.retry !== nothing && println(buffer, "retry: ", event.retry)
@@ -405,7 +386,30 @@ function open_event_stream(client::MCPClient; headers=nothing, timeout=nothing)
         end
         println(buffer)
     end
-    response = HTTP.Response(response.status, headers_to_pairs(response.headers), String(take!(buffer)))
+    return HTTP.Response(response.status, headers_to_pairs(response.headers), String(take!(buffer)))
+end
+
+# Calls `on_event` with each event as it arrives, so a stream the server keeps
+# open still delivers its messages.
+function request_event_stream(on_event, client::MCPClient; headers=nothing, timeout=nothing)
+    ensure_http_transport(client.transport)
+    client_is_modern(client) && throw(mcp_error(:unsupported_protocol_version, "The 2026-07-28 protocol uses subscriptions/listen instead of a standalone event stream"))
+    client.initialized || throw(mcp_error(:not_initialized, "Client must be initialized before opening an event stream"))
+    header_pairs = normalize_headers(headers)
+    request_headers = build_request_headers(client, header_pairs; content_type=nothing, accept="text/event-stream")
+    if client.last_event_id !== nothing
+        set_header!(request_headers, "Last-Event-ID", String(client.last_event_id))
+    end
+    timeout_settings = transport_timeout_kwargs(normalize_timeout(client, timeout))
+    log_client_http_request(client, "GET", client.transport.url, request_headers, nothing)
+    response = client.http.request(
+        "GET",
+        client.transport.url;
+        headers=request_headers,
+        status_exception=false,
+        sse_callback=(_stream, event) -> on_event(event),
+        timeout_settings...,
+    )
     log_client_http_response(client, "GET", client.transport.url, response; streaming=true)
     status = response.status
     status in 200:299 || throw(mcp_error(:http_error, "Event stream request failed with status $(status)"))
@@ -598,10 +602,8 @@ function event_listener_loop(client::MCPClient, poll_interval::Real, headers)
     current = current_task()
     while client.event_task === current
         try
-            response = open_event_stream(client; headers=headers)
-            body = String(response.body)
-            for event in parse_sse_events(body)
-                handle_sse_event!(client, event)
+            request_event_stream(client; headers=headers) do event
+                client.event_task === current && handle_sse_event!(client, event)
             end
         catch err
             if client.event_task !== current || err isa InterruptException
