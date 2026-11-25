@@ -79,3 +79,41 @@ using Test, HTTP, JSON, ModelContextProtocol
         close(stub)
     end
 end
+
+@testset "Client starts a new session after the server expires one" begin
+    sessions = Set{String}()
+    issued = Ref(0)
+    stub = HTTP.serve!("127.0.0.1", 0; verbose=false) do req
+        session_id = HTTP.header(req, "MCP-Session-Id", "")
+        # Like the Python MCP SDK, answer 404 for any unknown session ID, even on initialize.
+        isempty(session_id) || session_id in sessions || return HTTP.Response(404, "Session not found")
+        payload = JSON.parse(String(req.body))
+        id = get(payload, "id", nothing)
+        id === nothing && return HTTP.Response(202)
+        headers = ["Content-Type" => "application/json"]
+        result = if payload["method"] == "initialize"
+            issued[] += 1
+            push!(sessions, "session-$(issued[])")
+            push!(headers, "MCP-Session-Id" => "session-$(issued[])")
+            Dict("protocolVersion" => "2025-11-25", "capabilities" => Dict(), "serverInfo" => Dict("name" => "Expiring", "version" => "1"))
+        else
+            Dict("tools" => Any[])
+        end
+        HTTP.Response(200, headers, JSON.json(Dict("jsonrpc" => "2.0", "id" => id, "result" => result)))
+    end
+    try
+        port = ModelContextProtocol.bound_http_port(stub)
+        transport = ModelContextProtocol.MCPTransportDescriptor(kind=:http, url="http://127.0.0.1:$(port)/mcp")
+        discovery = ModelContextProtocol.MCPDiscovery(manifest=Dict{String,Any}(), transports=[transport], default_transport=transport)
+        client = prepare_manual_client(discovery)
+        initialize_client!(client)
+        @test client.session_id == "session-1"
+        empty!(sessions)
+        @test_throws ModelContextProtocol.MCPError list_tools(client)
+        initialize_client!(client)
+        @test client.session_id == "session-2"
+        @test list_tools(client)["tools"] == Any[]
+    finally
+        close(stub)
+    end
+end

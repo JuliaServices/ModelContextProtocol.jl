@@ -351,6 +351,9 @@ function initialize_client!(
         !isempty(info) && (params["clientInfo"] = info)
     end
     merge_extra_params!(params, extra_params)
+    # initialize starts a new session, so it never carries the previous session ID;
+    # this is how a client recovers after the server answers 404 for an expired session.
+    client.session_id = nothing
     result = jsonrpc_call(client, JSONRPC_METHOD_INITIALIZE; params=params, headers=headers, timeout_ms=timeout_ms)
     session_data = result isa AbstractDict ? to_json_dict(result) : Dict{String,Any}()
     if client.transport.kind == :stdio
