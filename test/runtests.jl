@@ -1472,7 +1472,7 @@ end
         @test unknown_resource["error"]["code"] == -32002
     end
 
-    @testset "streamed POST responses" begin
+    @testset "streamed POST responses ($(repr(eol)) line endings)" for eol in ("\n", "\r\n", "\r")
         router = HTTP.Router()
         HTTP.register!(router, "POST", "/mcp", req -> begin
             payload = JSON.parse(String(req.body))
@@ -1503,8 +1503,9 @@ end
                     "result" => Dict("tools" => [Dict("name" => "streamed")]),
                 ))
                 body = string(
-                    "event: message\ndata: ", notification, "\n\n",
-                    "data: ", response, "\n\n",
+                    ": ping", eol, eol,
+                    "event: message", eol, "data: ", notification, eol, eol,
+                    "data: ", response, eol, eol,
                 )
                 return HTTP.Response(200, ["Content-Type" => "text/event-stream"], body)
             end
