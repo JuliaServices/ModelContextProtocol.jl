@@ -1529,6 +1529,42 @@ end
             close(stub)
         end
     end
+
+    @testset "event listener on a stream the server keeps open" begin
+        release = Channel{Nothing}(1)
+        stub = HTTP.serve!("127.0.0.1", 0; verbose=false) do req
+            if req.method == "GET"
+                notification = JSON.json(Dict("jsonrpc" => "2.0", "method" => "notifications/tools/list_changed"))
+                return ModelContextProtocol.build_sse_response(HTTP.Headers()) do stream
+                    write(stream, HTTP.SSEEvent(notification; id="1"))
+                    take!(release)
+                end
+            end
+            payload = JSON.parse(String(req.body))
+            id = get(payload, "id", nothing)
+            id === nothing && return HTTP.Response(202)
+            result = Dict("protocolVersion" => "2025-11-25", "capabilities" => Dict(),
+                "serverInfo" => Dict("name" => "Open stream", "version" => "0.1.0"))
+            HTTP.Response(200, ["Content-Type" => "application/json", "MCP-Session-Id" => "open-stream"],
+                JSON.json(Dict("jsonrpc" => "2.0", "id" => id, "result" => result)))
+        end
+        try
+            port = ModelContextProtocol.bound_http_port(stub)
+            transport = ModelContextProtocol.MCPTransportDescriptor(kind=:http, url="http://127.0.0.1:$(port)/mcp")
+            discovery = ModelContextProtocol.MCPDiscovery(manifest=Dict{String,Any}(), transports=[transport], default_transport=transport)
+            client = prepare_manual_client(discovery)
+            initialize_client!(client)
+            changes = Ref(0)
+            register_notification_handler!(client, "notifications/tools/list_changed", (_c, _m, _p) -> (changes[] += 1))
+            start_event_listener!(client)
+            @test timedwait(() -> changes[] == 1, 10.0; pollint=0.05) == :ok
+            @test client.last_event_id == "1"
+            stop_event_listener!(client)
+        finally
+            put!(release, nothing)
+            close(stub)
+        end
+    end
 end
 
 function modern_http_request(method::String; id="1", params=Dict{String,Any}(), version=ModelContextProtocol.PROTOCOL_VERSION_2026_07_28, mcp_method=method, mcp_name=nothing, header_version=version, include_meta=true, extra_headers=Pair{String,String}[])
