@@ -1409,6 +1409,9 @@ function call_tool(server::MCPServer, context::MCPRequestContext, params::Dict{S
             end
         end
     end
+    # CallToolResult.content is required; the spec recommends mirroring structured results as JSON text.
+    haskey(normalized, "content") || (normalized["content"] = Any[
+        Dict{String,Any}("type" => "text", "text" => JSON.json(normalized["structuredContent"]))])
     return normalized
 end
 

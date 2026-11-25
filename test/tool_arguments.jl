@@ -150,4 +150,32 @@ JSON.StructUtils.lower(arguments::LoweredArguments) = arguments.value
     end
 end
 
+@testset "Structured-only tool results still carry content" begin
+    server = MCP.MCPServer(name="Structured results", version="1.0.0")
+    MCP.register_tool!(server; name="dict", handler=(_context, _arguments) -> Dict("structuredContent" => Dict("temperature" => 22.5)))
+    MCP.register_tool!(server; name="typed", handler=(_context, _arguments) -> MCP.MCPToolResult(structured_content=Dict("temperature" => 22.5)))
+    MCP.register_tool!(server; name="text", handler=(_context, _arguments) -> MCP.MCPToolResult(
+        content=[MCP.MCPTextContent(text="22.5 C")], structured_content=Dict("temperature" => 22.5)))
+    http_server = MCP.serve_mcp_http(server; host="127.0.0.1", port=0)
+    try
+        transport = MCP.MCPTransportDescriptor(kind=:http, url=MCP.base_url(http_server) * "/v1/mcp")
+        client = MCP.prepare_manual_client(MCP.MCPDiscovery(manifest=Dict{String,Any}(), transports=[transport], default_transport=transport))
+        MCP.initialize_client!(client)
+        for name in ("dict", "typed")
+            result = MCP.call_tool(client, name)
+            @test result["structuredContent"] == Dict("temperature" => 22.5)
+            # CallToolResult.content is required; the spec recommends the serialized JSON as text.
+            @test haskey(result, "content")
+            if haskey(result, "content")
+                block = only(result["content"])
+                @test block["type"] == "text"
+                @test JSON.parse(block["text"]) == result["structuredContent"]
+            end
+        end
+        @test only(MCP.call_tool(client, "text")["content"])["text"] == "22.5 C"
+    finally
+        MCP.stop_mcp_server(http_server)
+    end
+end
+
 end
