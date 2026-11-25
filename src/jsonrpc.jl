@@ -113,8 +113,11 @@ function jsonrpc_call(
         timeout_value = normalize_timeout_ms(timeout_ms)
         push!(header_pairs, normalize_pair("Mcp-Timeout-Ms", string(timeout_value)))
     end
+    # A legacy initialize negotiates the version in its body; the header starts with the next request.
+    legacy_initialize = method_str == JSONRPC_METHOD_INITIALIZE && !client_is_modern(client)
     response = submit_jsonrpc_request(client, body; headers=header_pairs, timeout=timeout,
-        retry_protocol_version=client_is_modern(client) && !notification)
+        retry_protocol_version=client_is_modern(client) && !notification,
+        protocol_version=legacy_initialize ? nothing : client.protocol_version)
     notification && return nothing
     isempty(response.body) && throw(mcp_error(:jsonrpc_error, "JSON-RPC response from $(client.transport.url) was empty"))
     if is_event_stream_response(response)
@@ -199,9 +202,10 @@ function protocol_version_retry_body(body, response::HTTP.Response, headers)
     return JSON.json(request)
 end
 
-function submit_jsonrpc_request(client::MCPClient, body; headers, timeout, retry_protocol_version::Bool=false)
+function submit_jsonrpc_request(client::MCPClient, body; headers, timeout, retry_protocol_version::Bool=false,
+        protocol_version::Union{String,Nothing}=client.protocol_version)
     header_pairs = normalize_headers(headers)
-    request_headers = build_request_headers(client, header_pairs)
+    request_headers = build_request_headers(client, header_pairs; protocol_version)
     timeout_settings = transport_timeout_kwargs(normalize_timeout(client, timeout))
     local response
     for attempt in 1:2
@@ -267,11 +271,12 @@ function build_request_headers(
     extra::Vector{HeaderPair};
     content_type::Union{String,Nothing}="application/json",
     accept::Union{String,Nothing}="application/json, text/event-stream",
+    protocol_version::Union{String,Nothing}=client.protocol_version,
 )
     headers = build_headers(client.headers)
     content_type !== nothing && set_header!(headers, "Content-Type", content_type)
     accept !== nothing && set_header!(headers, "Accept", accept)
-    set_header!(headers, "MCP-Protocol-Version", client.protocol_version)
+    protocol_version !== nothing && set_header!(headers, "MCP-Protocol-Version", protocol_version)
     if client.auth_token !== nothing
         set_header!(headers, "Authorization", authorization_value(client.auth_token))
     end

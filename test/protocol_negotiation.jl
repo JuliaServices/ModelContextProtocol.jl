@@ -247,3 +247,22 @@ using Test, HTTP, JSON, ModelContextProtocol
         end
     end
 end
+
+@testset "Client uses the protocol version the server negotiates" begin
+    server = MCPServer(name="Older server", version="1.0.0", protocol_version="2025-06-18",
+        supported_protocol_versions=String[])
+    register_tool!(server; name="echo", handler=(context, _arguments) -> Dict(
+        "content" => [Dict("type" => "text", "text" => context.protocol_version)]))
+    http = serve_mcp_http(server; host="127.0.0.1", port=0)
+    try
+        transport = MCPTransportDescriptor(kind=:http, url=base_url(http) * "/v1/mcp")
+        discovery = MCPDiscovery(manifest=Dict{String,Any}(), transports=[transport], default_transport=transport)
+        client = prepare_manual_client(discovery)
+        @test client.protocol_version == "2025-11-25"
+        @test initialize_client!(client)["protocolVersion"] == "2025-06-18"
+        @test client.protocol_version == "2025-06-18"
+        @test only(call_tool(client, "echo")["content"])["text"] == "2025-06-18"
+    finally
+        HTTP.forceclose(http.http)
+    end
+end

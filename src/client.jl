@@ -357,6 +357,12 @@ function initialize_client!(
         get(session_data, "protocolVersion", nothing) == String(protocol_version) ||
             throw(mcp_error(:unsupported_protocol_version, "The stdio server did not accept protocol version $(protocol_version)"))
         client.protocol_version = String(protocol_version)
+    else
+        # Later requests send the version the server chose, which may differ from the one requested.
+        negotiated = get(session_data, "protocolVersion", nothing)
+        if negotiated isa AbstractString && !is_modern_protocol_version(negotiated)
+            client.protocol_version = String(negotiated)
+        end
     end
     client.session = session_data
     client.last_event_id = nothing
